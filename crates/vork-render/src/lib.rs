@@ -109,6 +109,8 @@ mod texture_source;
 pub mod footage;
 mod catcher;
 mod timing;
+#[cfg(feature = "frame-profile")]
+mod frame_profile;
 mod mesh_exit;
 mod transmission;
 mod values;
@@ -151,6 +153,8 @@ mod lights;
 mod light_temperature;
 mod targets;
 mod canvas;
+mod canvas_parallel;
+mod canvas_timing;
 mod canvas_draw;
 mod canvas_world;
 
@@ -387,7 +391,7 @@ pub struct Renderer {
     pipelines: pipelines::Registry,
     program_pipelines:
         Mutex<std::collections::HashMap<blake3::Hash, std::sync::Arc<CachedPipelines>>>,
-    brdf: OnceLock<wgpu::TextureView>,
+    brdf: Mutex<Option<wgpu::TextureView>>,
     ltc: OnceLock<wgpu::TextureView>,
 }
 /// What work needs from the device beyond what every device vork opens has. Opening a device with a need costs
@@ -1135,7 +1139,7 @@ impl Renderer {
             compiler,
             program_pipelines: Mutex::new(Default::default()),
             pipelines,
-            brdf: OnceLock::new(),
+            brdf: Mutex::new(None),
             ltc: OnceLock::new(),
         })
     }
@@ -1464,11 +1468,31 @@ fn decode_scene_document(bytes: &[u8], path: &Path) -> Result<Scene> {
     let base = path.parent().unwrap_or(Path::new("."));
     let expanded = || -> Result<serde_json::Value> {
         let mut document = vork_scene::v2::diagnostics::read_document(bytes)?;
-        vork_std::expand_scene(&mut document, base)?;
+        expand_standard_geometry(&mut document, base)?;
         Ok(document)
     };
     // The expanded document is read into the scene and gone; a decode error makes it again to explain itself.
     expanded().and_then(|document| Scene::parse_value_with_source(document, bytes, Some(path), expanded)).map_err(failure::scene)
+}
+
+/// Setup and scene loading share the pure builders' ordinary JSON results.
+/// Validation still consumes the expanded scene before any device is opened.
+fn expand_standard_geometry(document: &mut serde_json::Value, base: &Path) -> Result<()> {
+    let cache = std::cell::OnceCell::new();
+    vork_std::expand_scene_with(document, base, &|function, argument| {
+        let mut key = blake3::Hasher::new();
+        // Conservatively bind every builder source and the target/build options.
+        key.update(env!("VORK_BUILD_ID").as_bytes());
+        key.update(&(function.len() as u64).to_le_bytes());
+        key.update(function.as_bytes());
+        key.update(argument.as_bytes());
+        let key = key.finalize();
+        // Expanded-buffer scenes and file-dependent native builders never open the store.
+        let path = || cache.get_or_init(disk_cache::Store::host).path("std-geometry", 1, key);
+        vork_std::evaluate_with_cache(function, argument,
+            || String::from_utf8(disk_cache::read(&path())?).ok(),
+            |result| { let _ = disk_cache::write(&path(), result.as_bytes()); })
+    })
 }
 /// A repository scene with its authored render settings: `X.json` plus, when
 /// present, the sibling profile `X.profile.json` (the repo's convention for its
@@ -1864,12 +1888,17 @@ mod tests {
     /// The loader behind render, check and session documents says the nesting limit in scene terms.
     #[test]
     fn the_scene_loader_states_the_nesting_limit() {
-        // 63 nested nodes reach 127 levels; an empty children array on the innermost is the 128th.
-        let mut node = serde_json::json!({"name":"n63","children":[]});
-        for depth in (1..63).rev() { node = serde_json::json!({"name":format!("n{depth}"),"children":[node]}); }
-        let bytes = serde_json::to_vec(&serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[node]})).unwrap();
-        let error = format!("{:#}", super::decode_scene_document(&bytes, std::path::Path::new("deep.json")).err().unwrap());
-        assert!(error.contains("nests arrays and objects more than 127 deep") && error.contains("flatten the hierarchy"), "{error}");
+        // Each node is two levels (its object and its children array) under the scene object and the nodes array.
+        let chain = |nodes: usize| {
+            let mut text = String::from(r#"{"version":2,"composition":{"space":"2d"},"nodes":["#);
+            for depth in 0..nodes { text.push_str(&format!(r#"{{"name":"n{depth}","children":["#)); }
+            for _ in 0..nodes { text.push_str("]}"); }
+            text.push_str("]}");
+            text.into_bytes()
+        };
+        let limit = vork_scene::MAX_JSON_DEPTH;
+        let error = format!("{:#}", super::decode_scene_document(&chain(limit / 2), std::path::Path::new("deep.json")).err().unwrap());
+        assert!(error.contains(&format!("nests arrays and objects more than {limit} deep")) && error.contains("flatten the hierarchy"), "{error}");
         // Any other reader error keeps its own words.
         let error = format!("{:#}", super::decode_scene_document(b"{\"version\":", std::path::Path::new("cut.json")).err().unwrap());
         assert!(!error.contains("nests arrays"), "{error}");

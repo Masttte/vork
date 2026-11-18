@@ -1,6 +1,6 @@
 {
   "name": "@voyager-so/vork",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Rust-generated scene types, JSON Schema and serialization for vork",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -30,7 +30,12 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "ajv": "^8.20.0",
-    "json-schema-to-typescript": "^16.0.0",
+    "json-schema-to-typescript": "15.0.2",
     "typescript": "^5.9.0"
+  },
+  "overrides": {
+    "json-schema-to-typescript": {
+      "glob": "14.0.6"
+    }
   }
 }

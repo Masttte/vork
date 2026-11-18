@@ -246,8 +246,7 @@ fn through_archive<P>(
     let Some(cache) = cache else {
         return admission.compile(label, source_bytes, compile);
     };
-    let archives = NSArray::from_retained_slice(&[cache.archive.clone()]);
-    if let Ok(pipeline) = create(Some(&archives), MTLPipelineOption::FailOnBinaryArchiveMiss) {
+    if let Ok(pipeline) = create(Some(&cache.lookup), MTLPipelineOption::FailOnBinaryArchiveMiss) {
         return Ok(pipeline);
     }
     // Recording a pipeline in the archive is a compiler request too: it reuses
@@ -261,9 +260,11 @@ fn through_archive<P>(
         // The lock is only tried: an admitted compilation never waits for it, which
         // is what lets a drain wait for admission while holding it.
         let Some(_guard) = cache.files.try_lock() else {
-            let (archive, add) = (cache.archive.clone(), add.clone());
+            let (archive, add, gained) = (cache.archive.clone(), add.clone(), cache.gained.clone());
             cache.deferred.lock().push(super::DeferredAddition(compile_admission::Deferred::new(label, source_bytes, move || {
-                add(&archive).map_err(|error| compile_admission::Failure::new(&error, alloc::format!("{error:?}")))
+                add(&archive).map_err(|error| compile_admission::Failure::new(&error, alloc::format!("{error:?}")))?;
+                gained.store(true, core::sync::atomic::Ordering::Release);
+                Ok(())
             })));
             additions.fetch_add(1, core::sync::atomic::Ordering::Release);
             return Ok(pipeline);
@@ -274,6 +275,7 @@ fn through_archive<P>(
                 alloc::format!("the pipeline compiled but the Metal binary archive refused it: {error:?}"),
             )
         })?;
+        cache.gained.store(true, core::sync::atomic::Ordering::Release);
         additions.fetch_add(1, core::sync::atomic::Ordering::Release);
         Ok(pipeline)
     })?;
@@ -2045,15 +2047,27 @@ impl crate::Device for super::Device {
         desc: &crate::PipelineCacheDescriptor<'_>,
     ) -> Result<super::PipelineCache, crate::PipelineCacheError> {
         autoreleasepool(|_| {
-            let descriptor = MTLBinaryArchiveDescriptor::new();
-            let source = match desc.data {
+            let segments = match desc.data {
                 Some(data) => {
                     if !super::archive_files_open() {
                         return Err(crate::PipelineCacheError::Rejected(
                             "the process released its Metal binary archive files for exit".into(),
                         ));
                     }
+                    super::archive_segments(data).ok_or_else(|| {
+                        crate::PipelineCacheError::Rejected("the data is not a set of Metal binary archives".into())
+                    })?
+                }
+                None => Vec::new(),
+            };
+            // Registered before the first file exists, so no exit leaves one behind.
+            let files = Arc::new(Mutex::new(Vec::new()));
+            super::register_archive_files(&files);
+            let open = |source: Option<&[u8]>| {
+                let descriptor = MTLBinaryArchiveDescriptor::new();
+                if let Some(data) = source {
                     let path = archive_path();
+                    files.lock().push(path.clone());
                     std::fs::write(&path, data).map_err(|error| {
                         crate::PipelineCacheError::Rejected(alloc::format!(
                             "cannot stage the Metal binary archive at {}: {error}",
@@ -2061,26 +2075,36 @@ impl crate::Device for super::Device {
                         ))
                     })?;
                     descriptor.setUrl(Some(&file_url(&path)));
-                    Some(path)
                 }
-                None => None,
-            };
-            match self.shared.device.newBinaryArchiveWithDescriptor_error(&descriptor) {
-                Ok(archive) => {
-                    let files = Arc::new(Mutex::new(source.into_iter().collect()));
-                    super::register_archive_files(&files);
-                    Ok(super::PipelineCache { archive, files, deferred: Default::default() })
-                }
-                Err(error) => {
-                    if let Some(path) = &source {
-                        let _ = std::fs::remove_file(path);
-                    }
-                    Err(crate::PipelineCacheError::Rejected(alloc::format!(
+                self.shared.device.newBinaryArchiveWithDescriptor_error(&descriptor).map_err(|error| {
+                    crate::PipelineCacheError::Rejected(alloc::format!(
                         "Metal could not open the binary archive: {}",
                         error.localizedDescription()
-                    )))
+                    ))
+                })
+            };
+            let opened = segments.iter().map(|segment| open(Some(segment))).collect::<Result<Vec<_>, _>>().and_then(|loaded| Ok((loaded, open(None)?)));
+            let (loaded, archive) = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    for path in files.lock().drain(..) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    return Err(error);
                 }
-            }
+            };
+            let lookup = NSArray::from_retained_slice(&loaded.iter().chain([&archive]).cloned().collect::<Vec<_>>());
+            let loaded_files = files.lock().clone();
+            Ok(super::PipelineCache {
+                loaded_files,
+                archive,
+                lookup,
+                gained: Default::default(),
+                saved: Default::default(),
+                failed: Default::default(),
+                files,
+                deferred: Default::default(),
+            })
         })
     }
     fn pipeline_cache_validation_key(&self) -> Option<[u8; 16]> {
@@ -2088,7 +2112,7 @@ impl crate::Device for super::Device {
         let os = NSProcessInfo::processInfo().operatingSystemVersionString();
         let os = alloc::string::ToString::to_string(&*os);
         let name = alloc::string::ToString::to_string(&*self.shared.device.name());
-        let parts: [&[u8]; 3] = [b"wgpu-metal-binary-archive-v1", name.as_bytes(), os.as_bytes()];
+        let parts: [&[u8]; 3] = [b"wgpu-metal-binary-archives-v2", name.as_bytes(), os.as_bytes()];
         let mut key = [0; 16];
         key[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325, &parts).to_be_bytes());
         key[8..].copy_from_slice(&fnv(0x8422_2325_cbf2_9ce4, &parts).to_be_bytes());
@@ -2096,17 +2120,30 @@ impl crate::Device for super::Device {
     }
     unsafe fn pipeline_cache_get_data(&self, cache: &super::PipelineCache) -> Option<Vec<u8>> {
         autoreleasepool(|_| {
+            use core::sync::atomic::Ordering;
             let mut files = cache.files.lock();
             // After release_archive_files_for_exit no backing file may appear.
             if !super::archive_files_open() {
                 return None;
             }
             cache.record_deferred(compile_admission::service());
-            let path = archive_path();
-            let serialized = cache.archive.serializeToURL_error(&file_url(&path));
-            // Serialization rebinds the archive to this file, even when reading it back fails.
-            files.push(path.clone());
-            serialized.ok().and_then(|()| std::fs::read(&path).ok())
+            if cache.failed.load(Ordering::Acquire) {
+                return None;
+            }
+            let mut saved = cache.saved.lock();
+            // Additions hold `files`, so none lands between this and the serialization.
+            if cache.gained.swap(false, Ordering::AcqRel) {
+                let path = archive_path();
+                // Serialization rebinds the archive to this file.
+                files.push(path.clone());
+                if cache.archive.serializeToURL_error(&file_url(&path)).is_err() {
+                    cache.failed.store(true, Ordering::Release);
+                    return None;
+                }
+                *saved = Some(path);
+            }
+            let segments = cache.loaded_files.iter().chain(saved.iter()).map(std::fs::read).collect::<Result<Vec<_>, _>>().ok()?;
+            Some(super::join_archive_segments(&segments))
         })
     }
     unsafe fn destroy_pipeline_cache(&self, _: super::PipelineCache) {}
@@ -2577,12 +2614,120 @@ mod binary_archive_tests {
             assert!(cache.deferred.lock().is_empty());
             assert!(three.len() > one.len(), "the second serialization holds no more than the first: {} and {} bytes", three.len(), one.len());
             let reloaded = unsafe { device.create_pipeline_cache(&crate::PipelineCacheDescriptor { label: None, data: Some(&three) }) }.unwrap();
-            let archives = NSArray::from_retained_slice(&[reloaded.archive.clone()]);
+            let archives = reloaded.lookup.clone();
             for (name, descriptor) in ["first", "second", "third"].into_iter().zip(&descriptors) {
                 assert!(create(descriptor)(Some(&archives), MTLPipelineOption::FailOnBinaryArchiveMiss).is_ok(),
                     "the second serialization lost the pipeline {name}");
             }
         });
+    }
+
+    /// Cache data loaded by a later process keeps every pipeline it holds, however
+    /// often that process serializes and whatever it adds. Metal cannot serialize an
+    /// archive opened from a file after it gains a render pipeline sharing a stage
+    /// function with a stored one, and the failure empties the archive: vork 0.6.0
+    /// then published only the pipelines added after it (setup's 16 MB of engines
+    /// became 0.6 MB after one std/draft MP4).
+    #[test]
+    fn loaded_pipelines_survive_additions_and_repeated_serializations() {
+        autoreleasepool(|_| {
+            let raw = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required");
+            let device = unsafe { super::super::Device::device_from_raw(raw.clone(), wgt::Features::PIPELINE_CACHE) };
+            let id = std::process::id();
+            let source = alloc::format!(
+                "#include <metal_stdlib>\nstruct Out {{ float4 position [[position]]; }};\nvertex Out shared_vertex(uint v [[vertex_id]]) {{ Out o; o.position = float4(float(v) * {id}.0, 0.5, 0.5, 1.0); return o; }}\nfragment float4 stored(Out i [[stage_in]]) {{ return float4(i.position.x * {id}.0, 0, 0, 1); }}\nfragment float4 added(Out i [[stage_in]]) {{ return float4(0, i.position.y * {id}.0, 0, 1); }}\nkernel void first(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ out[i] = i * {id}u + 23u; }}\nkernel void second(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ out[i] = i * {id}u + 29u; }}\nkernel void third(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ out[i] = i * {id}u + 31u; }}\n"
+            );
+            let library = raw.newLibraryWithSource_options_error(&NSString::from_str(&source), None).unwrap();
+            let function = |name: &str| library.newFunctionWithName(&NSString::from_str(name)).unwrap();
+            // One pipeline: the lookup that needs an archive entry, and the recording in an archive.
+            type Lookup = alloc::boxed::Box<dyn Fn(Option<&NSArray<ProtocolObject<dyn MTLBinaryArchive>>>, MTLPipelineOption) -> Result<(), Retained<NSError>>>;
+            type Record = alloc::rc::Rc<dyn Fn(&ProtocolObject<dyn MTLBinaryArchive>) -> Result<(), Retained<NSError>>>;
+            let render = |fragment: Option<&str>| -> (Lookup, Record) {
+                let descriptor = MTLRenderPipelineDescriptor::new();
+                descriptor.setVertexFunction(Some(&function("shared_vertex")));
+                descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
+                if let Some(fragment) = fragment {
+                    descriptor.setFragmentFunction(Some(&function(fragment)));
+                    unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) }.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+                }
+                let (raw, looked, recorded) = (raw.clone(), descriptor.clone(), descriptor);
+                (alloc::boxed::Box::new(move |archives, options| {
+                    looked.setBinaryArchives(archives);
+                    raw.newRenderPipelineStateWithDescriptor_options_reflection_error(&looked, options, None).map(drop)
+                }), alloc::rc::Rc::new(move |archive| archive.addRenderPipelineFunctionsWithDescriptor_error(&recorded)))
+            };
+            let compute = |name: &str| -> (Lookup, Record) {
+                let descriptor = MTLComputePipelineDescriptor::new();
+                descriptor.setComputeFunction(Some(&function(name)));
+                let (raw, looked, recorded) = (raw.clone(), descriptor.clone(), descriptor);
+                (alloc::boxed::Box::new(move |archives, options| {
+                    looked.setBinaryArchives(archives);
+                    raw.newComputePipelineStateWithDescriptor_options_reflection_error(&looked, options, None).map(drop)
+                }), alloc::rc::Rc::new(move |archive| archive.addComputePipelineFunctionsWithDescriptor_error(&recorded)))
+            };
+            let pipelines = [
+                ("vertex only", render(None)), ("stored fragment", render(Some("stored"))), ("first", compute("first")),
+                ("added fragment", render(Some("added"))), ("second", compute("second")), ("third", compute("third")),
+            ];
+            let create = |cache: &super::super::PipelineCache, index: usize| {
+                let (lookup, record) = &pipelines[index].1;
+                let record = record.clone();
+                through_archive(Some(cache), &device.archive_additions, compile_admission::service(), None, 0, lookup, move |archive| record(archive)).unwrap();
+            };
+            let open = |data: &[u8]| unsafe { device.create_pipeline_cache(&crate::PipelineCacheDescriptor { label: None, data: Some(data) }) }.unwrap();
+            let held = |data: &[u8], count: usize, when: &str| {
+                let cache = open(data);
+                for (name, (lookup, _)) in &pipelines[..count] {
+                    assert!(lookup(Some(&cache.lookup), MTLPipelineOption::FailOnBinaryArchiveMiss).is_ok(), "{when}: the cache data lost the pipeline {name}");
+                }
+            };
+            let data = |cache: &super::super::PipelineCache, when: &str| unsafe { device.pipeline_cache_get_data(cache) }.unwrap_or_else(|| panic!("{when}: no cache data"));
+
+            // The first process (setup): a depth-only pipeline and one with a fragment stage on the same vertex function.
+            let setup = unsafe { device.create_pipeline_cache(&crate::PipelineCacheDescriptor { label: None, data: None }) }.unwrap();
+            for index in 0..3 { create(&setup, index); }
+            let stored = data(&setup, "setup");
+            held(&stored, 3, "setup");
+            drop(setup);
+
+            // The second process adds the same vertex function with another fragment stage, and
+            // serializes after its preparation, again after a later pipeline, and at its end.
+            let render = open(&stored);
+            let additions = device.archive_additions();
+            for index in 0..3 { create(&render, index); }
+            assert_eq!(device.archive_additions(), additions, "stored pipelines must hit");
+            assert!(data(&render, "before additions") == stored);
+            create(&render, 3);
+            create(&render, 4);
+            let prepared = data(&render, "after preparation");
+            held(&prepared, 5, "after preparation");
+            create(&render, 5);
+            let finished = data(&render, "after a later pipeline");
+            held(&finished, 6, "after a later pipeline");
+            for _ in 0..3 {
+                assert!(data(&render, "at the end") == finished, "an unchanged cache serialized differently");
+            }
+            drop(render);
+
+            // A third process finds everything and writes the same data back.
+            let warm = open(&finished);
+            let additions = device.archive_additions();
+            for index in 0..6 { create(&warm, index); }
+            assert_eq!(device.archive_additions(), additions);
+            assert!(data(&warm, "warm") == finished);
+        });
+    }
+
+    /// Cache data is a list of archives; anything else is refused before Metal sees it.
+    #[test]
+    fn archive_segments_round_trip_and_refuse_malformed_data() {
+        let segments = [b"one".to_vec(), Vec::new(), b"three".to_vec()];
+        let data = super::super::join_archive_segments(&segments);
+        assert_eq!(super::super::archive_segments(&data).unwrap(), segments.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        assert_eq!(super::super::archive_segments(&super::super::join_archive_segments(&[])).unwrap().len(), 0);
+        for malformed in [&data[..data.len() - 1], &[data.as_slice(), b"x"].concat(), &data[..3], &[0xff; 12]] {
+            assert!(super::super::archive_segments(malformed).is_none());
+        }
     }
 
     /// A pipeline compiled through an empty archive is stored; the serialized
@@ -2616,19 +2761,23 @@ mod binary_archive_tests {
             assert_eq!(device.archive_additions(), 1);
 
             let data = unsafe { device.pipeline_cache_get_data(&empty) }.expect("serialized archive");
-            let again = unsafe { device.pipeline_cache_get_data(&empty) }.expect("an archive serializes repeatedly");
-            assert_eq!(again.len(), data.len());
+            // Any number of times: Metal itself moves an unchanged archive's file away
+            // on the second serialization and fails the third.
+            for _ in 0..3 {
+                assert!(unsafe { device.pipeline_cache_get_data(&empty) }.expect("an archive serializes repeatedly") == data);
+            }
             assert!(!data.is_empty());
             let reloaded = unsafe { device.create_pipeline_cache(&crate::PipelineCacheDescriptor { label: None, data: Some(&data) }) }.unwrap();
             let staged = reloaded.files.lock()[0].clone();
             assert!(staged.exists());
-            let archives = NSArray::from_retained_slice(&[reloaded.archive.clone()]);
+            let archives = reloaded.lookup.clone();
             assert!(create(Some(&archives), MTLPipelineOption::FailOnBinaryArchiveMiss).is_ok());
             // A hit neither compiles nor adds to the archive.
             through_archive(Some(&reloaded), &device.archive_additions, compile_admission::service(), None, 0, &create, |_| panic!("an archive hit must not compile or add")).unwrap();
             assert_eq!(device.archive_additions(), 1);
-            let saved = unsafe { device.pipeline_cache_get_data(&reloaded) }.expect("a reloaded archive serializes");
-            assert_eq!(saved.len(), data.len());
+            for _ in 0..3 {
+                assert!(unsafe { device.pipeline_cache_get_data(&reloaded) }.expect("a reloaded archive serializes") == data);
+            }
             let files = reloaded.files.lock().clone();
             drop(reloaded);
             assert!(files.iter().all(|file| !file.exists()), "dropping the cache removes its files");

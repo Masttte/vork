@@ -233,8 +233,8 @@ impl Asset {
                     node: target,
                     property,
                     curve: Arc::new(Curve {
-                        times,
-                        values,
+                        times: times.into(),
+                        values: values.into(),
                         width,
                         rotation: property == gltf::animation::Property::Rotation,
                         euler: false,

@@ -1,0 +1,78 @@
+smoke: bounded dense-grid smoke/fire simulation using ordinary compute and media.
+Source shapes and fire looks are authored in the scene, not library presets.
+Use vork help smoke --all for the inclusion and scheduling contract.
+
+<!-- all -->
+# Smoke simulation
+
+Use #include "smoke/<operation>.slang" after declaring the configuration and
+callbacks below in an authored compute wrapper. These are inclusion templates,
+not standalone import modules. The library owns staggered
+MAC transport and pressure projection; source shapes, combustion, buoyancy and
+optical coefficients belong to the author. No scene types or renderer switches.
+
+Each wrapper declares SMOKE_DIMS (int3, each axis >= 2), SMOKE_CELL (positive
+finite float3 cell sizes in metres), SMOKE_ORIGIN (float3 minimum corner in metres),
+and struct Inputs. All buffers have SMOKE_DIMS; x is contiguous. Bind exactly the
+buffers consumed by each operation, with distinct storage for each generation:
+
+  advect: d,t,fuel,v -> d1,t1,fuel1,v1; smoke_advect(ctx)
+  sources: d1,t1,fuel1 -> d,t,fuel; smoke_sources(ctx,inputs)
+  forces: d,t,fuel,v1 -> v2; smoke_forces(ctx,inputs)
+  divergence: v2 -> rhs,pressure; smoke_divergence(ctx)
+  pressure: rhs,pressure -> pressure; smoke_pressure(ctx,colour,relaxation)
+  project: v2,pressure -> v; smoke_project(ctx)
+
+Scalar buffers are f32. v,v1,v2 are vec3: component a stores velocity on the
+negative a face of the indexed cell, in m/s. They are not cell-centred VectorGrid
+fields. d is smoke concentration, t excess temperature above an authored ambient,
+and fuel an authored nonnegative concentration. The library transports these
+three scalars independently; their units and conversion to optical coefficients
+must agree with the authored source and medium. Initial values are ordinary
+buffer data; absent data is zero. Negative domain-face velocities must be zero
+initially. Positive domain-face velocities are implicit zero.
+
+Schedule all operations as simulation passes, dispatching product(SMOKE_DIMS)
+items. Order each fixed tick: advect, sources, forces, divergence, repeated red
+(colour=0) then black (colour=1) pressure passes, project. Choose a finite pressure
+iteration count and relaxation in (0,2); 1.5 is a useful starting value. Each colour
+requires its own dispatch/barrier. Include ALL buffers, including scratch and
+pressure, in simulation.state. The ordinary fixed-clock cursor owns seek/replay.
+Use advect as simulation.init: its dt=0 copies the authored initial generations
+to scratch without changing the published scalar fields.
+
+Before including sources.slang, define:
+  float3 smoke_source(float3 p,float time,float dt,float3 density_heat_fuel,Inputs inputs)
+returning updated scalar values. Before including forces.slang, define:
+  float3 smoke_force(float3 p,float time,float3 density_heat_fuel,Inputs inputs)
+returning acceleration in m/s². Positions use the declared domain coordinates;
+time and dt are seconds. Inputs is the caller’s ordinary numeric input struct,
+forwarded unchanged so sources and forces can use animated controls.
+Callbacks must return finite values; scalar values must
+remain nonnegative. Bounded source injection, exponential losses and a fuel-limited reaction can
+produce artistic fire looks; they are not calibrated combustion chemistry.
+
+Publish d and t through ordinary FloatGrid material inputs and a medium callback
+on a topology:volume carrier. Dense grid coordinates are local [-1,1]³: place the
+carrier at SMOKE_ORIGIN + .5*SMOKE_CELL*SMOKE_DIMS and scale it by half that size.
+Absorption/scattering are per metre; emission is independent of extinction.
+Use std/path. Rendering and simulation costs are separate: lower image resolution
+does not reduce grid, replay or pressure work. First use compiles the stages;
+subsequent renders reuse them. Start coarse, inspect motion, then refine.
+
+METHOD AND LIMITS
+Midpoint backtracing with trilinear semi-Lagrangian transport is bounded by the
+sampled scalar range but diffuses detail and is not mass conservative. Keep
+max(|velocity[a]|*dt/SMOKE_CELL[a]) below about one for useful accuracy; choose a
+smaller timestep when forcing raises speed. No automatic CFL adaptation or hidden
+velocity clipping. Pressure uses matching face divergence and gradient, including
+rectangular cells, with free-slip impermeable walls on all six domain faces.
+A finite iteration count leaves a residual: check divergence and refine the solve.
+Use authored scalar sinks near the walls when a plume should fade before reaching
+them; this is a closed box, not an open outflow or obstacle solver. No sparse
+simulation, moving solids, oxygen chemistry, detonation/shock waves or adaptive
+meshing. An explosion puff demonstrates a buoyant impulse, not compressible gas.
+The five examples remain editable authoring code.
+
+Numerical reference: Bridson and Müller-Fischer, Fluid Simulation (SIGGRAPH 2007),
+https://www.cs.ubc.ca/~rbridson/fluidsimulation/ . Implementation is original.

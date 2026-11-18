@@ -108,7 +108,9 @@ struct CameraPolicy : IVariant {
     static const bool has_camera_interior = true;
     static const bool has_subsurface = true;
     static const bool has_hair = true;
+    static const bool has_scattering = true;
     static const bool installed = false;
+    static const bool has_surface_coverage = true;
 };
 
 #define VORK_CAMERA_SINGLE (camera_config.samples==1u)

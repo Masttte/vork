@@ -65,6 +65,8 @@ pub(crate) struct Values {
     pub world: Option<(String, [u32; 2])>,
     /// Content identity for the host's external text specs; Moda includes it in its text cache key.
     pub text_revision: u64,
+    /// Picture revision for externally held paint values, independent of glyph geometry.
+    pub text_paint_revision: u64,
 }
 /// Text-unit pictures, using Moda's ordinary group-opacity composition.
 #[derive(Clone, Debug, PartialEq)]
@@ -751,18 +753,19 @@ fn paint_is_srgb(image: &v2::Image) -> bool {
     image.is_srgb() && matches!(image.color_space, None | Some(v2::ColorSpace::Srgb))
 }
 impl Media {
+    pub(crate) fn is_empty(&self) -> bool { self.images.is_empty() }
     pub(crate) fn new(scene: &vork_scene::Scene, base: &Path) -> Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut readers: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
-        fn visit(scene: &vork_scene::Scene, nodes: &[v2::Node], at: &mut usize, readers: &mut std::collections::BTreeMap<String, Vec<usize>>) {
+        fn visit(media: &v2::MediaReaders<'_>, nodes: &[v2::Node], at: &mut usize, readers: &mut std::collections::BTreeMap<String, Vec<usize>>) {
             for node in nodes {
-                for name in scene.node_media(node) { readers.entry(name).or_default().push(*at); }
+                for name in media.node_media(node) { readers.entry(name).or_default().push(*at); }
                 *at += 1;
-                visit(scene, &node.children, at, readers);
+                visit(media, &node.children, at, readers);
             }
         }
-        visit(scene, &scene.nodes, &mut 0, &mut readers);
+        visit(&scene.media_readers(), &scene.nodes, &mut 0, &mut readers);
         let mut images = Vec::new();
         for (name, readers) in readers {
             let image = &scene.images[&name];
@@ -797,6 +800,7 @@ impl Media {
             let time = plan.image_time_exact(samples, request, &image.name, base)?;
             let index = image.source.frame_index_exact(&time, self.fps)?;
             if image.frame == Some(index) { continue; }
+            let _decode = moda_engine::prof::span("canvas.input_decode");
             let frame = image.source.frame_exact(&time, self.fps, self.max_side)?.to_rgba8();
             ensure!([frame.width(), frame.height()] == image.size, "image {:?}: frame dimensions changed; use a sequence with constant dimensions", image.name);
             let mut pixels = frame.into_raw();
@@ -1306,6 +1310,8 @@ pub(crate) struct Retained {
     plan_revision: Option<u64>,
     /// Rows whose placement was written since the last plan (the scene's dirty list for the planner).
     moved: moda_scene::stamps::Subscription,
+    painted: moda_scene::stamps::Subscription,
+    content: moda_scene::stamps::Subscription,
     /// Rows written, in any group, since their hashes were taken (the dirty lists for `hashes`).
     unhashed: [moda_scene::stamps::Subscription; 4],
     /// The scene clock at which every row's hash was last taken whole; a later change to everything
@@ -1325,10 +1331,12 @@ impl Retained {
         let (mut scene, bindings) = write_document(page, nodes, values)?.load()?;
         let hashes = moda_engine::residency::node_hashes_for_scene(&scene);
         let moved = scene.subscribe(moda_scene::stamps::Group::Placement);
+        let painted = scene.subscribe(moda_scene::stamps::Group::Paint);
+        let content = scene.subscribe(moda_scene::stamps::Group::Content);
         let unhashed = { use moda_scene::stamps::Group; [Group::Placement, Group::Paint, Group::Content, Group::Structure].map(|group| scene.subscribe(group)) };
         let hashed_at = scene.stamps().clock();
         Ok(Self { background:page.background, forms: nodes.iter().zip(values).map(|(node, v)| Form::of(node, v)).collect(), scene, hashes, bindings, caches: Default::default(), id: RETAINED_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed), plan_index: Default::default(),
-            planned_at: None, plan_revision: None, moved, unhashed, hashed_at,
+            planned_at: None, plan_revision: None, moved, painted, content, unhashed, hashed_at,
             placeable: None, placement_frames: 0, write_frames: 0, installs: 0 })
     }
 
@@ -1339,7 +1347,7 @@ impl Retained {
     }
 
     /// The placement rows written since the last plan, when nothing else was: `None` when content, paint or
-    /// structure changed too (or nothing was planned yet), which is a whole plan.
+    /// structure changed too (or nothing was planned yet). Paint can still use the common span writer.
     fn placement_batch(&self) -> Option<&[u32]> {
         use moda_scene::stamps::Group;
         let stamps = &self.scene.stamps();
@@ -1352,6 +1360,8 @@ impl Retained {
     fn planned(&mut self) {
         self.planned_at = Some(self.scene.stamps().clock());
         self.scene.clear_dirty(self.moved);
+        self.scene.clear_dirty(self.painted);
+        self.scene.clear_dirty(self.content);
     }
 
     /// Lower the canvas again and install the scene that makes: the path of the first install, with every row
@@ -1528,7 +1538,13 @@ impl Retained {
                         fields.insert("fills".into(), world_fill(src, *size));
                     }
                     BoundField::Text { sub } => {
-                        fields.insert("vorkText".into(), json!([item as u64, *sub as u64, new.text_revision]));
+                        let content = json!([item as u64, *sub as u64, new.text_revision]);
+                        if self.scene.row(bound.row).is_some_and(|n| n.field_eq_json("vorkText", &content)) {
+                            rows |= self.scene.write_row(bound.row, |fields| fields.set("vorkPaint", json!(new.text_paint_revision))).map_err(anyhow::Error::msg)?;
+                            continue;
+                        }
+                        fields.insert("vorkText".into(), content);
+                        fields.insert("vorkPaint".into(), json!(new.text_paint_revision));
                         // The laid-out box of every text node of the item, clip copies included.
                         if let Kind::Text { size, .. } = &item_node.kind {
                             fields.insert("width".into(), json!(size[0]));
@@ -1949,7 +1965,7 @@ impl Writer<'_> {
             let body = format!("{id}.glyphs");
             let sub = values.texts;
             self.list.push(json!({"id": body, "type": "richtext", "x": 0, "y": 0,
-                "width": size[0], "height": size[1], "vorkText": [i, sub, values.text_revision]}));
+                "width": size[0], "height": size[1], "vorkText": [i, sub, values.text_revision], "vorkPaint": values.text_paint_revision}));
             self.bindings.push(Binding { item: i, id: body.clone(), field: BoundField::Text { sub } });
             children.push(body);
         }
@@ -2025,7 +2041,7 @@ impl Writer<'_> {
                 // does not know.
                 let texts = self.values[i].texts;
                 let richtext = |id: &str, sub: usize| json!({"id": id, "type": "richtext", "x": 0, "y": 0, "width": size[0], "height": size[1],
-                    "vorkText": [i as u64, sub as u64, self.values[i].text_revision]});
+                    "vorkText": [i as u64, sub as u64, self.values[i].text_revision], "vorkPaint": self.values[i].text_paint_revision});
                 if !self.values[i].text_composition.is_empty() {
                     // `at` is where `parts` sits in the item's composition: each paint's picture and each fading
                     // group is bound by its place there, so their values are fields of nodes that stay.
@@ -2209,6 +2225,7 @@ pub(crate) fn install_captures(captures: &[(String, [u32; 2], u64)]) {
 /// which Moda's frame walk reads them from. A paint's `src` is the store's key: a path, or the path's natural
 /// key for a canvas that takes decoded texels (`Media::decoded_texels`), which Moda's loader prepares so.
 pub(crate) fn install_images(nodes: &[&Node], text_paints: &[&PaintSource]) -> Result<()> {
+    let _decode = moda_engine::prof::span("canvas.input_decode");
     let installed=moda_assets::engine_seam::installed();
     let mut requests = Vec::new();
     let paints = nodes.iter().flat_map(|node| match &node.kind {
@@ -2231,7 +2248,12 @@ pub(crate) fn install_images(nodes: &[&Node], text_paints: &[&PaintSource]) -> R
     if let Some(failure) = report.failures.first() {
         bail!("image {}: {}", moda_assets::natural_source(&failure.url).unwrap_or(&failure.url), failure.reason);
     }
-    // Several canvases (a canvas seen in a world beside another) share the process's store.
+    // Animated paints can discover different images on concurrent frame workers.
+    // Publish additions together: separate read/replace operations could lose another
+    // worker's newly decoded image and leave its draw with a loading placeholder.
+    // Decoding stays outside this lock; installed pixels are immutable and shared.
+    static PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _publish = PUBLISH.lock().expect("canvas image publication");
     let mut merged = moda_assets::engine_seam::installed().map(|installed| (*installed).clone()).unwrap_or_default();
     merged.extend(store);
     moda_assets::engine_seam::install_store(std::sync::Arc::new(merged));
@@ -2297,11 +2319,11 @@ pub(crate) fn warm_text(renderer: &crate::Renderer, float: bool) -> Result<()> {
     let node = |filter| Node { parent: None, clip_path: None, mask: None, filter, kind: Kind::Text { size: [48., 48.] } };
     let (plain, blurred) = (node(Filter::default()), node(Filter { drop_shadow: None, blur: Some(1.) }));
     let values = Values { style_revision: 0, transform: v2::Transform::default(), visible: true, opacity: 1., path: None, texts: 2,
-        text_composition: Vec::new(), text_revision: 0, world: None };
+        text_composition: Vec::new(), text_revision: 0, text_paint_revision: 0, world: None };
     let page = Page { size: [64, 64], scale: [1., 1.], offset: [0., 0.], background: None, working: None };
     let mut retained = Retained::new(&page, &[&plain, &blurred], &[values.clone(), values])?;
     let op = |pipeline, tris: Vec<f32>, records: Vec<VectorAnalyticRecord>| VectorOp {
-        pipeline, color: [1.; 4], opacity: 1., blur_px: 0., stroke_px: 0., additive: false, tris, records, gradient: None,
+        pipeline, color: [1.; 4], opacity: 1., blur_px: 0., stroke_px: 0., additive: false, tris: tris.into(), records: records.into(), gradient: None,
         paint: None,
     };
     // One em square as four quadratic segments (em units, y down, pen origin), and a glyph record that places
@@ -2311,7 +2333,7 @@ pub(crate) fn warm_text(renderer: &crate::Renderer, float: bool) -> Result<()> {
         glyph_lin: [1., 0., 0., 1.], glyph_off: [0., 0.], glyph_opacity: 1. };
     let batch = |vector, degraded| std::sync::Arc::new(moda_text_draw::TextQuadBatch {
         node_id: "setup-text".into(), z: 0., model_matrix: glam::Mat4::IDENTITY.to_cols_array(), page_clip_bounds: [0., 0., 64., 64.],
-        ops: Vec::new(), emojis: Vec::new(), degraded, vector, distort: None, content_key: None,
+        ops: Vec::new(), emojis: Vec::new(), degraded, vector, distort: None, content_key: None, paint_geometry_key: None,
     });
     // The raster lane's picture: a few opaque texels.
     let raster = moda_text::degraded::DegradedRaster { rgba: vec![255; 8 * 8 * 4], width: 8, height: 8, logical_w: 8., logical_h: 8.,
@@ -2323,7 +2345,7 @@ pub(crate) fn warm_text(renderer: &crate::Renderer, float: bool) -> Result<()> {
         }), None),
         batch(None, Some(moda_text_draw::seams::DegradedQuad { raster: std::sync::Arc::new(raster), offset: [0., 0.], opacity: 1. })),
     ];
-    let text: CanvasTextBuilder = std::rc::Rc::new(move |_, index, model, z, clip, _, _| {
+    let text: CanvasTextBuilder = std::rc::Rc::new(move |_, index, model, z, clip, _, _, _| {
         let mut placed = batches[index.min(batches.len() - 1)].clone();
         let batch = std::sync::Arc::make_mut(&mut placed);
         batch.model_matrix = model;
@@ -2338,22 +2360,29 @@ pub(crate) fn warm_text(renderer: &crate::Renderer, float: bool) -> Result<()> {
 
 /// Moda's frame walk over one document: the plan and its warnings. Text nodes are drawn by `text`, given the
 /// vork item index and batch of a richtext node, its model matrix, z, clip, render scale and effective opacity.
-pub(crate) type CanvasTextBuilder = std::rc::Rc<dyn Fn(usize, usize, [f32; 16], f64, [f32; 4], f64, f64) -> Result<Option<std::sync::Arc<moda_text_draw::TextQuadBatch>>>>;
+pub(crate) type CanvasTextBuilder = std::rc::Rc<dyn Fn(usize, usize, [f32; 16], f64, [f32; 4], f64, f64, Option<&moda_text_draw::TextQuadBatch>) -> Result<Option<std::sync::Arc<moda_text_draw::TextQuadBatch>>>>;
 pub(crate) fn plan(
     retained: &mut Retained,
     page: &Page,
     text: CanvasTextBuilder,
 ) -> Result<Plan> {
 
+    let paint_text = text.clone();
+    let identity = retained.id;
+    let geometry_key = move |node: &moda_scene::types::RawNode| {
+        let at = node.json_field("vorkText")?.as_array()?;
+        Some([identity, at.first()?.as_u64()?, at.get(1)?.as_u64()?, at.get(2)?.as_u64()?])
+    };
     let builder: moda_engine::text_draw::TextBuilder = std::rc::Rc::new(move |node, model, z, clip, scale| {
         let at = |k: usize| node.json_field("vorkText").and_then(|v| v.get(k)).and_then(Value::as_u64).map(|v| v as usize);
         let (Some(item), Some(sub)) = (at(0), at(1)) else { bail!("a richtext node vork did not write") };
         let opacity = node.f64("opacity").unwrap_or(1.);
-        Ok(match text(item, sub, model, z, clip, scale, opacity)? {
+        Ok(match text(item, sub, model, z, clip, scale, opacity, None)? {
             Some(mut batch) => {
                 // Planner coverage belongs to this lowered occurrence, not the
                 // authored text name shared by its paint and mask batches.
                 std::sync::Arc::make_mut(&mut batch).node_id = node.id().to_string();
+                std::sync::Arc::make_mut(&mut batch).paint_geometry_key = geometry_key(node);
                 moda_engine::text_draw::TextBuildOutcome::Item(Box::new(moda_engine::seams::DrawItem::Text(batch)))
             },
             None => moda_engine::text_draw::TextBuildOutcome::Empty,
@@ -2379,16 +2408,34 @@ pub(crate) fn plan(
     // Placement writes first follow their recipes, by row, reading no hash and no name. What the recipes decline
     // goes to the planner node by node, and after that to a whole plan; both read current hashes. Either writes
     // the plan the index holds, in place.
+    let patchable = retained.planned_at.is_some_and(|at| {
+        let stamps = retained.scene.stamps();
+        stamps.latest(moda_scene::stamps::Group::Structure) <= at
+            && stamps.all() <= at
+            && [retained.moved, retained.painted, retained.content].into_iter()
+                .any(|list| !stamps.dirty(list).is_empty())
+    });
+    let painter: moda_engine::text_draw::TextPainter = std::rc::Rc::new(move |node, old, opacity| {
+        if old.paint_geometry_key != geometry_key(node) { return None; }
+        let at = node.json_field("vorkText")?.as_array()?;
+        paint_text(at.first()?.as_u64()? as usize, at.get(1)?.as_u64()? as usize,
+            old.model_matrix, old.z, old.page_clip_bounds, 1., opacity, Some(old)).ok().flatten()
+    });
+    moda_engine::text_draw::install_text_painter(Some(painter));
     let placed = if batch {
         let rows = retained.scene.stamps().dirty(retained.moved);
         retained.plan_index.place(&retained.scene, &opts, generation, frame_key, rows, &mut retained.caches)
     } else { None };
     let patched = match placed {
         Some(plan) => Some(plan),
-        None if batch => {
+        None if patchable => {
             retained.refresh_hashes();
             // The planner prepares a node by its name.
-            let ids: Vec<String> = retained.scene.stamps().dirty(retained.moved).iter()
+            let mut rows = retained.scene.stamps().dirty(retained.moved).to_vec();
+            rows.extend_from_slice(retained.scene.stamps().dirty(retained.painted));
+            rows.extend_from_slice(retained.scene.stamps().dirty(retained.content));
+            rows.sort_unstable(); rows.dedup();
+            let ids: Vec<String> = rows.iter()
                 .filter_map(|&row| retained.scene.row(row).map(|node| node.id().to_string())).collect();
             retained.plan_index.patch(&retained.scene, &retained.hashes, &opts, generation, frame_key, ids, &mut retained.caches)
         }
@@ -2424,6 +2471,7 @@ pub(crate) fn plan(
         planned
     };
     moda_engine::text_draw::install_text_builder(None);
+    moda_engine::text_draw::install_text_painter(None);
     let (plan, warnings, change, same) = planned?;
     retained.planned();
     // A plan made or written is the state after the last.
@@ -2504,6 +2552,9 @@ impl Engine {
         engine.set_offscreen_vertex_residency(true);
         Ok(Self { inner: engine, reuse_picture: true, held: Default::default(), picture_hits: Default::default() })
     }
+    pub fn share_images(&mut self, images: std::sync::Arc<moda_engine::paint::draw::SharedImages>) {
+        self.inner.share_images(images);
+    }
     /// Embedded pictures can have deferred consumers, so only their resolve textures must stay distinct.
     pub fn new_picture(renderer: &crate::Renderer, float: bool, working: v2::WorkingColorSpace) -> Result<Self> {
         let mut engine = Self::new(renderer, float, working)?;
@@ -2540,7 +2591,7 @@ impl Engine {
             let change = plan.change.as_ref().map(|(from, change)| PlanChange {
                 from: *from,
                 items: match change {
-                    Change::Written(written) => ChangedItems::Written { placed: &written.placed, replaced: &written.replaced },
+                    Change::Written(written) => ChangedItems::Written { placed: &written.placed, replaced: &written.replaced, masks_changed: written.masks_changed },
                     Change::Whole(before) => ChangedItems::Whole(before),
                 },
             });
@@ -2551,6 +2602,7 @@ impl Engine {
             self.inner.render_plan_to_texture(&plan.coverage)
         };
         moda_engine::text_draw::install_text_builder(None);
+    moda_engine::text_draw::install_text_painter(None);
         // Submission owns GPU resource lifetimes; exports need not keep old CPU
         // plans through the editor's idle-time destruction queue.
         self.inner.drop_deferred();
@@ -2614,7 +2666,7 @@ mod tests {
         let node = Node { parent: None, clip_path: None, mask: None, filter: Filter::default(),
             kind: Kind::Text { size: [80., 80.] } };
         let mut values = Values { style_revision: 0, transform: v2::Transform::default(), visible: true,
-            opacity: 1., path: None, texts: 2, text_composition: Vec::new(), text_revision: 0, world: None };
+            opacity: 1., path: None, texts: 2, text_composition: Vec::new(), text_revision: 0, text_paint_revision: 0, world: None };
         let page = Page { size: [256, 128], scale: [1., 1.], offset: [0., 0.], background: None, working: None };
         let mut retained = Retained::new(&page, &[&node], &[values.clone()])?;
         // A host can serve shared shaped glyphs for multiple lowered batches.
@@ -2622,10 +2674,10 @@ mod tests {
         let shared = std::sync::Arc::new(moda_text_draw::TextQuadBatch {
             node_id: "authored-text".into(), z: 0., model_matrix: glam::Mat4::IDENTITY.to_cols_array(),
             page_clip_bounds: [0., 0., 256., 128.], ops: Vec::new(), emojis: Vec::new(),
-            degraded: None, vector: None, distort: None, content_key: None,
+            degraded: None, vector: None, distort: None, content_key: None, paint_geometry_key: None,
         });
         let source = shared.clone();
-        let builder = std::rc::Rc::new(move |_, _, model, z, clip, _, _| {
+        let builder: CanvasTextBuilder = std::rc::Rc::new(move |_, _, model, z, clip, _, _, _| {
             let mut batch = source.clone();
             let placed = std::sync::Arc::make_mut(&mut batch);
             placed.model_matrix = model;
@@ -2662,13 +2714,49 @@ mod tests {
             let hits = retained.caches.incr_patch_hits;
             retained.update(&page, &[&node], &[values.clone()])?;
             let changed = plan(&mut retained, &page, builder.clone())?;
-            assert_eq!(retained.caches.incr_patch_hits - hits, u64::from(step < 4),
-                "only placement edits reuse the indexed plan");
+            assert_eq!(retained.caches.incr_patch_hits - hits, 1,
+                "node-local placement and content edits reuse the indexed plan");
             assert!(!std::sync::Arc::ptr_eq(previous.as_ref().unwrap(), &changed.coverage));
             let mut fresh = Retained::new(&page, &[&node], &[values.clone()])?;
             let expected = plan(&mut fresh, &page, builder.clone())?;
             assert_eq!(format!("{:?}", changed.coverage.items), format!("{:?}", expected.coverage.items));
             previous = Some(changed.coverage.clone());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lowered_group_opacity_writes_only_composition_outputs() -> Result<()> {
+        use std::sync::Arc;
+        let path = Arc::new(PathItem {
+            points: moda_points(&vork_std::moda::path_commands("M-2 0A2 2 0 1 0 2 0A2 2 0 1 0-2 0Z")?.0),
+            closed: true, bounds: None, length: 0.,
+            fill: PaintSource::Color([1.,0.,0.,1.]), stroke: PaintSource::None,
+            fill_rule: Default::default(), linecap: Default::default(), linejoin: Default::default(),
+            miterlimit: 4., dasharray: Vec::new(), path_length: None, stroke_first: false,
+            values: PathValues {fill:Some([1.,0.,0.,1.]),stroke:None,stroke_width:0.,stroke_dashoffset:0.,fill_opacity:1.,stroke_opacity:1.},
+        });
+        let mut nodes = vec![Node {parent:None,clip_path:None,mask:None,filter:Default::default(),kind:Kind::Group}];
+        nodes.extend((0..40).map(|_| Node {parent:Some(0),clip_path:None,mask:None,filter:Default::default(),kind:Kind::Path(path.clone())}));
+        let mut values = vec![Values {style_revision:0,transform:Default::default(),visible:true,opacity:1.,
+            path:Some(path.values),texts:0,text_composition:Vec::new(),world:None,text_revision:0,text_paint_revision:0};nodes.len()];
+        values[0].path=None; values[0].opacity=0.6;
+        for (i, value) in values.iter_mut().enumerate().skip(1) { value.transform.translation=[8. + i as f32 * 2.,40.,0.]; }
+        let page=Page {size:[320,180],scale:[1.,1.],offset:[0.,0.],background:None,working:None};
+        let refs=nodes.iter().collect::<Vec<_>>();
+        let mut retained=Retained::new(&page,&refs,&values)?;
+        let builder: CanvasTextBuilder=std::rc::Rc::new(|_,_,_,_,_,_,_,_| Ok(None));
+        plan(&mut retained,&page,builder.clone())?;
+        for opacity in [0.4,0.7,0.3,0.8] {
+            values[0].opacity=opacity;
+            retained.update(&page,&refs,&values)?;
+            let changed=plan(&mut retained,&page,builder.clone())?;
+            let Some((_,Change::Written(written)))=&changed.change else { panic!("opacity must patch its plan"); };
+            assert_eq!(written.replaced.len(),2,"the lowered group must retain child draw records");
+            assert!(written.placed.is_empty());
+            let mut fresh=Retained::new(&page,&refs,&values)?;
+            let expected=plan(&mut fresh,&page,builder.clone())?;
+            assert_eq!(format!("{:?}",changed.coverage),format!("{:?}",expected.coverage));
         }
         Ok(())
     }
@@ -2691,7 +2779,7 @@ mod tests {
                     nodes[1].kind = Kind::Group;
                     nodes.push(Node { parent: Some(1), clip_path: None, mask: None, filter: Filter::default(), kind: Kind::Text { size: [8., 8.] } });
                 }
-                let mut values = vec![Values { style_revision: 0, transform: v2::Transform::default(), visible: true, opacity: 1., path: None, texts: batches, text_composition: Vec::new(), text_revision: 0, world: None }; nodes.len()];
+                let mut values = vec![Values { style_revision: 0, transform: v2::Transform::default(), visible: true, opacity: 1., path: None, texts: batches, text_composition: Vec::new(), text_revision: 0, text_paint_revision: 0, world: None }; nodes.len()];
                 values[0].transform.scale = parent_scale;
                 values[0].transform.rotation = Some(glam::Quat::from_rotation_z(angle).to_array());
                 let page = Page { size: [256, 128], scale, offset: [23., 45.], background: None, working: None };
@@ -2773,7 +2861,7 @@ mod retained_world_tests {
                 kind: Kind::Text { size: [160., 120.] } };
             let nodes = [&node];
             let mut values = vec![Values { style_revision: 0, transform: Default::default(), visible: true, opacity: 0.5,
-                path: None, texts: 1, text_composition: Vec::new(), text_revision: 0, world: None }];
+                path: None, texts: 1, text_composition: Vec::new(), text_revision: 0, text_paint_revision: 0, world: None }];
             let mut retained = Retained::new(&page, &nodes, &values).unwrap();
             for opacity in [0.5, 1., 0.25, 0., 0.5] {
                 values[0].opacity = opacity;
@@ -2806,7 +2894,7 @@ mod retained_world_tests {
         let text = |filter: &str| Node { parent: None, clip_path: None, mask: None, filter: parse_filter(filter).unwrap(),
             kind: Kind::Text { size: [160., 120.] } };
         let mut values = vec![Values { style_revision: 0, transform: Default::default(), visible: true, opacity: 1.,
-            path: None, texts: 1, text_composition: Vec::new(), text_revision: 0, world: None }];
+            path: None, texts: 1, text_composition: Vec::new(), text_revision: 0, text_paint_revision: 0, world: None }];
         let first = text("drop-shadow(8px 4px 0px red)");
         let mut retained = Retained::new(&page, &[&first], &values).unwrap();
         for (step, filter) in ["drop-shadow(2px 9px 3px blue)", "drop-shadow(8px 4px 0px red)", "drop-shadow(-5px 1px 6px #00ff0080)"].into_iter().enumerate() {
@@ -2835,7 +2923,7 @@ mod retained_world_tests {
             let mut nodes = vec![source.clone(),source.clone(),source.clone(),source.clone()];
             nodes[1].clip_path=Some(0); nodes[2].clip_path=Some(0);
             let mut values = vec![Values {style_revision:0,transform:Default::default(),visible:true,opacity:1.,
-                path:Some(path.values),texts:0,text_composition:Vec::new(),world:None,text_revision:0};4];
+                path:Some(path.values),texts:0,text_composition:Vec::new(),world:None,text_revision:0,text_paint_revision:0};4];
             let page=Page {size:[64,64],scale:[1.,1.],offset:[0.,0.],background:None,working:None};
             let mut retained=Retained::new(&page,&nodes.iter().collect::<Vec<_>>(),&values).unwrap();
             let copies:Vec<u32>=retained.bindings.list.iter().filter(|b| matches!(b.field,BoundField::Geometry))
@@ -2887,7 +2975,7 @@ mod retained_world_tests {
         let nodes = [&node];
         let page = Page { size: [64, 64], scale: [1., 1.], offset: [0., 0.], background: None, working: None };
         let mut values = vec![Values { style_revision: 0, transform: Default::default(), visible: true, opacity: 1.,
-            path: None, texts: 0, text_composition: Vec::new(), text_revision: 0, world: None }];
+            path: None, texts: 0, text_composition: Vec::new(), text_revision: 0, text_paint_revision: 0, world: None }];
         let mut retained = Retained::new(&page, &nodes, &values).unwrap();
         for (step, picture) in [Some(("a", [64, 64])), Some(("b", [64, 64])), Some(("b", [32, 32])), None,
             Some(("a", [64, 64]))].into_iter().enumerate() {

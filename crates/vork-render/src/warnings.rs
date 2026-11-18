@@ -31,6 +31,9 @@ impl Collector {
 pub(crate) fn dropped(code: &'static str, requested: serde_json::Value, dropped: String) {
     record(code, requested, dropped);
 }
+pub(crate) fn approximated(code: &'static str, requested: serde_json::Value, approximation: String) {
+    record(code, requested, approximation);
+}
 fn record(code: &'static str, requested: serde_json::Value, dropped: String) {
     let warning = RenderWarning { code, requested, dropped };
     let fresh = CURRENT.with(|current| {
@@ -39,7 +42,7 @@ fn record(code: &'static str, requested: serde_json::Value, dropped: String) {
         let mut warnings = collector.0.lock().unwrap();
         if warnings.contains(&warning) { false } else { warnings.push(warning.clone()); !collector.1 }
     });
-    if fresh && code == "nonfinite_samples" {
+    if fresh && matches!(code, "nonfinite_samples" | "previs_material_emission" | "openpbr_approximation") {
         eprintln!("WARNING: {}", warning.dropped);
     } else if fresh {
         // No ANSI or TTY detection: the same conspicuous record survives logs.

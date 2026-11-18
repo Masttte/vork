@@ -116,8 +116,10 @@ pub(crate) fn opacity_within(scene: &Scene, id: &str, root: &str) -> Option<f64>
     };
     let mut product = own;
     let mut cursor = parent_of(id);
-    // Depth-bounded: corrupt parent data must not hang the planner.
-    for _ in 0..256 {
+    // Bounded: corrupt parent data (a cycle) must not hang the planner. A chain of parents visits each link at
+    // most once, so no valid chain is longer than the links the scene holds, however deep its nodes nest.
+    let links = scene.parent_map().len() + scene.transient_parent_of().len();
+    for _ in 0..=links {
         let pid = cursor?;
         if pid == root {
             return Some(product);
@@ -707,7 +709,23 @@ pub(crate) fn plan_shadow_group(
 /// The canvas AABB of drawn items (tessellated bodies' geometry bounds, text
 /// glyph and op vertices), through each item's model matrix. `None` when
 /// nothing measurable draws.
+/// Unrounded extrema of the ordinary body/text bounds walk. Keeping extrema until the final Rect avoids
+/// reconstructing a maximum with x + width at intermediate retained nodes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ItemExtents { min: (f64, f64), max: (f64, f64) }
+impl ItemExtents {
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self { min: (self.min.0.min(other.min.0), self.min.1.min(other.min.1)),
+            max: (self.max.0.max(other.max.0), self.max.1.max(other.max.1)) }
+    }
+    pub(crate) fn rect(self) -> Rect {
+        Rect { x: self.min.0, y: self.min.1, w: self.max.0 - self.min.0, h: self.max.1 - self.min.1 }
+    }
+}
 pub(crate) fn items_canvas_bounds(items: &[crate::seams::DrawItem]) -> Option<Rect> {
+    item_extents(items).map(ItemExtents::rect)
+}
+pub(crate) fn item_extents(items: &[crate::seams::DrawItem]) -> Option<ItemExtents> {
     use crate::seams::DrawItem;
     let mut min = (f64::INFINITY, f64::INFINITY);
     let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -753,7 +771,7 @@ pub(crate) fn items_canvas_bounds(items: &[crate::seams::DrawItem]) -> Option<Re
                     for v in op.tris.chunks_exact(2) {
                         add(m, v[0], v[1]);
                     }
-                    for r in &op.records {
+                    for r in op.records.iter() {
                         let [x0, y0, x1, y1] = r.em_box;
                         let s = r.font_size_px;
                         let center = (
@@ -778,12 +796,20 @@ pub(crate) fn items_canvas_bounds(items: &[crate::seams::DrawItem]) -> Option<Re
             _ => {}
         }
     }
-    (min.0 <= max.0 && min.1 <= max.1).then(|| Rect {
-        x: min.0,
-        y: min.1,
-        w: max.0 - min.0,
-        h: max.1 - min.1,
-    })
+    (min.0 <= max.0 && min.1 <= max.1).then_some(ItemExtents { min, max })
+}
+
+/// The ordered rectangle union used by capture and capture-local isolation bounds.
+/// Keep its arithmetic order: repeated x+w reconstruction is observable at floating-point boundaries.
+pub(crate) fn union_canvas_bounds(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
+            let (x1, y1) = ((a.x + a.w).max(b.x + b.w), (a.y + a.h).max(b.y + b.h));
+            Some(Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+        }
+        (a, b) => a.or(b),
+    }
 }
 
 /// The canvas AABB every one of `items` paints (a subtree layer capture's
@@ -795,22 +821,7 @@ pub(crate) fn all_items_canvas_bounds(items: &[crate::seams::DrawItem]) -> Optio
     use crate::seams::DrawItem;
     let mut acc = items_canvas_bounds(items);
     let mut add = |r: Rect| {
-        if !r.finite() {
-            return;
-        }
-        acc = Some(match acc {
-            None => r,
-            Some(a) => {
-                let (x0, y0) = (a.x.min(r.x), a.y.min(r.y));
-                let (x1, y1) = ((a.x + a.w).max(r.x + r.w), (a.y + a.h).max(r.y + r.h));
-                Rect {
-                    x: x0,
-                    y: y0,
-                    w: x1 - x0,
-                    h: y1 - y0,
-                }
-            }
-        });
+        if r.finite() { acc = union_canvas_bounds(acc, Some(r)); }
     };
     // The canvas AABB of a local box through a column-major model matrix.
     let boxed = |m: &[f32; 16], x0: f64, y0: f64, x1: f64, y1: f64| {

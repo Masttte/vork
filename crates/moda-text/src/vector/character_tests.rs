@@ -40,7 +40,7 @@ fn records(html: &str, store: &VectorFontStore, catalog: &Catalog) -> Vec<Vector
     };
     match build_vector_node_ops(&spec, store, catalog, 1.0, VectorPlacement::VectorParity) {
         VectorEngineDecision::Vector(ops) => {
-            ops.ops.iter().flat_map(|o| o.records.clone()).collect()
+            ops.ops.iter().flat_map(|o| o.records.iter().cloned()).collect()
         }
         other => panic!("not vector: {other:?}"),
     }

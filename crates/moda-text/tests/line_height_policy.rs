@@ -100,7 +100,7 @@ fn fractional_lines_keep_layout_and_draw_in_step_without_changing_moda_default()
                 ) else {
                     panic!("expected vector draw")
                 };
-                let records: Vec<_> = ops.ops.iter().flat_map(|op| &op.records).collect();
+                let records: Vec<_> = ops.ops.iter().flat_map(|op| op.records.iter()).collect();
                 assert_eq!(records.len(), glyph_lines.len());
                 for (record, line) in records.iter().zip(&glyph_lines) {
                     assert!(

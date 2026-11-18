@@ -80,3 +80,7 @@ Unchanged.
 - `src/text_draw.rs`: `TextDraw::new` takes the owning engine's working colour (`moda_shaders::working_color`),
   compiles its text modules for it, and uploads a text raster's or an emoji's texture in it (half floats; the
   crate gains `half`).
+- `src/records.rs`: vork's retained `Column` and `PendingRecords`, moved from moda-engine's packet writer so
+  text uniforms and body records use the same staging, discard and batched-upload rule; its test moved with it.
+- `src/seams.rs`, `src/text_draw.rs`: host content identity for paint-only reuse, retained uniform columns and
+  addressed paint writes. The engine owns upload accounting and the queue commit.

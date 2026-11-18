@@ -55,10 +55,15 @@ interface IVariant {
     // is a fibre program. Distinct from `subsurface`, the raster diffusion technique.
     static const bool has_subsurface;
     static const bool has_hair;
+    // Final closure only: the surface before lit may still need lighting.
+    static const bool has_scattering;
     // The key is the union of every installed material. Only then are the
     // capabilities it lacks absent from the whole scene, and only then does
     // installed_surface state them.
     static const bool installed;
+    // Scalar coverage may be partial in the installed scene. Generic and
+    // covering keys retain the reader, independently of transmission.
+    static const bool has_surface_coverage;
 }
 // Whether `input` may be textured in this variant.
 bool input_textured<V:IVariant>(uint input) {
@@ -104,5 +109,7 @@ struct Unspecialized : IVariant {
     static const bool has_camera_interior = true;
     static const bool has_subsurface = true;
     static const bool has_hair = true;
+    static const bool has_scattering = true;
     static const bool installed = false;
+    static const bool has_surface_coverage = true;
 };

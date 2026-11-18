@@ -78,3 +78,6 @@ available under MIT).
   empty lines, text measurement and glyph extraction use the same policy; shaping and baseline metrics
   are unchanged. `tests/line_height_policy.rs` and `tests/degraded_contract.rs` cover fractional line
   advances across hard breaks, soft wraps and empty paragraphs, including actual glyph draw positions.
+- `src/ops.rs`: compare text content independently of supplied run/stroke colours without copying specs.
+  `src/vector/ops.rs`: triangle and analytic-record arrays are shared immutable geometry, as curve points
+  already are; consumers borrow their slices and paint copies share their allocations.

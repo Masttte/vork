@@ -72,11 +72,11 @@ struct GiGuide {float4 point;float4 moments;};
 bool gi_small_infinite_set<V:IVariant>(uint count) {
     if(count>REG_GI_PILOT_RAYS) return false;
     if(V.light_types==1u) return true;
-    for(uint i=0u;i<count;i++) {if(lights[i].position.w>0.) return false;}
+    for(uint i=0u;i<uint(frame_light_count(frame));i++) {if(any(lights[i].radiance.rgb!=float3(0.)) && lights[i].position.w>0.) return false;}
     return true;
 }
 float2 gi_hit_light<V:IVariant>(float3 world,uint2 pixel,uint index,uint count,bool pilot,bool lit_material) {
-    let lights_count=uint(frame_light_count(frame));
+    let lights_count=gi_light_nodes[0].links.w;
     // Authored Shader-to-RGB can apply nonlinear functions to `lit`.
     // Preserve its complete input lighting; sampling before that function
     // would change authored semantics rather than merely estimator variance.
@@ -110,9 +110,9 @@ GiProposal gi_proposal(uint2 pixel,float3 position,float3 normal) {
         result.weight[i]=guide.w*max(dot(normal,result.axis[i]),0.)/max(distance2,0.01);
         result.total+=result.weight[i];
     }
-    let count=uint(frame_light_count(frame));
+    let count=gi_light_nodes[0].links.w;
     if(count>0u) {
-        var identity=0u;
+        var identity=gi_light_nodes[0].source.y;
         if(count>1u) {
             let u=sample_2d(gi_pixel_key(pixel)^uint2(0x4a39b70du,0x12fad5c9u),0u,1u,REG_SAMPLING_STREAM_MEDIUM_LIGHT);
             identity=light_tree_pick(gi_light_nodes,2u*count-1u,position,u).identity;
@@ -150,11 +150,11 @@ bool gi_needs_samples<V:IVariant>(uint2 pixel,float3 position,float3 normal) {
     // concentration, world/light proxies cannot change the budget decision.
     if(peak<=REG_GI_CONCENTRATION*max(mean/9.,1.e-12)) return false;
     let world_signal=max(dot(world_radiance(normal)*frame.radiance.w,float3(.2126,.7152,.0722)),0.);
-    var direct_signal=0.;let count=uint(frame_light_count(frame));
+    var direct_signal=0.;let count=gi_light_nodes[0].links.w;
     // Up to the discovery budget, exact cheap proxies avoid lottery-driven
     // oversampling of ordinary broad bounce. Many-source views retain the tree.
     if(count<=REG_GI_PILOT_RAYS) {
-        for(uint i=0u;i<count;i++) direct_signal+=gi_unoccluded_signal<V>(i,position,normal);
+        for(uint i=0u;i<uint(frame_light_count(frame));i++) direct_signal+=gi_unoccluded_signal<V>(i,position,normal);
     } else {
         let u=sample_2d(gi_pixel_key(pixel)^uint2(0x4a39b70du,0x12fad5c9u),0u,1u,REG_SAMPLING_STREAM_MEDIUM_LIGHT);
         let pick=light_tree_pick(gi_light_nodes,2u*count-1u,position,u);
@@ -301,7 +301,7 @@ void gi_pixel<V:IVariant,P:IProgram>(uint3 gid) {
     }
     var rays=REG_GI_PILOT_RAYS;
     if(pilot) {
-        let count=uint(frame_light_count(frame));
+        let count=gi_light_nodes[0].links.w;
         // A small infinite-only source set has no light origins to explore.
         // Keep the independent hemisphere pilots; omit the two unavailable
         // source-origin pilots instead of replacing them with redundant rays.
@@ -373,7 +373,7 @@ void gi_pixel<V:IVariant,P:IProgram>(uint3 gid) {
         var direction_weight=density>0. ? max(dot(n,direction),0.)/(REG_PI*density) : 0.;
         var light_pilot=false;var light_origin=float3(0.);
         if(pilot && k>=REG_GI_PILOT_RAYS/2u) {
-            let light_count=uint(frame_light_count(frame));
+            let light_count=gi_light_nodes[0].links.w;
             if(light_count>0u) {
                 let pick=light_tree_pick(gi_light_nodes,2u*light_count-1u,position,strategy);
                 let source=lights[pick.identity];

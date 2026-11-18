@@ -3,7 +3,7 @@
 //! Language-independent JSON fragments from the same implementation as @voyager-so/vork.
 //! The embedded engine has no host bindings, filesystem or network access.
 mod expand;
-pub use expand::{expand_scene, load_scene};
+pub use expand::{expand_scene, expand_scene_with, load_scene};
 pub mod environment;
 mod extrude;
 pub mod moda;
@@ -40,6 +40,18 @@ fn clamp_radii(radii: &[f32], edges: &[(f32, &[usize])]) -> Vec<f32> {
 }
 
 pub fn evaluate(function: &str, argument: &str) -> Result<String> {
+    evaluate_with_cache(function, argument, || None, |_| {})
+}
+
+/// Only the embedded geometry builders have closed inputs. The caller owns the
+/// key (including these sources and the complete call), storage and eviction.
+/// Native builders keep their ordinary path, including text's font reads.
+pub fn evaluate_with_cache(
+    function: &str,
+    argument: &str,
+    read: impl FnOnce() -> Option<String>,
+    write: impl FnOnce(&str),
+) -> Result<String> {
     match function {
         "expand" => {
             let mut scene = serde_json::from_str(argument)?;
@@ -52,6 +64,7 @@ pub fn evaluate(function: &str, argument: &str) -> Result<String> {
         "sweep" => return sweep::evaluate(argument),
         _ => {}
     }
+    if let Some(result) = read() { return Ok(result); }
     let runtime = rquickjs::Runtime::new().context("initialize standard-library engine")?;
     let context =
         rquickjs::Context::full(&runtime).context("initialize standard-library context")?;
@@ -61,7 +74,7 @@ pub fn evaluate(function: &str, argument: &str) -> Result<String> {
         serde_json::to_string(function)?,
         serde_json::to_string(argument)?
     );
-    context.with(|ctx| {
+    let result = context.with(|ctx| {
         ctx.eval::<String, _>(script).map_err(|error| {
             let exception = ctx.catch();
             let message = exception
@@ -70,12 +83,54 @@ pub fn evaluate(function: &str, argument: &str) -> Result<String> {
                 .unwrap_or_else(|| error.to_string());
             anyhow::anyhow!("standard-library function failed: {message}")
         })
-    })
+    })?;
+    write(&result);
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_geometry_reuses_exact_results_without_hiding_changed_or_invalid_calls() {
+        let cache = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        let writes = std::cell::Cell::new(0);
+        let cached = |function: &str, argument: &str| {
+            let key = (function.to_owned(), argument.to_owned());
+            evaluate_with_cache(function, argument,
+                || cache.borrow().get(&key).cloned(),
+                |result| {
+                    writes.set(writes.get() + 1);
+                    cache.borrow_mut().insert(key.clone(), result.to_owned());
+                })
+        };
+        let calls = [
+            ("sphere", r#"{"radius":0.85,"segments":16,"rings":8}"#),
+            ("sphere", r#"{"radius":0.9,"segments":16,"rings":8}"#),
+            ("box", r#"{"size":[0.9,0.9,0.9]}"#),
+            ("grid", r#"{"size":[200,200]}"#),
+        ];
+        for (function, argument) in calls {
+            let expected = evaluate(function, argument).unwrap();
+            assert_eq!(cached(function, argument).unwrap(), expected);
+            assert_eq!(cached(function, argument).unwrap(), expected);
+        }
+        assert_eq!(writes.get(), calls.len());
+        assert!(cached("sphere", r#"{"radius":-1}"#).is_err());
+        assert!(cached("not_a_builder", "{}").is_err());
+        assert_eq!(writes.get(), calls.len(), "failed calls are never published");
+    }
+
+    #[test]
+    fn file_dependent_builders_do_not_consult_closed_geometry_cache() {
+        let argument = serde_json::json!({"body":"A", "font": std::env::temp_dir()
+            .join(format!("vork-std-cache-missing-font-{}.ttf", std::process::id()))}).to_string();
+        let error = evaluate_with_cache("text", &argument,
+            || panic!("a font read cannot be replaced by a closed-input cache hit"),
+            |_| panic!("a file-dependent result cannot be published here")).unwrap_err();
+        assert!(error.chain().any(|cause| cause.is::<std::io::Error>()));
+    }
 
     #[test]
     fn retired_builders_are_normal_lookup_errors() {

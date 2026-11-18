@@ -261,6 +261,9 @@ pub struct MaskRef {
 /// (`effects::mask::coverage_placement`).
 #[derive(Clone, PartialEq)]
 pub struct MaskPlan {
+    /// The row whose coverage this mask reads. Unlike the owner, this names the source of a group mask
+    /// or a clip-to-below mask. Retained dependency membership stands only while this binding stands.
+    pub source_node_id: String,
     /// The mask owner (group with `clipMaskNodeId` / container with
     /// `clipContent`).
     pub owner_node_id: String,
@@ -397,12 +400,25 @@ pub struct MaskImage {
     pub rendered: Option<std::sync::Arc<RenderedMask>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RenderedMask {
     pub document: std::sync::Arc<moda_scene::types::SceneDocument>,
     pub node_id: String,
     pub shader_time_s: f64,
     pub source_fingerprint: u64,
+    /// Self-contained host text/path subtree eligible for exact retained capture reuse.
+    pub cache_key: Option<u64>,
+    /// A fact of this immutable capture, established by its ordinary prepared plan. Unknown means
+    /// clock-dependent until the executor proves otherwise; preparing a new source starts unknown.
+    pub(crate) shader_clock: std::sync::OnceLock<bool>,
+}
+
+impl std::fmt::Debug for RenderedMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderedMask").field("document", &self.document).field("node_id", &self.node_id)
+            .field("shader_time_s", &self.shader_time_s).field("source_fingerprint", &self.source_fingerprint)
+            .field("cache_key", &self.cache_key).finish()
+    }
 }
 
 impl PartialEq for RenderedMask {
@@ -777,6 +793,8 @@ pub struct ShaderImageTexture {
 /// inner-shadow quads +0.5. Depth = `depth::linear_depth(z)`.
 #[derive(Debug, Clone)]
 pub enum DrawItem {
+    /// Storage released by a retained unit. Painter order never includes this slot.
+    Vacant,
     /// The page-fill quad (depth hardcoded 0.99999 in WGSL; drawn before all
     /// nodes; skipped for transparent exports and non-solid page fills).
     PageFill { instance: PageInstance },
@@ -1382,7 +1400,7 @@ impl BlendMode {
 ///   - all blending is premultiplied source-over IN GAMMA (sRGB) SPACE except
 ///     the fixed-function approximations named by `BlendMode`,
 ///   - clip = rect intersect (page_clip) then optional mask multiply.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CoveragePlan {
     pub page_id: String,
     pub page_index: usize,
@@ -1402,6 +1420,9 @@ pub struct CoveragePlan {
     /// Canvas-space camera origin (= page position; zoom 1).
     pub camera: [f64; 2],
     pub items: Vec<DrawItem>,
+    /// Present only after retained output changes its slot count. Indices remain stable; this column
+    /// supplies painter order without moving unrelated output or reseeding its addresses.
+    pub(crate) item_order: Option<crate::plan_items::ItemOrder>,
     /// M3d interface-change note (SEAMS.md change log; additive): per-owner
     /// mask coverage plans, indexed by `MaskRef::mask_id`. Ancestor masks
     /// always precede descendants. Empty when the page has no mask owners.
@@ -1421,6 +1442,24 @@ pub struct CoveragePlan {
     /// Tiled export: the raster band the tile projects through and the tile's
     /// place in it (`RegionViewport`). `None` for every other plan.
     pub region_viewport: Option<RegionViewport>,
+}
+
+impl CoveragePlan {
+    pub(crate) fn indexed_items(&self) -> crate::plan_items::PlanItems<'_> { crate::plan_items::PlanItems::new(self) }
+    pub(crate) fn ordered_items(&self) -> impl ExactSizeIterator<Item = &DrawItem> { self.indexed_items().map(|(_, item)| item) }
+}
+// The plan's value is its ordered output; arena addresses are retained execution metadata.
+impl std::fmt::Debug for CoveragePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoveragePlan")
+            .field("page_id", &self.page_id).field("page_index", &self.page_index)
+            .field("width_px", &self.width_px).field("height_px", &self.height_px)
+            .field("page_size", &self.page_size).field("scale", &self.scale)
+            .field("transparent", &self.transparent).field("sample_count", &self.sample_count)
+            .field("camera", &self.camera).field("items", &self.ordered_items().collect::<Vec<_>>())
+            .field("masks", &self.masks).field("camera_frame", &self.camera_frame)
+            .field("clear_rgba", &self.clear_rgba).field("region_viewport", &self.region_viewport).finish()
+    }
 }
 
 /// Tiled export: how a tile projects — through a `raster_w x raster_h`

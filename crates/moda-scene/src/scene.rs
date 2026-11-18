@@ -33,7 +33,8 @@ pub type HashMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHash
 /// deep chain stays linear.
 #[derive(Default)]
 pub struct SeenIds<'a> {
-    list: Vec<&'a str>,
+    list: [Option<&'a str>; 16],
+    len: usize,
     set: Option<HashSet<&'a str>>,
 }
 
@@ -46,12 +47,14 @@ impl<'a> SeenIds<'a> {
         if let Some(set) = &mut self.set {
             return set.insert(id);
         }
-        if self.list.contains(&id) {
+        if self.list[..self.len].contains(&Some(id)) {
             return false;
         }
-        self.list.push(id);
-        if self.list.len() > Self::LIST_MAX {
-            self.set = Some(self.list.drain(..).collect());
+        if self.len < Self::LIST_MAX {
+            self.list[self.len] = Some(id);
+            self.len += 1;
+        } else {
+            self.set = Some(self.list.iter().flatten().copied().chain(std::iter::once(id)).collect());
         }
         true
     }
@@ -576,14 +579,17 @@ pub struct Scene {
 /// classification every in-place write stamps by ([`Scene::write_row`], [`Scene::write_placement`]).
 ///
 /// - Placement: the node's own transform, and the opacity of a node that draws a body itself.
-/// - Content: everything else. A node that holds children composites them by its opacity, so that is content. A
-///   `fills` or `strokes` field can change a paint's form or a stroke's geometry as well as a paint's values, so a
+/// - Paint: a compositing parent's opacity while its isolation form stands, and external text paint values.
+///   Opening or closing opacity isolation is Content (the writers check the before/after form).
+/// - Content: everything else. A `fills` or `strokes` field can change a paint's form or a stroke's geometry as well as a paint's values, so a
 ///   field write of one is content too; the paint group is for a write that names a value of a paint that keeps
 ///   its form.
 fn field_group(node: &RawNode, key: &str) -> crate::stamps::Group {
     match key {
         "x" | "y" | "rotation" | "scaleX" | "scaleY" | "scale" | "skewX" => crate::stamps::Group::Placement,
         "opacity" if !is_parent_node(node) => crate::stamps::Group::Placement,
+        "opacity" if is_opacity_group(node) => crate::stamps::Group::Paint,
+        "vorkPaint" if node.node_type() == "richtext" => crate::stamps::Group::Paint,
         _ => crate::stamps::Group::Content,
     }
 }
@@ -593,8 +599,8 @@ fn field_group(node: &RawNode, key: &str) -> crate::stamps::Group {
 /// belongs to ([`field_group`]).
 pub struct RowFields<'a> {
     node: &'a mut RawNode,
-    /// Whether a field of the placement group, and of the content group, was written.
-    wrote: [bool; 2],
+    /// Whether a field of each non-structural group (Placement, Paint, Content) was written.
+    wrote: [bool; 3],
     /// The write named a field that is structure.
     structure: bool,
 }
@@ -610,8 +616,14 @@ impl RowFields<'_> {
         if self.node.field_eq_json(key, &value) {
             return;
         }
-        self.wrote[usize::from(field_group(self.node, key) != crate::stamps::Group::Placement)] = true;
+        let group = field_group(self.node, key);
+        let composition = (key == "opacity" && group == crate::stamps::Group::Paint).then(|| is_opacity_group(self.node));
         self.node.set(key, value);
+        // A paint value keeps its form. Opening or closing an isolation changes content instead.
+        let group = if composition.is_some_and(|before| before != is_opacity_group(self.node)) {
+            crate::stamps::Group::Content
+        } else { group };
+        self.wrote[group as usize] = true;
     }
 
     /// Replace the node's path geometry with compact points it shares with other nodes.
@@ -619,7 +631,7 @@ impl RowFields<'_> {
         if self.node.shared_points().is_some_and(|held| std::sync::Arc::ptr_eq(held, &points) || **held == *points) {
             return;
         }
-        self.wrote[1] = true;
+        self.wrote[2] = true;
         self.node.set_shared_points(points);
     }
 
@@ -1216,7 +1228,7 @@ impl Scene {
     /// A number the row already holds is not written, and a write that changes nothing leaves the clock alone:
     /// the same rule as a field write ([`RowFields::set`]). The row is stamped as a placement when its transform
     /// changed; a changed opacity is stamped as a field write of it is ([`field_group`]: placement for a node
-    /// that draws a body itself, content for one that holds children). Returns whether anything changed.
+    /// that draws a body itself, paint for a compositing value, content when its isolation form changes). Returns whether anything changed.
     pub fn write_placement(&mut self, row: u32, transform: Option<NodePlacement>, opacity: Option<crate::value::Number>) -> bool {
         let Some(node) = self.doc.nodes.get_mut(row as usize) else { return false };
         let mut moved = false;
@@ -1225,13 +1237,17 @@ impl Scene {
                 moved |= node.set_placement_number(key, number);
             }
         }
-        let faded = opacity.is_some_and(|opacity| node.set_placement_number("opacity", opacity));
         let opacity_group = field_group(node, "opacity");
+        let composition = (opacity.is_some() && opacity_group == crate::stamps::Group::Paint).then(|| is_opacity_group(node));
+        let faded = opacity.is_some_and(|opacity| node.set_placement_number("opacity", opacity));
+        let opacity_group = if composition.is_some_and(|before| before != is_opacity_group(node)) {
+            crate::stamps::Group::Content
+        } else { opacity_group };
         if moved || (faded && opacity_group == crate::stamps::Group::Placement) {
             self.stamps.mark(row, crate::stamps::Group::Placement);
         }
-        if faded && opacity_group == crate::stamps::Group::Content {
-            self.stamps.mark(row, crate::stamps::Group::Content);
+        if faded && opacity_group != crate::stamps::Group::Placement {
+            self.stamps.mark(row, opacity_group);
         }
         moved || faded
     }
@@ -1259,11 +1275,16 @@ impl Scene {
         }
         let plain = self.placeable(row);
         let node = &mut self.doc.nodes[index];
-        let mut fields = RowFields { node: &mut *node, wrote: [false; 2], structure: false };
+        let mut fields = RowFields { node: &mut *node, wrote: [false; 3], structure: false };
         write(&mut fields);
         let (wrote, structure) = (fields.wrote, fields.structure);
-        if wrote == [false; 2] {
+        if wrote == [false; 3] {
             return if structure { Err(STRUCTURE.into()) } else { Ok(false) };
+        }
+        // Paint revisions name external paint values; they cannot change normalized or derived geometry.
+        if plain && !structure && wrote == [false, true, false] {
+            self.stamps.mark(row, crate::stamps::Group::Paint);
+            return Ok(true);
         }
         crate::feed_points::resolve_node_feed_points(node);
         normalize_node_in_place(node);
@@ -1279,7 +1300,7 @@ impl Scene {
         if row_alone {
             // Each group a written field belongs to: the groups are independent, and a consumer of one must
             // see a write to it whatever else was written with it.
-            for (group, wrote) in [crate::stamps::Group::Placement, crate::stamps::Group::Content].into_iter().zip(wrote) {
+            for (group, wrote) in [crate::stamps::Group::Placement, crate::stamps::Group::Paint, crate::stamps::Group::Content].into_iter().zip(wrote) {
                 if wrote {
                     self.stamps.mark(row, group);
                 }
@@ -1923,6 +1944,27 @@ impl Scene {
             .unwrap_or_default()
     }
 
+    /// Whether the ordinary paint-order walk prunes this node at a hidden/zero-opacity source.
+    /// This proves absence from the draw order only: masks and derived geometry may still read it.
+    pub fn hidden_from_paint_order(&self, id: &str) -> bool {
+        if let Some(hidden) = self.node_index.get(id)
+            .and_then(|&row| self.worlds.hidden(self.stamps.clock(), row)) { return hidden; }
+        let mut cursor = id;
+        for _ in 0..4096 {
+            let Some(node) = self.canonical_or_transient(cursor) else { return false };
+            if Self::hides_paint_subtree(node) { return true; }
+            let Some(parent) = self.parent_map.get(cursor).or_else(|| self.transient_parent_of.get(cursor)) else {
+                return false;
+            };
+            cursor = parent;
+        }
+        false
+    }
+
+    pub(crate) fn hides_paint_subtree(node: &RawNode) -> bool {
+        node.truthy("hidden") || node.f64("opacity") == Some(0.0)
+    }
+
     fn visit_z(
         &self,
         ids: &[NodeId],
@@ -1946,7 +1988,7 @@ impl Scene {
                 continue;
             };
             // `node.hidden || node.opacity === 0` (scene.selectors.ts:69)
-            if visible_only && (node.truthy("hidden") || node.f64("opacity") == Some(0.0)) {
+            if visible_only && Self::hides_paint_subtree(node) {
                 continue;
             }
             if node.node_type() == "boolean" {
@@ -3301,6 +3343,49 @@ mod tests {
         operand.set("x", json!(80));
         scene.apply_node_edits(vec![operand], &[], &[], None).unwrap();
         assert!(scene.stamps.all() > built);
+    }
+
+    #[test]
+    fn text_paint_revision_stamps_paint_without_content() {
+        use crate::stamps::Group;
+        let mut scene = Scene::load(&json!({"nodes":[{"id":"t","type":"richtext","width":100,"height":40,
+            "vorkText":[0,0,1],"vorkPaint":1}],"pages":[{"id":"p","width":100,"height":100,"nodeIds":["t"]}]})).unwrap();
+        let row = scene.row_of("t").unwrap();
+        let at = scene.stamps.clock();
+        assert!(scene.write_row(row, |fields| fields.set("vorkPaint", json!(2))).unwrap());
+        assert!(!scene.stamps.current(row, Group::Paint, at));
+        assert!(scene.stamps.current(row, Group::Content, at));
+        assert!(scene.stamps.current(row, Group::Structure, at));
+        let at = scene.stamps.clock();
+        assert!(!scene.write_row(row, |fields| fields.set("vorkPaint", json!(2))).unwrap());
+        assert_eq!(scene.stamps.clock(), at);
+        scene.write_row(row, |fields| {
+            fields.set("vorkPaint", json!(3));
+            fields.set("vorkText", json!([0,0,2]));
+        }).unwrap();
+        assert!(!scene.stamps.current(row, Group::Paint, at));
+        assert!(!scene.stamps.current(row, Group::Content, at));
+    }
+
+    #[test]
+    fn composition_values_and_form_changes_have_distinct_stamps() {
+        use crate::stamps::Group;
+        for typed in [false, true] {
+            let mut scene = Scene::load(&json!({"nodes":[
+                {"id":"g","type":"group","opacity":0.6,"children":["body"]},
+                {"id":"body","type":"path","points":[],"closed":true}],
+                "pages":[{"id":"p","width":100,"height":100,"nodeIds":["g"]}]})).unwrap();
+            let row = scene.row_of("g").unwrap();
+            for (opacity, group) in [(0.3, Group::Paint), (1., Group::Content), (0.8, Group::Content),
+                (0., Group::Content), (0.9, Group::Content), (0.4, Group::Paint)] {
+                let at = scene.stamps.clock();
+                if typed { scene.write_placement(row, None, crate::value::Number::from_f64(opacity)); }
+                else { scene.write_row(row, |fields| fields.set("opacity", json!(opacity))).unwrap(); }
+                for input in [Group::Placement, Group::Paint, Group::Content, Group::Structure] {
+                    assert_eq!(scene.stamps.current(row, input, at), input != group, "{typed}/{opacity}/{input:?}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -212,6 +212,7 @@ impl AttributeData {
         let width = buffer.element_type.width();
         let words = if let Some(data) = &buffer.data {
             let mut words = Vec::with_capacity(data.len() * width);
+            let mut values = Vec::with_capacity(width);
             for row in data {
                 fn flatten<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
                     if let Some(values) = value.as_array() {
@@ -222,10 +223,10 @@ impl AttributeData {
                         out.push(value);
                     }
                 }
-                let mut values = Vec::new();
+                values.clear();
                 flatten(row, &mut values);
                 ensure!(values.len() == width, "attribute element width mismatch");
-                for value in values {
+                for value in &values {
                     words.push(match buffer.element_type {
                         BufferType::U32 | BufferType::Uvec4 => {
                             u32::try_from(value.as_u64().context("attribute requires u32")?)?
@@ -313,7 +314,7 @@ impl SceneBuffers {
         for (name, buffer) in &scene.buffers {
             let result = (|| -> Result<()> {
             if buffer.dims.is_some() && buffer.is_volume_grid() {
-                grids.insert(name.clone(), crate::vdb::Grid { words: Vec::new(), bounds: (Vec3::splat(-1.), Vec3::ONE) });
+                grids.insert(name.clone(), crate::vdb::Grid { words: Vec::new(), bounds: (Vec3::splat(-1.), Vec3::ONE), range: (0., 0.) });
             }
             if buffer.grid.is_some() {
                 grids.insert(name.clone(), crate::vdb::Grid::load(buffer, base)
@@ -610,6 +611,20 @@ mod buffer_decode_tests {
         assert_eq!(AttributeData::decode(&buffer, Path::new("."))?.count(), 1);
         Ok(())
     }
+    #[test]
+    fn inline_scratch_is_cleared_between_differently_nested_rows() -> Result<()> {
+        let buffer = vork_scene::v2::from_test_value(json!({"type":"vec3","data":[
+            [1,2,3], [[4],[5,6]], [[],7,[8,9]], [10,[11,[12]]]
+        ]}))?;
+        let actual = AttributeData::decode(&buffer, Path::new("."))?;
+        assert_eq!(actual.words, (1..=12).map(|n| (n as f32).to_bits()).collect::<Vec<_>>());
+        for row in [json!([1,2]), json!([1,2,3,4]), json!([1,"bad",3])] {
+            let buffer = vork_scene::v2::from_test_value(json!({"type":"vec3","data":[[1,2,3],row]}))?;
+            assert!(AttributeData::decode(&buffer, Path::new(".")).is_err());
+        }
+        Ok(())
+    }
+
     #[test]
     fn bb107_sdk_written_implicit_field_loads() -> Result<()> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bb107/written.json");

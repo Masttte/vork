@@ -14,7 +14,16 @@ import variant;
 import bsdf;
 import light_connection;
 import vork_ray_sampling;
-public float candidate_coverage<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<uint> words, RayIntersection hit, float3x4 world_to_object, float3 direction, float2 pixel) {
+public float candidate_coverage<P:IProgram,G:IHitGeometry,V:IVariant=Unspecialized>(G g,StructuredBuffer<uint> words, RayIntersection hit, float3x4 world_to_object, float3 direction, float2 pixel) {
+    // Installation unions the same coverage-mode fact this reader tests below.
+    // Full scalar coverage still permits glass, solid exits and null interfaces.
+    // Metal's reduced candidate loop misrenders solid glass on M5 (Slang
+    // 2026.21). Retain the runtime reader there: its constant-one result is
+    // semantically identical, but preserves the working native query graph.
+    // Vulkan qualifies this specialization independently (path-kernels check).
+#ifndef VORK_METAL
+    if(!V.has_surface_coverage) return 1.;
+#endif
     let r=objects[hit.instance_custom_data].material_index;
     let record=material_records[r];
     // The installed bound capability erases this reader in ordinary attribute scenes.
@@ -38,9 +47,9 @@ public float candidate_coverage<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<
 public bool candidate_covers_side(uint object, bool front, bool solid_owner=false) {
     return material_covers_side<Unspecialized>(object,front) || solid_owner;
 }
-public bool candidate_accepts<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<uint> words, RayIntersection hit, bool front, float3x4 world_to_object, float3 direction, float2 pixel, bool solid_owner=false) {
+public bool candidate_accepts<P:IProgram,G:IHitGeometry,V:IVariant=Unspecialized>(G g,StructuredBuffer<uint> words, RayIntersection hit, bool front, float3x4 world_to_object, float3 direction, float2 pixel, bool solid_owner=false) {
     if (!candidate_covers_side(hit.instance_custom_data,front,solid_owner)) {return false;}
-    return candidate_coverage<P,G>(g,words,hit,world_to_object,direction,pixel)>0.;
+    return candidate_coverage<P,G,V>(g,words,hit,world_to_object,direction,pixel)>0.;
 }
 // Reflection rays integrate blended surface coverage. Keep the sequence fixed as camera samples
 // move their hit point, so coverage remains stratified over the exposure.
@@ -83,7 +92,7 @@ public bool connection_owns_hit<G:IHitGeometry>(G g,RayIntersection hit,float3x4
 // evaluating its closure, and a scene without one compiles no evaluation.
 // Shared by every triangle backend.
 public ConnectionVisibility connection_candidate_transmittance<P:IProgram,G:IHitGeometry,V:IVariant=Unspecialized>(G g,StructuredBuffer<uint> words, RayIntersection hit, float3x4 inverse, float3 direction, float2 pixel, float3 world, uint sample_index, DielectricSegment incident=DielectricSegment(float3(1.),0.,1.,1.)) {
-    let opacity=candidate_coverage<P,G>(g,words,hit,inverse,direction,pixel);
+    let opacity=candidate_coverage<P,G,V>(g,words,hit,inverse,direction,pixel);
     if (opacity<=0.) {return ConnectionVisibility(float3(1.),0u);}
     if (!V.has_null_connection || (material_records[objects[hit.instance_custom_data].material_index].tag.z&REG_FLAG_NULL_CONNECTION)==0u) {return ConnectionVisibility(float3(1.-opacity),0u);}
     let spatial=pixel_hash(asuint(world.x)^asuint(world.y)^asuint(world.z)^hit.instance_custom_data^hit.primitive_index);

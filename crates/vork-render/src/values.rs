@@ -13,6 +13,8 @@ pub(crate) struct UploadCache {
 }
 impl UploadCache {
     fn changed(&mut self, offset: usize, bytes: &[u8]) -> bool {
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("byte_compare");
         let end = offset + bytes.len();
         if self.bytes.len() < end {
             self.bytes.resize(end, 0);
@@ -97,6 +99,8 @@ impl LightingTracker {
             .is_some_and(|h| h.stamp == self.sample)
     }
     pub(crate) fn changed(&mut self, key: LightingKey, bytes: &[u8]) -> bool {
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("track_change");
         let history = self.history.entry(key).or_default();
         let resized = history.bytes.len() != bytes.len();
         let changed = history.changed(0, bytes);
@@ -159,6 +163,8 @@ impl ChangeTracker {
     }
     pub(crate) fn dirty(&self, key: ChangeKey) -> bool { self.history.get(&key).is_some_and(|h|h.stamp == self.sample) }
     pub(crate) fn changed(&mut self, key: ChangeKey, bytes: &[u8]) -> bool {
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("track_change");
         let history = self.history.entry(key).or_default();
         let resized = history.bytes.len() != bytes.len();
         let changed = history.changed(0, bytes);
@@ -188,6 +194,8 @@ impl ChangeTracker {
         Ok(value)
     }
     pub(crate) fn upload(&mut self, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("track_upload");
         let history = self
             .history
             .entry(ChangeKey::Buffer(buffer.clone()))
@@ -199,6 +207,10 @@ impl ChangeTracker {
         self.record_upload(buffer, offset, bytes);
     }
     fn record_upload(&mut self, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("pack_upload");
+        #[cfg(feature = "frame-profile")]
+        crate::frame_profile::count("dirty_upload_bytes", bytes.len() as u64);
         let source = self.bytes.len() as u64;
         self.bytes.extend_from_slice(bytes);
         // Preserve field/joint granularity without a separate dirty-range detector.
@@ -324,6 +336,8 @@ pub(crate) fn sample_frame(
     values: &mut [Option<EvalNode>],
     worlds: &mut [Mat4],
 ) -> Result<()> {
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("scene_evaluation");
     let request=request.into();
     let time=request.numeric()?;
     sample_pose(&s.nodes, &s.assets, &s.animation, &s.targets, &s.environment, &request, samples, values, worlds)?;
@@ -453,6 +467,8 @@ impl FrameSlot {
         frame_time: f32,
         shadow_changes: &mut LightingTracker,
     ) -> Result<(Vec<u8>, Vec<Upload>, Mat4, Uniform)> {
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("prepare_values_inclusive");
         self.sample_request=request.into();
         let time=self.sample_request.numeric()?;
         let exact=!s.footage.is_empty() || s.compute.is_some() || s.animation.has_camera_tracks() || s.environment.has_media() || s.animation.has_discrete_tracks() || s.animation.has_clocks();
@@ -1099,6 +1115,8 @@ impl FrameSlot {
         uploads: &[Upload],
         batch: bool,
     ) {
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("copy_values");
         if upload_bytes.is_empty() { return; }
         let size = upload_bytes.len() as u64;
         // Batched commands must retain distinct immutable sources until publication.

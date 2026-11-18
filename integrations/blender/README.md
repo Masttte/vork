@@ -2,6 +2,10 @@
 
 # Blender import helpers
 
+Light graphs retain unsmoothed Quadratic Light Falloff as its Strength input.
+Linear/Constant outputs and nonzero smoothing depend on receiver distance and
+remain explicit substitutions; they are not additional physical light units.
+
 This directory is a separate GPL-3.0-or-later Blender component; the boundary
 with vork is scene, geometry, shader and image files. The renderer and std do
 not import bpy or this component.
@@ -33,6 +37,24 @@ fields. `shot.json` holds the scene and `shot.profile.json` its render profile: 
 for EEVEE or level 2 for Cycles, plus seed and denoise. Source sample counts are
 recorded in the export report; the selected vork profile owns its sample budget. Render with
 `vork render shot.json --profile shot.profile.json`. No EEVEE rendering runs in export.
+
+Static HAIR/PATH particle systems on directly rendered mesh emitters export as
+counted curves at render child count and render step. Source diameter, taper,
+close-tip and ray visibility are retained; exact repeated adjacent points and
+fully degenerate strands are reported/removed. The geometry is evaluated
+polylines rendered as open tubes, not Cycles native curve intersections.
+Uniform nonsingular object scale is required; other transforms and instanced
+hair occurrences are reported as omissions. Animated exports retain a reported
+strand snapshot at the export frame.
+
+Legacy hair CORNER/BYTE_COLOR attributes use Blender's particle emitter lookup,
+including child interpolation, then decode sRGB to linear. Alpha is one, matching
+legacy hair attributes. Hair Info Intercept uses normalized strand arc length.
+Root colors are stored once per strand in 32-bit EXR atlases and addressed by one
+per-point coordinate stream. The renderer currently uploads float images as
+RGBA16F, so texture precision remains half-float. Other hair attributes, UVs and
+hair-specific closure nodes remain explicit unsupported/substituted cases.
+`export-report.json` records strand counts and the geometry/attribute method.
 
 `--bake-curves` samples RGB curve transfer functions into lookup textures to
 reduce shader compilation on large material collections. Upstream values and
@@ -126,12 +148,17 @@ the asset path and each missing slot name when Blender drops a slot or its faces
 retained overrides apply normally. Authored scene bindings remain strictly validated.
 The helper preserves native TEXCOORD streams and adds stable active/named UV
 aliases referencing the same accessors, without copying geometry buffers. It
-restores temporary source metadata even if export fails. Packed PNG/JPEG bytes, colour spaces and supported sampler settings
+also resolves object-linked material slots on private mesh copies and exports
+named point/corner colors as linear float custom attributes. Attribute-node
+Color, Vector and Alpha outputs retain those names independently of COLOR_n
+ordering; scalar conversions and other attribute types remain unsupported.
+Temporary meshes, slots and source metadata are restored even if export fails.
+Packed PNG/JPEG bytes, colour spaces and supported sampler settings
 are preserved without applying Blender's display transform.
 
 This subset handles Object/Normal, active UV and named UV Map coordinates, constant affine
 Mapping, flat/box images with mapped pixel footprints, RGB Curves, RGBA Mix,
-Bump, Invert/HSV, Color Ramp, Layer Weight Facing, Principled, Emission
+Bump, Invert/HSV, Color Ramp, Gradient Texture, Layer Weight Facing, Principled, Emission
 and Add/Mix Shader, plus Glossy in best effort mode. The writer selects the current source render engine; direct
 Compiler callers can pass `engine="CYCLES"` or `engine="EEVEE"`. It requires no fabricated UVs.
 Source RGB curves are evaluated through Blender's API and resampled until probes
@@ -142,6 +169,9 @@ and lerp arithmetic. One- and two-segment curves remain expressions. Height call
 neighbouring pixel offsets. Implicit image vectors use the active render UV. UV graphs read typed attributes
 with gradients and retain Blender UV orientation through Mapping/Bump. Missing
 source UV streams fail installation instead of receiving invented coordinates.
+Gradient Texture supports all seven modes with explicit vectors or qualified source
+Generated coordinates, using the same source-coordinate field as Texture Coordinate
+Generated. Unqualified meshes retain an explicit approximation in best effort mode.
 In strict mode, unsupported nodes and instancer coordinates,
 image Color with linked Alpha, linked mapping parameters, subsurface/anisotropic/thin-film
 responses, the reflection substitutions below and material volume/displacement raise `UnsupportedMaterial` with the
@@ -149,6 +179,11 @@ source material/node/socket. Nonzero unsupported responses are never dropped.
 Image Texture Alpha samples the stored Alpha channel independently of Color.
 The emitted Principled response uses vork's OpenPBR shading; it does not promise
 identical Blender BSDFs. No source datablock is edited.
+
+Constant white Transparent BSDF uses opacity passthrough. Colored or linked
+Transparent inputs are refused in strict mode: the best-effort RGB index-matched
+sheet preserves tint, but crossing it uses transmission visibility and the
+lighting World, whereas Cycles Transparent preserves camera-ray classification.
 
 
 
@@ -257,8 +292,15 @@ normalization changes retain initial numeric data across the clip; shape and
 shadow toggles retain their initial configuration and report it. Animated material
 values remain source-frame snapshots and are explicitly reported.
 
-Generated coordinates in best effort use normalized imported rest bounds; source
-ORCO/manual texture-space data is not carried by glTF. Strict mode rejects that
+Generated coordinates retain source positions normalized by Blender texture-space
+location/size, including manual texture space, in a typed custom mesh attribute.
+Unmodified meshes, Simple Deform stacks and relative shape keys carry the source
+field through evaluation. Static stacks of Subdivision Surface, Bevel, Array and
+Mirror instead derive the field from exported positions in the original texture
+space; interpolating a source custom attribute through those modifiers is wrong.
+Instancer coordinates, alternate texture meshes, absolute shape keys, mixed
+deformation/constructive stacks and other modifiers remain unqualified. For those meshes, best
+effort reports normalized imported rest bounds, and strict mode rejects that
 missing source context. Object and UV coordinates retain their explicit contracts.
 
 Standard-tone display curves export as a compositor before white balance,

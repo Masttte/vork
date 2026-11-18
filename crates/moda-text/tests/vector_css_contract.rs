@@ -92,7 +92,7 @@ fn unit_ranges_keep_full_layout_and_shared_pivots() {
     assert_eq!(full.ops.len(), selected.ops.len());
     for (full_op, selected_op) in full.ops.iter().zip(&selected.ops) {
         assert_eq!(selected_op.records.len(), 2);
-        for (expected, actual) in full_op.records[1..3].iter().zip(&selected_op.records) {
+        for (expected, actual) in full_op.records[1..3].iter().zip(selected_op.records.iter()) {
             let curves = |ops: &VectorNodeOps, record: &moda_text::vector::ops::VectorAnalyticRecord| {
                 let start = record.first_curve as usize * 6;
                 ops.curve_points[start..start + record.curve_count as usize * 6].to_vec()

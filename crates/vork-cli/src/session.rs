@@ -137,13 +137,17 @@ pub fn run(gpu: Option<vork_render::GpuSelection>) -> Result<()> {
     for line in stdin.lines() {
         let line = line.context("read session request")?;
         if line.trim().is_empty() { continue; }
-        let mut value: serde_json::Value = match serde_json::from_str(&line) {
+        // An inline document is one level inside the request.
+        // A request nested past the limit carries a document nested past it: that is the scene's refusal, not a
+        // malformed request, and the session goes on to the next request.
+        let read = match vork_scene::diagnostics::too_deep(line.as_bytes(), vork_scene::MAX_JSON_DEPTH + 1, "request") {
+            Some(refusal) => Err(refusal.context(vork_render::failure::FailureKind::Scene)),
+            None => vork_scene::diagnostics::read_value(line.as_bytes()).map_err(|error| usage(anyhow::anyhow!("request is not a JSON object: {error}"))),
+        };
+        let mut value: serde_json::Value = match read {
             Ok(value) => value,
             Err(error) => {
-                // An inline document is one level inside the request.
-                let error = vork_scene::diagnostics::nesting_error(&error, "request")
-                    .unwrap_or_else(|| anyhow::anyhow!("request is not a JSON object: {error}"));
-                reply(failure(&serde_json::Value::Null, &usage(error)))?;
+                reply(failure(&serde_json::Value::Null, &error))?;
                 continue;
             }
         };

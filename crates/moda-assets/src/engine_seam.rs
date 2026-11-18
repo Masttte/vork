@@ -63,22 +63,15 @@ fn transparent_rgba() -> Arc<Vec<u8>> {
 
 /// Install the prefetched store for the current process (CLI: once per run).
 ///
-/// Re-installing the SAME store (by `Arc` pointer identity) is a no-op for the
-/// generation counter: the mobile playback lane re-installs its session store
-/// under the engine lock on EVERY frame (another live session may have swapped
-/// the process-global slot), and bumping the generation there would
-/// re-fingerprint the retained page plan every frame — defeating the R5 cache
-/// for the whole point of caching across `render_page_at_time` calls. A genuine
-/// settle swap (the CLI/wasm/py callers always pass a freshly-allocated `Arc`)
-/// still bumps and re-fingerprints.
+/// The generation names resource inputs, not the allocation holding the map. Reinstalling a store with
+/// the same resources is a no-op, including an immutable snapshot cloned by a frame's capture installer.
+/// Changed membership, payload identity, state or external upload metadata advances the generation.
 pub fn install_store(store: Arc<AssetStore>) {
     let mut guard = slot().write().expect("asset store lock");
-    let same = guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &store));
+    let same = guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &store) || cur.same_resources(&store));
+    if same { return; }
     *guard = Some(store);
-    if !same {
-        // Task #95 residency: settle flips re-fingerprint retained page plans.
-        STORE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    STORE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Monotonic install counter (task #95): retained-mode caches key on this so
@@ -300,6 +293,58 @@ mod tests {
     use crate::shader_image::ShaderImageEntry;
     use crate::AssetEntry;
     use moda_shaders::runtime::image_processing::PreparedShaderImage;
+
+    #[test]
+    fn resource_generations_follow_inputs_not_store_allocations() {
+        let _report = crate::report::tests::serial_globals();
+        clear_store();
+        let mut store = AssetStore::default();
+        store.insert("still".into(), AssetEntry::Loaded(Arc::new(
+            PreparedImage::from_premultiplied(vec![255; 4], 1, 1))));
+        store.insert("failed".into(), AssetEntry::Failed);
+        let external = crate::ExternalImageMeta { width: 10, height: 20, scale_factor: (1., 1.), upload_id: 7 };
+        store.insert_external("capture".into(), external.clone());
+        store.insert_shader_image("shader".into(), ShaderImageEntry::Loaded(Arc::new(PreparedShaderImage {
+            width: 1, height: 1, rgba_straight: Arc::new(vec![255; 4]), content_rect: None,
+        })));
+        install_store(Arc::new(store.clone()));
+        let held = installed().unwrap();
+        let at = store_generation();
+        install_store(Arc::new(store.clone()));
+        assert_eq!(store_generation(), at, "a cloned snapshot has no changed resource");
+        assert!(Arc::ptr_eq(&held, &installed().unwrap()));
+
+        let mut changes = Vec::new();
+        for meta in [
+            crate::ExternalImageMeta { upload_id: 8, ..external.clone() },
+            crate::ExternalImageMeta { width: 11, ..external.clone() },
+            crate::ExternalImageMeta { height: 21, ..external.clone() },
+            crate::ExternalImageMeta { scale_factor: (2., 1.), ..external.clone() },
+        ] {
+            let mut next = store.clone();
+            next.insert_external("capture".into(), meta);
+            changes.push(next);
+        }
+        let mut next = store.clone();
+        next.remove("failed");
+        changes.push(next);
+        let mut next = store.clone();
+        next.insert("still".into(), AssetEntry::Loaded(Arc::new(
+            PreparedImage::from_premultiplied(vec![255; 4], 1, 1))));
+        changes.push(next); // A new payload identity writes even when its pixels happen to match.
+        let mut next = store.clone();
+        next.insert_shader_image("shader".into(), ShaderImageEntry::Fallback);
+        changes.push(next);
+        for next in changes {
+            install_store(Arc::new(store.clone()));
+            let at = store_generation();
+            install_store(Arc::new(next.clone()));
+            assert_eq!(store_generation(), at + 1, "a changed input advances the generation");
+            install_store(Arc::new(next));
+            assert_eq!(store_generation(), at + 1);
+        }
+        clear_store();
+    }
 
     // One test fn: these share the process-global store slot and must not
     // run on parallel test threads.

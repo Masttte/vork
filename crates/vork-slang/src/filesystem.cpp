@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <filesystem>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -187,7 +188,8 @@ extern "C" int vork_slang_compile(const char *library,
                                   const char *const *argv, void *context,
                                   Read read, Emit emit) noexcept {
   try {
-    Library lib(library);
+    // One global session per companion; requests and resolver state stay fresh.
+    static Library lib(library);
     if (!lib.handle)
       throw std::runtime_error(std::string("cannot load Slang library: ") +
                                library);
@@ -204,7 +206,8 @@ extern "C" int vork_slang_compile(const char *library,
         if (p)
           drop(p);
       }
-    } session{create(nullptr), destroy};
+    };
+    static Session session{create(nullptr), destroy};
     if (!session.p)
       throw std::runtime_error("cannot create Slang session");
     // Slang's optional SPIR-V backends belong to the selected toolchain, not
@@ -342,15 +345,40 @@ int run(int argc, const char *const *argv) {
 #endif
   if (!protocolOut)
     return 2;
-  put64(1);
+  put64(2);
   std::fflush(protocolOut);
-  std::vector<unsigned char> bytes;
-  auto result = vork_slang_compile(argv[1], argv[2], argc - 3, argv + 3, &bytes,
-                                   remoteRead, remoteEmit);
-  std::fputc('D', protocolOut);
-  put64(uint32_t(result));
-  std::fflush(protocolOut);
-  return 0;
+  auto readString = []() {
+    auto n = get64();
+    if (n > 512 * 1024 * 1024) std::exit(2);
+    std::string value(size_t(n), '\0');
+    if (n && std::fread(value.data(), 1, size_t(n), stdin) != n) std::exit(2);
+    return value;
+  };
+  while (true) {
+    int tag = std::getchar();
+    if (tag == EOF) return 0;
+    if (tag != 'C') return 2;
+    auto directory = readString();
+    auto count = get64();
+    if (count > 65536) return 2;
+    std::vector<std::string> arguments;
+    for (uint64_t i = 0; i < count; ++i) arguments.push_back(readString());
+    std::vector<const char *> pointers;
+    for (const auto &argument : arguments) pointers.push_back(argument.c_str());
+    std::vector<unsigned char> bytes;
+    int result;
+    try {
+      std::filesystem::current_path(std::filesystem::u8path(directory));
+      result = vork_slang_compile(argv[1], argv[2], int(count), pointers.data(),
+                                  &bytes, remoteRead, remoteEmit);
+    } catch (const std::exception &e) {
+      remoteEmit(nullptr, 2, nullptr, e.what(), strlen(e.what()));
+      result = -1;
+    }
+    std::fputc('D', protocolOut);
+    put64(uint32_t(result));
+    std::fflush(protocolOut);
+  }
 }
 
 #ifdef _WIN32

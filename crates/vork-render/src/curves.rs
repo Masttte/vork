@@ -28,7 +28,8 @@ pub(crate) fn cached_tubes(
     hash.update(&(widths.len() as u64).to_le_bytes());
     hash.update(&(sides as u32).to_le_bytes());
     let path = cache.map(|c| c.path("curve-tubes", 8, hash.finalize()));
-    if let Some(payload) = path.as_ref().and_then(|p| crate::disk_cache::read(p)) {
+    // Verify and decode the cache in place; expanded fur can have gigabytes of payload.
+    if let Some(payload) = path.as_ref().and_then(|p| crate::disk_cache::read_mapped(p)) {
         if let Some(mesh) = decode(&payload) {
             return Ok(mesh);
         }
@@ -280,6 +281,33 @@ mod tests {
             bytemuck::cast_slice::<_, u8>(&mesh.vertices)
         );
         assert!(decode(&payload[..payload.len() - 1]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tube_cache_preserves_bytes_and_rebuilds_corruption() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("vork-curve-cache-{}", std::process::id()));
+        let store = crate::disk_cache::Store::for_test(directory.clone());
+        let positions = [[0., 0., 0.], [0.1, 1., 0.], [0.4, 2., 0.2]];
+        let load = || cached_tubes(&positions, &[0.2, 0.1, 0.], &[3], 8, Some(&store));
+        let cold = load()?;
+        let equal = |mesh: &crate::geometry::Geometry| {
+            assert_eq!(bytemuck::cast_slice::<_, u8>(&mesh.vertices), bytemuck::cast_slice::<_, u8>(&cold.vertices));
+            assert_eq!(mesh.indices, cold.indices);
+            assert_eq!(mesh.primitive_ids, cold.primitive_ids);
+            assert_eq!(mesh.bounds, cold.bounds);
+        };
+        equal(&load()?);
+        let path = std::fs::read_dir(&directory)?.filter_map(|entry| entry.ok())
+            .map(|entry| entry.path()).find(|path| path.extension().is_some_and(|extension| extension == "entry")).unwrap();
+        let original = std::fs::read(&path)?;
+        let mut damaged = original.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, damaged)?;
+        equal(&load()?);
+        assert_eq!(std::fs::read(&path)?, original);
+        equal(&load()?);
+        std::fs::remove_dir_all(directory)?;
         Ok(())
     }
 

@@ -50,7 +50,11 @@ pub(super) fn install(
     let mut words = vec![0, 0, u32::MAX, 0];
     let mut input_bindings = Vec::new();
     let animated = crate::materials::animated_inputs(scene)?;
-    let mut native = Native::default();
+    let mut native = Native {
+        opaque_views: !scene.render.background.transparent()
+            && scene.images.values().all(|image| image.render.as_ref().is_none_or(|render| !render.background.transparent())),
+        ..Native::default()
+    };
     let mut native_dispatch = String::from(
         "export MediumSample volume_coefficients(uint id,float3 p,MediumTransportContext context) {switch(id) {\n",
     );
@@ -61,6 +65,9 @@ pub(super) fn install(
     let compiled=names.keys().map(|name|Ok((name.clone(),compile(r,scene,name,base)?))).collect::<Result<BTreeMap<_,_>>>()?;
     native.world_only=stages.values().all(|s|!s.medium);
     native.homogeneous=compiled.values().all(|(p,_)|p.homogeneous);
+    native.finite_homogeneous=compiled.iter().all(|(name,(p,_))|p.homogeneous ||
+        (Some(name.as_str())==world && !stages.get(name).is_some_and(|stage|stage.medium)));
+    native.dense_grids_only=scene.buffers.values().any(|b|b.dims.is_some()) && scene.buffers.values().all(|b|b.grid.is_none());
     native.scattering_free=compiled.values().all(|(p,_)|p.scattering_free);
     native.emission_free=compiled.values().all(|(p,_)|p.emission_free);
     native.time_dependent=compiled.values().any(|(p,_)|p.time_dependent);
@@ -164,7 +171,7 @@ impl super::Installed {
                 }
                 if bounds.0.is_finite() {
                     let dynamic=animated.get(name).cloned().unwrap_or_default();
-                    let proof=grid_proof_words(program,inputs,&dynamic).0;
+                    let proof=grid_proof_words(program,inputs,&dynamic)?.0;
                     self.words[*base as usize-1]=bound::certify(program,&proof,bounds,bound::certification_times(scene)).with_context(||format!("medium shader {:?} (material {name:?}): cannot certify extinction majorant; use supported shader operations",scene.materials[name].program))?.to_bits();
                 }
             }
@@ -490,7 +497,7 @@ impl super::Installed {
             .chain(self.inputs.iter().filter(|(_,_,_,time)|*time!=0.).map(|(name,base,_,_)|(name,*base as u32)));
         for (name,base) in copies {
             let (program,inputs)=&self.instances.programs[name];
-            let (proof,proof_slots)=grid_proof_words(program,inputs,&animated.get(name).cloned().unwrap_or_default());
+            let (proof,proof_slots)=grid_proof_words(program,inputs,&animated.get(name).cloned().unwrap_or_default())?;
             let mut grids=Vec::new();
             for field in &program.inputs.fields {
                 if !matches!(field.ty,vork_slang::Type::FloatGrid|vork_slang::Type::VectorGrid) {continue;}
@@ -514,7 +521,12 @@ impl super::Installed {
 
 /// The certificate consumes grid ranges, never voxel payloads. Remap only its
 /// private resource handles to compact metadata; GPU input addresses stay intact.
-fn grid_proof_words(program:&vork_slang::MediumProgram,inputs:&[u32],dynamic:&std::collections::BTreeSet<String>)->(Vec<Option<u32>>,BTreeMap<String,usize>) {
+/// A dense grid's metadata is its published header. A sparse grid's is the same
+/// record holding the range of every stored value, background included, which
+/// loading found once and packed after the payload: its
+/// trilinear read is a convex combination of stored values, widened here by
+/// the rounding of that eight-term f32 sum.
+fn grid_proof_words(program:&vork_slang::MediumProgram,inputs:&[u32],dynamic:&std::collections::BTreeSet<String>)->Result<(Vec<Option<u32>>,BTreeMap<String,usize>)> {
     let mut words=program.inputs.varying_words(&inputs[..program.inputs.words],dynamic);
     let mut slots=BTreeMap::new();
     for field in &program.inputs.fields {
@@ -525,13 +537,51 @@ fn grid_proof_words(program:&vork_slang::MediumProgram,inputs:&[u32],dynamic:&st
         if inputs.get(source)==Some(&u32::MAX) {
             words.extend(inputs[source..source+6].iter().copied().map(Some));
         } else {
-            // Sparse interpolation still has no enclosure. Keep the resource
-            // unknown rather than substituting a synthetic empty grid.
-            words.push(None);
+            let length=*inputs.get(source).context("grid input address out of bounds")? as usize;
+            let range=inputs.get(source+1+length..source+3+length).context("grid range out of bounds")?;
+            let (lo,hi)=(f32::from_bits(range[0]),f32::from_bits(range[1]));
+            let (lo,hi)=sparse_sample_range(lo,hi);
+            words.extend([u32::MAX,0,0,0,lo.to_bits(),hi.to_bits()].map(Some));
         }
         slots.insert(field.name.clone(),slot);
     }
-    (words,slots)
+    Ok((words,slots))
+}
+
+// Eight terms, each with three multiplies, then eight accumulated additions.
+// The relative allowance covers normal rounding; an absolute term per operation
+// also encloses gradual underflow and backends that flush tiny results to zero.
+// Compute the allowance in f64 and round both endpoints outward in f32.
+fn sparse_sample_range(lo:f32,hi:f32)->(f32,f32) {
+    let rounding=16.*f32::EPSILON as f64*(lo.abs().max(hi.abs()) as f64)
+        +32.*f32::MIN_POSITIVE as f64;
+    (((lo as f64-rounding) as f32).next_down(),((hi as f64+rounding) as f32).next_up())
+}
+
+#[cfg(test)]
+mod sparse_range_tests {
+    use super::*;
+
+    #[test]
+    fn amplified_subnormal_sparse_sample_stays_below_certificate()->Result<()> {
+        let abi=vork_slang::Abi {aov_count:0,context:vork_slang::Abi::spec_context(),closure:vork_slang::openpbr_fields()};
+        let source="import std.grid; struct Inputs {FloatGrid density;}; MediumCoefficients medium(MediumContext c,Inputs i) {MediumCoefficients m={}; m.absorption=float3(sample_grid(i.density,c.position)*1e38);return m;}";
+        let program=vork_slang::Compiler::discover().compile_medium(&abi,source,std::path::Path::new("subnormal-range.slang"),"subnormalrange")?;
+        let value=f32::from_bits(7);
+        let mut inputs=vec![0;program.inputs.words];
+        inputs[0]=1;
+        inputs[program.inputs.fields[0].offset]=inputs.len() as u32;
+        // Empty payload followed by the cached stored-value range.
+        inputs.extend([0,value.to_bits(),value.to_bits()]);
+        let (words,_)=grid_proof_words(&program,&inputs,&Default::default())?;
+        let bound=program.extinction_majorant(&abi,&words,[[-1.,1.];3],[0.,1.])?;
+        let half=std::hint::black_box(0.5f32);
+        let mut sample=0f32;
+        for _ in 0..8 {sample+=value*half*half*half;}
+        assert!(sample>value,"witness must preserve subnormal rounding");
+        assert!(sample*1e38<=bound,"amplified sparse sample exceeds certificate");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -573,11 +623,6 @@ mod empty_input_tests {
 }
 
 impl super::Installed {
-    pub(crate) fn certified_world_exponential(&self,world:&str)->bool {
-        self.instances.programs.iter().all(|(name,(program,_))|
-            if name==world {program.exponential.is_some()} else {program.homogeneous})
-    }
-
     pub(crate) fn prepare_point_work(&mut self,scene:&v2::Scene)->Result<()> {
         let animated=crate::materials::animated_inputs(scene)?;
         let bounded=&self.instances;

@@ -559,8 +559,8 @@ mod discrete_tests {
             plan.sample_request_into(request.numeric()?,&request,&mut samples)?;
             assert_eq!(samples.values[0],Sample::Bool(old));
             assert_eq!(samples.values[1],Sample::String(if old {"old"}else{"new"}.into()));
-            assert_eq!(samples.values[2],Sample::Numeric(if old {vec![1.,0.,0.]}else{vec![0.,0.,1.]}));
-            assert_eq!(samples.values[3],Sample::Numeric(vec![1.,0.,0.]));
+            assert_eq!(samples.values[2],Sample::numeric(if old {vec![1.,0.,0.]}else{vec![0.,0.,1.]}));
+            assert_eq!(samples.values[3],Sample::numeric(vec![1.,0.,0.]));
             let mut identity=Vec::new();plan.append_discrete_key(&request,&mut identity)?;identities.push(identity);
         }
         assert_ne!(identities[0],identities[1]);assert_eq!(identities[1],identities[2]);
@@ -600,7 +600,7 @@ mod discrete_tests {
             assert_eq!(request.numeric()?,0.5);
             plan.sample_request_into(0.5,&request,&mut samples)?;
             assert_eq!(samples.values[0],Sample::Bool(old));
-            assert_eq!(samples.values[1],Sample::Numeric(if old {vec![1.,0.,0.]}else{vec![0.,0.,1.]}));
+            assert_eq!(samples.values[1],Sample::numeric(if old {vec![1.,0.,0.]}else{vec![0.,0.,1.]}));
         }
         Ok(())
     }

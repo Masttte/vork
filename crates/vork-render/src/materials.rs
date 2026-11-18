@@ -1,6 +1,6 @@
 //! Tagged material records and installed textures (GPU mips) and samplers.
 use super::*;
-use ::vork_scene::v2::{OPENPBR, OpenPbrKind, OpenPbrParam};
+use ::vork_scene::v2::{OPENPBR_TABLE as OPENPBR, OpenPbrKind, OpenPbrParam};
 
 // Fatal errors, transmission warning, evaluation demand and current-view capacity feedback.
 pub(crate) const SHADER_DIAGNOSTICS_INIT: [u32; vork_slang::registry::SHADER_DIAGNOSTICS_WORDS as usize] = [0, u32::MAX, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, u32::MAX, u32::MAX, u32::MAX, 0];
@@ -308,7 +308,7 @@ fn frame_materials(
 }
 // The install-time capability key is defined beside the Slang variant it selects.
 pub(crate) use crate::forward_variant::{
-    FeatureMask, FEATURE_ANISOTROPY, FEATURE_COAT_ANISOTROPY, FEATURE_FILM, FEATURE_SUBSURFACE, FEATURE_HAIR, FEATURE_INSTALLED, FEATURE_WEIGHTED_IOR, FEATURE_GLTF_TINT, FEATURE_COAT, FEATURE_ELLIPSE, FEATURE_FINITE, FEATURE_FUZZ, FEATURE_RECTANGLE, FEATURE_LIGHT_SHIFT, FEATURE_LIGHT_TYPES,
+    FeatureMask, FEATURE_ANISOTROPY, FEATURE_COAT_ANISOTROPY, FEATURE_FILM, FEATURE_SUBSURFACE, FEATURE_HAIR, FEATURE_SCATTERING, FEATURE_INSTALLED, FEATURE_WEIGHTED_IOR, FEATURE_GLTF_TINT, FEATURE_COAT, FEATURE_ELLIPSE, FEATURE_FINITE, FEATURE_FUZZ, FEATURE_RECTANGLE, FEATURE_LIGHT_SHIFT, FEATURE_LIGHT_TYPES,
     FEATURE_SHADOW_RAYS, FEATURE_TRANSMISSION, FEATURE_SOLID_TRANSMISSION, FEATURE_LIT, FEATURE_LOBES, FEATURE_MASK, FEATURE_PUNCTUAL, FEATURE_SPECIALIZED, FEATURE_TINT,
     SHADING_LAYERS, SHADING_METAL,
 };
@@ -349,7 +349,9 @@ pub(crate) fn installed_features(materials: &[Material]) -> FeatureMask {
         union | m.features
             | if m.subsurface { FEATURE_SUBSURFACE } else { 0 }
             | if m.hair { FEATURE_HAIR } else { 0 }
+            | if m.scattering { FEATURE_SCATTERING } else { 0 }
             | if m.null_connection { crate::forward_variant::FEATURE_NULL_CONNECTION } else { 0 }
+            | if m.surface_coverage { crate::forward_variant::FEATURE_SURFACE_COVERAGE } else { 0 }
     })
 }
 /// One OpenPBR input's texture capability in the installed shading key.
@@ -369,6 +371,8 @@ pub(crate) struct Material {
     /// A returned closure can have a subsurface lobe: the weight is nonzero,
     /// textured or tracked, or a program's proofs leave it possible.
     pub(crate) subsurface: bool,
+    /// A final closure may scatter; applied only after any authored lit stage.
+    pub(crate) scattering: bool,
     pub(crate) features: FeatureMask,
     pub(crate) transparent: bool,
     /// Any possible transmission (thin or solid), independent of alpha coverage.
@@ -418,6 +422,8 @@ pub(crate) struct PendingMaterial {
     // Reserves shader features even when their initial weights are zero.
     shading: u8,
     response_animated: FeatureMask,
+    /// Per-field animation proof for material-emitter receiver admission.
+    receiver_animated: u16,
     /// Possible program responses, replaced by compiler proofs at installation.
     pub(crate) response_program: FeatureMask,
     // An animated material's name: its record must not merge with an identical static one.
@@ -442,7 +448,7 @@ impl PendingMaterial {
 
     /// Static unbound zero coverage needs no draw. Vertex-alpha draws retain
     /// ordinary coverage when their sampling policy could vary.
-    fn zero_opacity(&self) -> bool {
+    pub(crate) fn zero_opacity(&self) -> bool {
         self.record.tag[0] == 0 && !self.opacity_animated
             && self.record.tag[2] & constants::FLAG_VERTEX_ALPHA == 0
             && !self.record.bound("geometry_opacity") && self.record.get("geometry_opacity") == [0.]
@@ -466,7 +472,8 @@ impl PendingMaterial {
             opacity_animated: false,
             shading: 0,
             response_animated: 0,
-            response_program: if id != 0 {FEATURE_ANISOTROPY|FEATURE_COAT_ANISOTROPY|FEATURE_FILM|FEATURE_COAT|FEATURE_FUZZ|FEATURE_TINT|FEATURE_WEIGHTED_IOR|FEATURE_SUBSURFACE} else {0},
+            receiver_animated: 0,
+            response_program: if id != 0 {FEATURE_ANISOTROPY|FEATURE_COAT_ANISOTROPY|FEATURE_FILM|FEATURE_COAT|FEATURE_FUZZ|FEATURE_TINT|FEATURE_WEIGHTED_IOR|FEATURE_SUBSURFACE|FEATURE_SCATTERING} else {0},
             unique: None,
             transmissive: false,
             lobes: false,
@@ -561,18 +568,63 @@ impl PendingMaterial {
             || self.record.bound("specular_ior") || self.record.get("specular_ior")[0]==1.
             || self.record.bound("transmission_dispersion_scale") || self.record.get("transmission_dispersion_scale")[0]>0.)
     }
-    fn emits(&self) -> bool {
+    pub(crate) fn emits(&self) -> bool {
         if self.record.tag[0]!=0 {self.source_emission} else {
             self.emission_animated || (self.record.get("emission_luminance")[0]>0. && self.record.get("emission_color")!=[0.;3])
         }
     }
     pub(crate) fn physical_emitter(&self) -> bool {self.emits() && !self.transparent && !self.zero_opacity()}
 
+    /// Response channels that need the previs material-emitter approximation.
+    /// A proven null thin sheet and unlit output keep their direct camera route.
+    pub(crate) fn emission_receiver_mask(&self) -> u32 {
+        let diffuse=constants::RAY_DIFFUSE;let specular=constants::RAY_SPECULAR;let transmission=constants::RAY_TRANSMISSION;
+        if self.record.tag[0]!=0 {return if self.response_program & FEATURE_SCATTERING!=0 {diffuse|specular|transmission} else {0};}
+        let possible=|name:&str,bit:u32|self.record.bound(name) || (self.receiver_animated & (1u16<<bit))!=0u16;
+        let positive=|name,bit|possible(name,bit) || self.record.get(name)[0]>0.;
+        let below_one=|name,bit|possible(name,bit) || self.record.get(name)[0]<1.;
+        let diffuse_response=positive("fuzz_weight",3) || positive("base_weight",0)
+            && below_one("base_metalness",1) && below_one("transmission_weight",2);
+        let reflection=positive("coat_weight",6) || positive("thin_film_weight",8)
+            || positive("specular_weight",4) && (positive("base_metalness",1)
+                || possible("specular_ior",5) || self.record.get("specular_ior")[0]!=1.);
+        let solid_transmission=positive("transmission_weight",2)
+            && (possible("geometry_thin_walled",7) || self.record.get("geometry_thin_walled")[0]==0.);
+        let mut mask=0u32;
+        if diffuse_response {mask|=diffuse;}
+        if reflection {mask|=specular;}
+        if solid_transmission {mask|=transmission;}
+        mask
+    }
+
+    /// Every possible source has point-independent builtin emission and coverage.
+    /// Numeric emission/opacity tracks still read the current record. Layer tracks
+    /// can introduce directional attenuation, so their initial zero is no proof.
+    pub(crate) fn constant_source_emission(&self) -> bool {
+        !self.emits() || (self.record.tag[0] == 0
+            && self.record.tag[2] & (FLAG_VERTEX_ALPHA | vork_slang::registry::FLAG_GLTF_UNLIT) == 0
+            && ["emission_color", "emission_luminance", "geometry_opacity", "alpha_cutoff",
+                "coat_weight", "fuzz_weight"].iter().all(|name| !self.record.bound(name))
+            && self.record.get("coat_weight")[0] == 0.
+            && self.record.get("fuzz_weight")[0] == 0.
+            && self.response_animated & (FEATURE_COAT | FEATURE_FUZZ) == 0)
+    }
+
     pub(crate) fn weighted_ior(&self) -> bool {
         (self.response_program & FEATURE_WEIGHTED_IOR != 0)
             || self.response_animated & FEATURE_WEIGHTED_IOR != 0
             || self.record.get("specular_weight")[0] != 1.
             || self.record.bound("specular_weight")
+    }
+
+    pub(crate) fn scattering(&self) -> bool {
+        self.hair || if self.record.tag[0]!=0 {
+            self.response_program & FEATURE_SCATTERING!=0
+        } else {
+            self.response_animated & FEATURE_SCATTERING!=0
+                || ["base_weight","specular_weight","coat_weight","fuzz_weight","transmission_weight","subsurface_weight"]
+                    .into_iter().any(|input|self.record.get(input)[0]!=0. || self.record.bound(input))
+        }
     }
 
     pub(crate) fn finish(self) -> Material {
@@ -647,6 +699,7 @@ impl PendingMaterial {
             } else {
                 0
             };
+        let scattering=self.scattering();
         let source_emission=self.emits();
         Material {
             zero_opacity: self.zero_opacity(),
@@ -655,6 +708,7 @@ impl PendingMaterial {
             hair: self.hair,
             physical_hair: self.physical_hair,
             subsurface,
+            scattering,
             features: features | FeatureMask::from(shading),
             #[cfg(test)]
             shadow_coverage: self.surface_coverage(),
@@ -1595,6 +1649,8 @@ pub(crate) fn install_gltf(
                 Ok(Some(tap(texture, tex_coord, transform, srgb, true)?))
             };
         if let Some(coat) = extension("KHR_materials_clearcoat") {
+            // Khronos clearcoat has no OpenPBR substrate darkening.
+            b.set("coat_darkening", &[0.]);
             b.set(
                 "coat_weight",
                 &[number(Some(coat), "clearcoatFactor").unwrap_or(0.)],
@@ -1684,6 +1740,7 @@ pub(crate) fn install_gltf(
         alpha_mask: alpha_mode == AlphaMode::Mask,
         shading: 0,
         response_animated: 0,
+        receiver_animated: 0,
         response_program: 0,
         unique: None,
         double_sided,
@@ -2477,7 +2534,7 @@ fn write_decoded(path: &Path, data: &gltf::image::Data) -> std::io::Result<()> {
     disk_cache::write_parts(path, &[&header, &pixels])
 }
 
-/// Byte offset of OpenPBR parameter `parameter` (index into `v2::OPENPBR`) of material
+/// Byte offset of OpenPBR parameter `parameter` (index into `v2::OPENPBR_TABLE`) of material
 /// record `slot` in the record storage, and its width in f32 words.
 pub(crate) fn value_location(slot: usize, parameter: usize) -> Option<(u64, usize)> {
     let p = OPENPBR.get(parameter)?;
@@ -2498,9 +2555,11 @@ pub(crate) fn track_targets(
     records: &[u8],
 ) -> Result<Vec<(usize, usize, Vec<f32>)>> {
     let path = format!("[\"materials\",{name:?},\"inputs\",{input:?}]");
-    let parameter = ::vork_scene::v2::validate_openpbr_input(input)
-        .map(|p| OPENPBR.iter().position(|q| q.name == p.name).unwrap())
+    let p = ::vork_scene::v2::validate_openpbr_input(input)
         .with_context(|| format!("track {path}"))?;
+    // The track is valid authoring data; the retained approximation is inert.
+    if p.approximated { return Ok(Vec::new()); }
+    let parameter = OPENPBR.iter().position(|q| q.name == p.name).unwrap();
     ensure!(
         !matches!(
             OPENPBR[parameter].kind,
@@ -2586,7 +2645,7 @@ pub(crate) fn openpbr_values(
         material.program == "std/openpbr",
         "material {name}: install program materials through programs.rs"
     );
-    for input in animated {
+    for input in animated.iter().filter(|input| !OpenPbrParam::find(input).is_some_and(|p| p.approximated)) {
         let (index, p) = param(input);
         if p.kind == OpenPbrKind::Vector3 {
             b.record.inputs[index] |= 1u32 << 31;
@@ -2597,6 +2656,7 @@ pub(crate) fn openpbr_values(
     }
     for (input, value) in &material.inputs {
         let p = ::vork_scene::v2::validate_openpbr_input(input).with_context(|| format!("material {name}"))?;
+        if p.approximated { continue; }
         let image = match value {
             Input::Number(x) => {
                 b.set(input, &[*x]);
@@ -2664,7 +2724,7 @@ pub(crate) fn openpbr_values(
 
     }
     // Normal/tangent tracks store ordinary tangent-space XYZ values.
-    for input in animated {
+    for input in animated.iter().filter(|input| !OpenPbrParam::find(input).is_some_and(|p| p.approximated)) {
         let (index, p) = param(input);
         if p.kind == OpenPbrKind::Vector3 {
             b.record.inputs[index] |= 1u32 << 31;
@@ -2715,14 +2775,36 @@ pub(crate) fn install_openpbr(
     Ok(openpbr_pending(scene, name, animated, values))
 }
 
-fn openpbr_pending(
+pub(crate) fn openpbr_pending(
     scene: &::vork_scene::v2::Scene,
     name: Option<&str>,
     animated: &std::collections::BTreeSet<String>,
     values: OpenPbrRecord,
 ) -> PendingMaterial {
-    let record = values.builder.record;
+    // Approximation-only inputs never reach the GPU table or change its layout.
+    // Conservatively warn for varying values; a zero attribute factor is neutral.
     let material = name.and_then(|name| scene.materials.get(name));
+    let nonzero = |input: &::vork_scene::v2::Input| match input {
+        ::vork_scene::v2::Input::Number(x) => *x != 0.,
+        ::vork_scene::v2::Input::Vector(v) => v.iter().any(|x| *x != 0.),
+        ::vork_scene::v2::Input::Attribute(b) => match &b.factor {
+            Some(::vork_scene::v2::Factor::Number(x)) => *x != 0.,
+            Some(::vork_scene::v2::Factor::Vector(v)) => v.iter().any(|x| *x != 0.),
+            None => true,
+        },
+        _ => true,
+    };
+    let approximated: Vec<_> = ::vork_scene::v2::OPENPBR.iter().filter(|p| p.approximated)
+        .filter(|p| animated.contains(p.name)
+            || material.and_then(|m| m.inputs.get(p.name)).is_some_and(nonzero))
+        .map(|p| p.name).collect();
+    if !approximated.is_empty() {
+        let material_name = name.unwrap_or("default OpenPBR");
+        crate::warnings::approximated("openpbr_approximation",
+            serde_json::json!({"material":material_name,"inputs":approximated}),
+            format!("material {material_name}: OpenPBR approximation for {}; using Lambert diffuse and Beer-only transmission without interior scattering", approximated.join(", ")));
+    }
+    let record = values.builder.record;
     let mut pending = PendingMaterial {
         uv_sources: [0, 1],
         emission_animated: animated.contains("emission_luminance") || animated.contains("emission_color"),
@@ -2741,11 +2823,16 @@ fn openpbr_pending(
         physical_hair: false,
         shading: values.shading,
         response_program: 0,
+        receiver_animated: ["base_weight","base_metalness","transmission_weight","fuzz_weight","specular_weight",
+            "specular_ior","coat_weight","geometry_thin_walled","thin_film_weight"].into_iter().enumerate()
+            .fold(0u16,|mask,(bit,name)|mask | if animated.contains(name) {1u16<<bit} else {0u16}),
         response_animated: if animated.contains("specular_roughness_anisotropy") {FEATURE_ANISOTROPY} else {0}
             | if animated.contains("coat_roughness_anisotropy") {FEATURE_COAT_ANISOTROPY} else {0}
             | if animated.contains("thin_film_weight") {FEATURE_FILM} else {0}
             | if animated.contains("subsurface_weight") {FEATURE_SUBSURFACE} else {0}
-            | if animated.contains("specular_weight") {FEATURE_WEIGHTED_IOR} else {0},
+            | if animated.contains("specular_weight") {FEATURE_WEIGHTED_IOR} else {0}
+            | if ["base_weight","specular_weight","coat_weight","fuzz_weight","transmission_weight","subsurface_weight"]
+                .into_iter().any(|name|animated.contains(name)) {FEATURE_SCATTERING} else {0},
         unique: name.filter(|_| !animated.is_empty()).map(str::to_owned),
     };
     pending.coverage(
@@ -2766,7 +2853,7 @@ pub(crate) fn input_slang() -> [(&'static str, String); 2] {
     use std::fmt::Write;
     let index = |name| param(name).0;
     let word = |name| value_word(index(name));
-    let layout = format!(
+    let mut layout = format!(
         "// Generated by materials.rs input_slang(): the material record and the inputs shading reads directly.\n\
          import vork_constants;\n\
          struct MaterialRecord {{ uint4 tag; float4 extra; uint4 inputs[{}]; float4 values[{}]; }};\n\
@@ -2792,6 +2879,9 @@ pub(crate) fn input_slang() -> [(&'static str, String); 2] {
         index("geometry_coat_tangent"),word("geometry_coat_tangent"),
         OCCLUSION_INPUT
     );
+    for name in ["emission_color", "emission_luminance"] {
+        writeln!(layout, "static const uint MATERIAL_{}_WORD={}u;", name.to_uppercase(), word(name)).unwrap();
+    }
     let mut s = String::from(
         "// Generated by materials.rs input_slang(): every OpenPBR input from its record word or texture tap.\n\
          import vork_constants;\nimport closure;\nimport vork_material_table;\nimport material_layout;\nimport variant;\n\
@@ -3552,6 +3642,38 @@ mod tests {
     }
 
     #[test]
+    fn final_scattering_retains_unknowns_and_unions_only_installed_materials() {
+        let weights=["base_weight","specular_weight","coat_weight","fuzz_weight","transmission_weight","subsurface_weight"];
+        let mut empty=PendingMaterial::program(0,false);
+        for name in weights {empty.record.values[value_word(param(name).0)]=0.;}
+        assert!(!empty.clone().finish().scattering);
+        for name in weights {
+            for value in [1.,-1.,1e-30] {
+                let mut active=empty.clone();active.record.values[value_word(param(name).0)]=value;
+                assert!(active.finish().scattering,"{name}={value}");
+            }
+            let mut bound=empty.clone();bound.record.inputs[param(name).0]=1;
+            assert!(bound.finish().scattering,"bound {name}");
+            let input=serde_json::json!({"base_weight":0,"specular_weight":0,"coat_weight":0,"fuzz_weight":0,"transmission_weight":0,"subsurface_weight":0});
+            let scene=scene(serde_json::json!({"material":{"inputs":input}}));
+            let animated=[name.to_owned()].into_iter().collect();
+            let values=openpbr_values(&scene,Some("material"),&animated,|_|Ok(0)).unwrap();
+            assert!(openpbr_pending(&scene,Some("material"),&animated,values).finish().scattering,"tracked {name}");
+        }
+        let mut program=PendingMaterial::program(1,false);
+        assert!(program.clone().finish().scattering,"unproven program");
+        program.response_program &= !FEATURE_SCATTERING;
+        assert!(!program.clone().finish().scattering,"program record defaults are not its output");
+        let mut materials=vec![empty.finish(),program.finish()];
+        assert_eq!(installed_features(&materials)&FEATURE_SCATTERING,0);
+        materials.push(PendingMaterial::program(2,false).finish());
+        let union=installed_features(&materials);materials.reverse();
+        assert_eq!(union,installed_features(&materials));
+        assert_ne!(union&FEATURE_SCATTERING,0);
+        assert!(materials.iter().all(|m|m.features&FEATURE_SCATTERING==0),"no raster variants");
+    }
+
+    #[test]
     fn installed_features_are_the_union_of_every_material() {
         // An unproven program keeps every lobe; its proofs remove them.
         let unproven=PendingMaterial::program(1,false);
@@ -3571,6 +3693,41 @@ mod tests {
         let mut reversed=[proven.clone().finish(),PendingMaterial::program(1,false).finish()];
         let forward=installed_features(&reversed);reversed.reverse();
         assert_eq!(forward,installed_features(&reversed));
+    }
+
+    #[test]
+    fn installed_coverage_keeps_bound_animated_and_programmed_opacity() -> Result<()> {
+        use crate::forward_variant::FEATURE_SURFACE_COVERAGE;
+        let mut s=scene(serde_json::json!({
+            "plain":{},
+            "glass":{"inputs":{"transmission_weight":1.}},
+            "alpha":{"inputs":{"geometry_opacity":0.4}},
+            "cutoff":{"inputs":{"alpha_cutoff":0.}},
+            "image":{"inputs":{"geometry_opacity":{"image":"d"}}}
+        }));
+        s.animation.clear();
+        let covered=|materials:&[Material]| installed_features(materials)&FEATURE_SURFACE_COVERAGE!=0;
+        for (name,tracked,expected) in [
+            ("plain",None,false),("glass",None,false),("alpha",None,true),
+            ("cutoff",None,true),("image",None,true),
+            ("plain",Some("geometry_opacity"),true),("plain",Some("alpha_cutoff"),true),
+        ] {
+            let animated=tracked.map(str::to_owned).into_iter().collect();
+            let values=openpbr_values(&s,Some(name),&animated,|_|Ok(1))?;
+            let material=openpbr_pending(&s,Some(name),&animated,values).finish();
+            assert_eq!(material.features&FEATURE_SURFACE_COVERAGE,0,"not a per-material proof");
+            assert_eq!(covered(&[material]),expected,"{name}, {tracked:?}");
+        }
+        // The existing installed program proof selects coverage integration.
+        // A single possible partial material, even unused by a draw, keeps it.
+        let mut program=PendingMaterial::program(1,false);
+        assert!(!covered(&[program.clone().finish()]));
+        program.integrate_opacity(None,false,true);
+        let mut materials=[PendingMaterial::program(0,false).finish(),program.finish()];
+        assert!(covered(&materials));
+        materials.reverse();
+        assert!(covered(&materials));
+        Ok(())
     }
 
     #[test]
@@ -3656,15 +3813,45 @@ mod tests {
     }
 
     #[test]
+    fn approximated_inputs_warn_once_per_material_and_keep_shaded_values() {
+        for (inputs, animated, warn) in [
+            (serde_json::json!({}), vec![], false),
+            (serde_json::json!({"base_diffuse_roughness":0,"transmission_scatter":[0,0,0],"transmission_scatter_anisotropy":0}), vec![], false),
+            (serde_json::json!({"base_diffuse_roughness":0.5,"transmission_scatter":[0.2,0.3,0.4],"transmission_scatter_anisotropy":-0.5}), vec![], true),
+            (serde_json::json!({"base_diffuse_roughness":{"image":"d"}}), vec![], true),
+            (serde_json::json!({}), vec!["transmission_scatter_anisotropy"], true),
+        ] {
+            let s = scene(serde_json::json!({"paint":{"inputs":inputs}}));
+            let collector = crate::warnings::Collector::default();
+            let _scope = collector.enter();
+            let animated = animated.into_iter().map(str::to_string).collect();
+            let install = || {
+                let values = openpbr_values(&s, Some("paint"), &animated, |_| Ok(0))?;
+                Ok::<_, anyhow::Error>(openpbr_pending(&s, Some("paint"), &animated, values))
+            };
+            let installed = install().unwrap();
+            install().unwrap();
+            let warnings = collector.snapshot();
+            assert_eq!(warnings.len(), usize::from(warn));
+            if warn {
+                assert_eq!(warnings[0].code, "openpbr_approximation");
+                assert_eq!(warnings[0].requested["material"], "paint");
+                assert!(warnings[0].dropped.contains("Lambert"));
+                assert!(warnings[0].dropped.contains("Beer-only"));
+            }
+            let default = RecordBuilder::openpbr();
+            for p in OPENPBR.iter().filter(|p| p.closure) {
+                assert_eq!(installed.record.get(p.name), default.get(p.name), "{}", p.name);
+            }
+        }
+    }
+
+    #[test]
     fn openpbr_records_reject_what_is_not_applied() {
         for (inputs, why) in [
             (
                 serde_json::json!({"specular_roughness":"a"}),
                 "sRGB data image",
-            ),
-            (
-                serde_json::json!({"transmission_scatter":[0.5,0.5,0.5]}),
-                "parameter vork does not shade",
             ),
             (
                 serde_json::json!({"geometry_thin_walled":{"image":"d"}}),
@@ -3736,6 +3923,34 @@ mod tests {
 
     }
 
+    #[test]
+    fn material_emission_receivers_follow_effective_weights() {
+        for (inputs,tracks,expected) in [
+            (serde_json::json!({}),vec![],true),
+            (serde_json::json!({"base_weight":0,"specular_weight":0}),vec![],false),
+            (serde_json::json!({"transmission_weight":1}),vec![],true),
+            (serde_json::json!({"transmission_weight":1,"geometry_thin_walled":true,"specular_ior":1}),vec![],false),
+            (serde_json::json!({"transmission_weight":1,"geometry_thin_walled":true,"specular_weight":0}),vec![],false),
+            (serde_json::json!({"transmission_weight":1,"geometry_thin_walled":true,"specular_ior":1}),vec!["specular_weight"],false),
+            (serde_json::json!({"transmission_weight":1,"geometry_thin_walled":true,"specular_ior":1}),vec!["specular_ior"],true),
+            (serde_json::json!({"transmission_weight":1,"geometry_thin_walled":true,"specular_ior":1}),vec!["geometry_thin_walled"],true),
+            (serde_json::json!({"base_metalness":1}),vec![],true),
+            (serde_json::json!({"base_weight":0,"specular_weight":0,"fuzz_weight":1}),vec![],true),
+            (serde_json::json!({"base_weight":0,"specular_weight":0}),vec!["fuzz_weight"],true),
+            (serde_json::json!({"base_weight":0,"specular_weight":0}),vec!["base_weight"],true),
+            (serde_json::json!({"subsurface_weight":1}),vec![],true),
+        ] {
+            let s=scene(serde_json::json!({"paint":{"inputs":inputs}}));
+            let tracks=tracks.into_iter().map(str::to_owned).collect();
+            let pending=openpbr_pending(&s,Some("paint"),&tracks,values(&s,"paint").unwrap());
+            assert_eq!(pending.emission_receiver_mask()!=0,expected,"{}: {tracks:?}",s.materials["paint"].inputs.len());
+        }
+        let mut program=PendingMaterial::program(1,false);
+        assert_ne!(program.emission_receiver_mask(),0,"unknown program scattering remains possible");
+        program.response_program &= !FEATURE_SCATTERING;
+        assert_eq!(program.emission_receiver_mask(),0,"proved unlit output needs no receiver");
+    }
+
     /// Zero emission factors (an authored black colour or zero luminance, a texture
     /// times either) are not emitters; nonzero constants and emission tracks are.
     #[test]
@@ -3767,6 +3982,40 @@ mod tests {
     }
 
     #[test]
+    fn constant_source_proof_keeps_spatial_and_layered_emission() {
+        let s=scene(serde_json::json!({"paint":{"inputs":{"emission_luminance":3}}}));
+        let mut plain=PendingMaterial::program(0,false);
+        plain.record=values(&s,"paint").unwrap().builder.record;
+        assert!(plain.constant_source_emission());
+        // Unrelated receiver response cannot invalidate a source-only proof.
+        let mut metal=plain.clone();metal.record.values[value_word(param("base_metalness").0)]=1.;
+        assert!(metal.constant_source_emission());
+        for input in ["emission_color","emission_luminance","geometry_opacity","alpha_cutoff","coat_weight","fuzz_weight"] {
+            let mut bound=plain.clone();bound.record.inputs[param(input).0]=1;
+            assert!(!bound.constant_source_emission(),"bound {input}");
+        }
+        for (input,feature) in [("coat_weight",FEATURE_COAT),("fuzz_weight",FEATURE_FUZZ)] {
+            let mut weighted=plain.clone();weighted.record.values[value_word(param(input).0)]=0.5;
+            assert!(!weighted.constant_source_emission(),"nonzero {input}");
+            let mut animated=plain.clone();animated.response_animated|=feature;
+            assert!(!animated.constant_source_emission(),"initially zero tracked {input}");
+        }
+        for flag in [FLAG_VERTEX_ALPHA,vork_slang::registry::FLAG_GLTF_UNLIT] {
+            let mut varying=plain.clone();varying.record.tag[2]|=flag;
+            assert!(!varying.constant_source_emission());
+        }
+        let mut program=plain.clone();program.record.tag[0]=1;program.source_emission=true;
+        assert!(!program.constant_source_emission());
+        program.source_emission=false;
+        assert!(program.constant_source_emission(),"proved dark programs cannot be sampled sources");
+        let mut animated=plain;animated.emission_animated=true;animated.opacity_animated=true;
+        animated.record.values[value_word(param("emission_luminance").0)]=0.;
+        assert!(animated.constant_source_emission(),"constant record tracks are read at the current time");
+        animated.response_animated|=FEATURE_COAT;
+        assert!(!animated.constant_source_emission(),"initially dark tracked sources still reserve layers");
+    }
+
+    #[test]
     fn animated_records_never_merge_with_identical_static_ones() {
         let s = scene(serde_json::json!({"paint":{}}));
         let record = values(&s, "paint").unwrap().builder.record;
@@ -3788,6 +4037,7 @@ mod tests {
             opacity_animated: false,
             shading: 0,
             response_animated: 0,
+            receiver_animated: 0,
             response_program: 0,
             unique: unique.map(str::to_owned),
         };
@@ -3811,6 +4061,9 @@ mod tests {
             targets,
             vec![(3, base, vec![1., 1., 1.]), (7, base, vec![1., 1., 1.])]
         );
+        for name in ["base_diffuse_roughness", "transmission_scatter", "transmission_scatter_anisotropy"] {
+            assert!(track_targets(("paint", name), &[3, 7], bytes).unwrap().is_empty());
+        }
         let roughness = track_targets(("paint", "specular_roughness"), &[3], bytes).unwrap();
         assert_eq!(roughness[0].2, vec![0.3]);
         assert!(track_targets(("paint", "thin_film_weight"), &[3], bytes).is_ok());

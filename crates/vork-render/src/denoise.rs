@@ -392,9 +392,8 @@ fn unpack_inputs(data: &[u8], samples: usize, count: usize, guide_alpha: bool) -
             f32::from_ne_bytes(p[c * 4..c * 4 + 4].try_into().unwrap()) / samples as f32
         }))
         .collect();
-    let color = associated.iter()
-        .map(|p| std::array::from_fn(|c| if p[3] > 0. { p[c] / p[3] } else { 0. }))
-        .collect();
+    // The denoiser takes associated colour (shaders/denoise.slang pack).
+    let color = associated.iter().map(|p| std::array::from_fn(|c| p[c])).collect();
     let guide = |plane: usize| -> Vec<[f32; 3]> {
         (0..count).map(|i| {
             let start = color_bytes + i * 32 + plane * 16;
@@ -683,7 +682,7 @@ impl Stage {
             // reconstruction, which need not preserve even a constant World.
             if !surface { continue; }
             for c in 0..3 {
-                p[c] = rgb[c] * p[3];
+                p[c] = rgb[c];
             }
         }
         r.queue

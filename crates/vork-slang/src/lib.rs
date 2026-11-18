@@ -765,6 +765,8 @@ pub struct ProgramCapabilities {
     pub tint: bool,
     /// Any returned closure can have a non-unit dielectric specular weight.
     pub weighted_ior: bool,
+    /// The final closure (lit when present, otherwise surface) may scatter.
+    pub scattering: bool,
     /// `surface` returns a Blend: independently shaded lobes.
     #[serde(default)]
     pub lobes: bool,
@@ -1266,17 +1268,9 @@ impl Compiler {
         if let Some(snapshot) = &snapshot {
             identity::check_imports(self, &work, snapshot)?;
         }
-        let mut code=fs::read(output)?;
+        let code=fs::read(output)?;
         if metal {metal_source::validate(std::str::from_utf8(&code)?)?;}
-        // Slang emits MSL source; its fp-mode flag cannot configure the later
-        // Metal compiler invocation in a passthrough API. Carry the precise
-        // contract as standard source directives, independent of shader names.
-        if metal
-            && args.windows(2).any(|pair|matches!(pair[0],"-fp-mode"|"-floating-point-mode") && pair[1]=="precise") {
-            let mut source=b"#pragma METAL fp math_mode(safe)\n#pragma METAL fp contract(off)\n".to_vec();
-            source.append(&mut code);code=source;
-        }
-        Ok(code)
+        metal_source::finalize(args, code)
     }
 
     /// Compile one program. `source` is the module text, `origin` the path used
@@ -1463,8 +1457,7 @@ impl Compiler {
         let mut includes = vec![work.0.clone()]; includes.extend(include_paths(origin));
         let field = |name: &str| if abi.closure.iter().any(|f| f.name == name) { format!("c.{name}") } else { "0.".into() };
         let opacity = if abi.closure.iter().any(|f| f.name == "geometry_opacity") { "1.-c.geometry_opacity" } else { "0." };
-        let square = |name: &str| if abi.closure.iter().any(|f| f.name == name) { format!("l.{name}*l.{name}") } else { "0.".into() };
-        let reflects = ["base_weight", "specular_weight", "coat_weight", "fuzz_weight", "transmission_weight", "subsurface_weight"].map(square).join("+");
+        let surface_scattering=registry::EFFECT_SURFACE_SCATTERING;
         let surface_dispersion=registry::EFFECT_SURFACE_DISPERSION;
         let lit_dispersion=registry::EFFECT_LIT_DISPERSION;
         let surface_wavelength=registry::EFFECT_SURFACE_WAVELENGTH;
@@ -1474,16 +1467,16 @@ impl Compiler {
         let lit_coat_anisotropy=registry::EFFECT_LIT_COAT_ANISOTROPY;
         let surface_weighted_ior=registry::EFFECT_SURFACE_WEIGHTED_IOR;
         let lit_weighted_ior=registry::EFFECT_LIT_WEIGHTED_IOR;
-        let lit_probe = if lit { format!("Closure l=lit(vork_context,inputs,vork_light); vork_effects[4]={reflects}; vork_effects[{lit_weighted_ior}]=vork_weighted_ior_of(l); let lr=vork_response_of(l); vork_effects[9]=lr.x; vork_effects[10]=lr.y; vork_effects[{lit_coat_anisotropy}]=lr.w; vork_effects[{lit_dispersion}]=lr.z; vork_effects[{lit_wavelength}]=vork_wavelength_of(l); let lit_layers=vork_layers_of(l); vork_effects[14]=lit_layers.x; vork_effects[15]=lit_layers.y; vork_effects[16]=lit_layers.z;") } else { String::new() };
+        let lit_probe = if lit { format!("Closure l=lit(vork_context,inputs,vork_light); vork_effects[4]=vork_closure_scattering(l); vork_effects[{lit_weighted_ior}]=vork_weighted_ior_of(l); let lr=vork_response_of(l); vork_effects[9]=lr.x; vork_effects[10]=lr.y; vork_effects[{lit_coat_anisotropy}]=lr.w; vork_effects[{lit_dispersion}]=lr.z; vork_effects[{lit_wavelength}]=vork_wavelength_of(l); let lit_layers=vork_layers_of(l); vork_effects[14]=lit_layers.x; vork_effects[15]=lit_layers.y; vork_effects[16]=lit_layers.z;") } else { String::new() };
         let spatial = openpbr::spatial_subsurface(&abi.closure);
         let tint = if abi.closure.iter().any(|f| f.name == "specular_color") { "(c.specular_color.x-1.)*(c.specular_color.x-1.)+(c.specular_color.y-1.)*(c.specular_color.y-1.)+(c.specular_color.z-1.)*(c.specular_color.z-1.)" } else { "0." };
-        let probe = format!("{}\nfloat vork_weighted_ior_of(Closure c) {{return vork_closure_weighted_ior(c);}}\nfloat vork_weighted_ior_of(Blend s) {{return vork_blend_weighted_ior(s);}}\nfloat vork_weighted_ior_of(Hair h) {{return 1.;}}\nfloat vork_emission_of(Closure c) {{return vork_closure_emission(c);}}\nfloat vork_emission_of(Blend s) {{return vork_blend_emission(s);}}\nfloat vork_emission_of(Hair h) {{return 0.;}}\nfloat vork_wavelength_of(Closure c) {{return vork_closure_wavelength(c);}}\nfloat vork_wavelength_of(Blend s) {{return vork_blend_wavelength(s);}}\nfloat vork_wavelength_of(Hair h) {{return {hair_wavelength};}}\nfloat3 vork_layers_of(Closure c) {{return float3({coat},{fuzz},{tint});}}\nfloat3 vork_layers_of(Blend s) {{return vork_blend_layers(s);}}\nfloat3 vork_layers_of(Hair h) {{return float3(0.);}}\nfloat4 vork_response_of(Closure c) {{return float4({anisotropy},{film},{dispersion},{coat_anisotropy});}}\nfloat4 vork_response_of(Blend s) {{return vork_blend_response(s);}}\nfloat4 vork_response_of(Hair h) {{return float4(0.);}}\nfloat vork_spatial_of(Closure c) {{return {spatial};}}\nfloat vork_spatial_of(Blend s) {{return vork_blend_effects(s).w;}}\nfloat vork_spatial_of(Hair h) {{return 0.;}}\nfloat4 vork_effects_of(Closure c) {{ return float4({},{opacity},{},0.); }}\n\
+        let probe = format!("{}\nfloat vork_scattering_of(Closure c) {{return vork_closure_scattering(c);}}\nfloat vork_scattering_of(Blend s) {{return vork_blend_scattering(s);}}\nfloat vork_scattering_of(Hair h) {{return 1.;}}\nfloat vork_weighted_ior_of(Closure c) {{return vork_closure_weighted_ior(c);}}\nfloat vork_weighted_ior_of(Blend s) {{return vork_blend_weighted_ior(s);}}\nfloat vork_weighted_ior_of(Hair h) {{return 1.;}}\nfloat vork_emission_of(Closure c) {{return vork_closure_emission(c);}}\nfloat vork_emission_of(Blend s) {{return vork_blend_emission(s);}}\nfloat vork_emission_of(Hair h) {{return 0.;}}\nfloat vork_wavelength_of(Closure c) {{return vork_closure_wavelength(c);}}\nfloat vork_wavelength_of(Blend s) {{return vork_blend_wavelength(s);}}\nfloat vork_wavelength_of(Hair h) {{return {hair_wavelength};}}\nfloat3 vork_layers_of(Closure c) {{return float3({coat},{fuzz},{tint});}}\nfloat3 vork_layers_of(Blend s) {{return vork_blend_layers(s);}}\nfloat3 vork_layers_of(Hair h) {{return float3(0.);}}\nfloat4 vork_response_of(Closure c) {{return float4({anisotropy},{film},{dispersion},{coat_anisotropy});}}\nfloat4 vork_response_of(Blend s) {{return vork_blend_response(s);}}\nfloat4 vork_response_of(Hair h) {{return float4(0.);}}\nfloat vork_spatial_of(Closure c) {{return {spatial};}}\nfloat vork_spatial_of(Blend s) {{return vork_blend_effects(s).w;}}\nfloat vork_spatial_of(Hair h) {{return 0.;}}\nfloat4 vork_effects_of(Closure c) {{ return float4({},{opacity},{},0.); }}\n\
             float4 vork_effects_of(Blend s) {{ let e=vork_blend_effects(s); return float4(e.x,e.y,e.z,1.); }}\n\
             float4 vork_effects_of(Hair h) {{ return float4(0.); }}\n\
             float vork_count_of(Closure c) {{return 1.;}} float vork_count_of(Hair h) {{return 1.;}} float vork_count_of(Blend s) {{return float(vork_blend_count(s));}}\n\
             float vork_is_hair(Closure c) {{ return 0.; }} float vork_is_hair(Blend s) {{ return 0.; }} float vork_is_hair(Hair h) {{ return 1.; }}\n\
             float vork_physical_of(Closure c) {{ return 0.; }} float vork_physical_of(Blend s) {{ return 0.; }} float vork_physical_of(Hair h) {{ return h.scattering ? 1. : 0.; }}\n\
-            ConstantBuffer<ShadingContext> vork_context; ConstantBuffer<Lighting> vork_light; RWStructuredBuffer<float> vork_effects; [shader(\"compute\")][numthreads(1,1,1)] void vork_entry() {{ uint base=0u;\n{decode} let vork_s=surface(vork_context,inputs); vork_effects[{surface_weighted_ior}]=vork_weighted_ior_of(vork_s); vork_effects[{lit_weighted_ior}]=0.; vork_effects[{emission_effect}]=vork_emission_of(vork_s); vork_effects[17]=vork_physical_of(vork_s); vork_effects[18]=vork_spatial_of(vork_s); let response=vork_response_of(vork_s); vork_effects[7]=response.x; vork_effects[8]=response.y; vork_effects[{surface_coat_anisotropy}]=response.w; vork_effects[{lit_coat_anisotropy}]=0.; vork_effects[{surface_wavelength}]=vork_wavelength_of(vork_s); vork_effects[{lit_wavelength}]=0.; vork_effects[{surface_dispersion}]=response.z; vork_effects[{lit_dispersion}]=0.; vork_effects[9]=0.;vork_effects[10]=0.; let ll=vork_layers_of(vork_s); vork_effects[11]=ll.x;vork_effects[12]=ll.y;vork_effects[13]=ll.z;vork_effects[14]=0.;vork_effects[15]=0.;vork_effects[16]=0.; let e=vork_effects_of(vork_s); vork_effects[0]=e.x;vork_effects[1]=e.y;vork_effects[2]=e.z;vork_effects[3]=e.w; vork_effects[5]=vork_is_hair(vork_s); vork_effects[6]=vork_count_of(vork_s); {lit_probe} }}",
+            ConstantBuffer<ShadingContext> vork_context; ConstantBuffer<Lighting> vork_light; RWStructuredBuffer<float> vork_effects; [shader(\"compute\")][numthreads(1,1,1)] void vork_entry() {{ uint base=0u;\n{decode} let vork_s=surface(vork_context,inputs); vork_effects[{surface_scattering}]=vork_scattering_of(vork_s); vork_effects[{surface_weighted_ior}]=vork_weighted_ior_of(vork_s); vork_effects[{lit_weighted_ior}]=0.; vork_effects[{emission_effect}]=vork_emission_of(vork_s); vork_effects[17]=vork_physical_of(vork_s); vork_effects[18]=vork_spatial_of(vork_s); let response=vork_response_of(vork_s); vork_effects[7]=response.x; vork_effects[8]=response.y; vork_effects[{surface_coat_anisotropy}]=response.w; vork_effects[{lit_coat_anisotropy}]=0.; vork_effects[{surface_wavelength}]=vork_wavelength_of(vork_s); vork_effects[{lit_wavelength}]=0.; vork_effects[{surface_dispersion}]=response.z; vork_effects[{lit_dispersion}]=0.; vork_effects[9]=0.;vork_effects[10]=0.; let ll=vork_layers_of(vork_s); vork_effects[11]=ll.x;vork_effects[12]=ll.y;vork_effects[13]=ll.z;vork_effects[14]=0.;vork_effects[15]=0.;vork_effects[16]=0.; let e=vork_effects_of(vork_s); vork_effects[0]=e.x;vork_effects[1]=e.y;vork_effects[2]=e.z;vork_effects[3]=e.w; vork_effects[5]=vork_is_hair(vork_s); vork_effects[6]=vork_count_of(vork_s); {lit_probe} }}",
             program_text(source,origin), field("subsurface_weight"), field("transmission_weight"), anisotropy=format!("({})+({})*({})",field("specular_roughness_anisotropy"),field("coat_weight"),field("coat_roughness_anisotropy")), coat_anisotropy=format!("({})*({})",field("coat_weight"),field("coat_roughness_anisotropy")), film=field("thin_film_weight"), dispersion=format!("({})*({})",field("transmission_weight"),field("transmission_dispersion_scale")), coat=field("coat_weight"), fuzz=field("fuzz_weight"), decode=inputs.slang_decode(), emission_effect=registry::EFFECT_SURFACE_EMISSION);
         let output = self.run(&work, &probe, &includes, false)?;
         Ok((EffectProbe::parse(&output.wgsl, lit)?.capabilities(&[]), output.wgsl))
@@ -1549,6 +1542,14 @@ impl Compiler {
         self.version()?;
         let work = Workspace::new()?;
         write_modules(&work, abi, source)?;
+        if precise {
+            // Medium proofs need a trusted bounded-work boundary around the
+            // grid sampler. Rename only this compiler-owned proof module's
+            // private helper; native consumers retain the original sampler and
+            // therefore exactly the same surface-grid kernels.
+            let grid = module_source("std/grid").unwrap();
+            fs::write(work.0.join("std/grid.slang"), grid.replace("grid_sample(", "vork_grid_sample("))?;
+        }
         let mut includes = vec![work.0.clone()];
         includes.extend(include_paths(origin));
         let program = program_text(source, origin);

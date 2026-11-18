@@ -15,6 +15,7 @@ import unittest
 import sys
 from blake3 import blake3
 from shader_bundle import export, package
+from shader_compiler import preparation_identity
 from runtime_platform import check_runtime_platform, macos_manifest, verify_macos_manifest
 import struct
 
@@ -200,17 +201,28 @@ class PackageReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='vork-prepare-test-') as tmp:
             root = Path(tmp)
             binary = root / 'vork'
-            write_executable(binary, f'#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n'
-                              'Path(__file__).with_suffix(".args").write_text(json.dumps(sys.argv[1:]))\n')
+            write_executable(binary, f'#!{sys.executable}\nimport json, sys, os, lzma\nfrom pathlib import Path\n'
+                              f'Path({str(binary.with_suffix(".args"))!r}).write_text(json.dumps(sys.argv[1:]))\n'
+                              'name = "a" * 64 + ".slang-variant-v1.entry"\n'
+                              '(Path(os.environ["VORK_CACHE_DIR"]) / name).write_bytes(lzma.decompress((Path(__file__).parent / "shaders" / (name + ".xz")).read_bytes()))\n')
 
-            cache = root / 'cache'
-            cache.mkdir()
+            compiler = root / 'slang/bin/slangc'
+            compiler.parent.mkdir(parents=True)
+            compiler.write_bytes(b'pinned compiler fixture')
+            # The prepared command fixture does not execute this compiler.
+            cache_root = root / 'cache'
+            cache = cache_root / preparation_identity(binary)
+            cache.mkdir(parents=True)
             shader = 'a' * 64 + '.slang-variant-v1.entry'
-            (cache / shader).write_bytes(envelope(shader))
+            (cache / (shader + '.xz')).write_bytes(lzma.compress(envelope(shader)))
+            obsolete = 'b' * 64 + '.slang-variant-v1.entry'
+            (cache / (obsolete + '.xz')).write_bytes(lzma.compress(envelope(obsolete)))
             subprocess.run([sys.executable, str(ROOT / 'scripts/prepare-shaders'),
-                            '--binary', str(binary), '--cache', str(cache),
+                            '--binary', str(binary), '--cache', str(cache_root),
                             '--output', str(root / 'shaders')], check=True)
             self.assertTrue((root / 'shaders' / (shader + '.xz')).is_file())
+            self.assertFalse((root / 'shaders' / (obsolete + '.xz')).exists())
+            self.assertTrue((cache / (obsolete + '.xz')).exists())
             command, *scenes = json.loads(binary.with_suffix('.args').read_text())
             self.assertEqual(command, 'prepare-release-shaders')
             self.assertIn(str(ROOT / 'crates/vork-scene/src/starter.json'), scenes)

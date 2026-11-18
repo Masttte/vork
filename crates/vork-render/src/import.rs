@@ -479,7 +479,7 @@ fn admit_geometry_streams(limits: &wgpu::Limits, bytes: [u64; 3]) -> Result<u64>
 impl GeometryUpload<'_> {
     pub(crate) fn upload(
         &mut self,
-        geometry: &crate::geometry::Geometry,
+        geometry: &std::sync::Arc<crate::geometry::Geometry>,
         deform: Option<Deform>,
         material: usize,
         node: (usize, String),
@@ -492,7 +492,7 @@ impl GeometryUpload<'_> {
         // meshes commonly have no further duplicates, so that only adds startup.
         let indexed = if deform.is_none() && !self.evaluated_layout && geometry.refinement.is_none()
             && geometry.indices.len() <= geometry.vertices.len() {
-            geometry.indexed()
+            geometry.indexed().map(std::sync::Arc::new)
         } else { None };
         let geometry = indexed.as_ref().unwrap_or(geometry);
         let crate::geometry::Geometry {
@@ -502,11 +502,21 @@ impl GeometryUpload<'_> {
             uv_sets,
             attributes,
             ..
-        } = geometry;
+        } = geometry.as_ref();
         let bounds = *bounds;
         let mut layout = crate::geometry::VertexLayout::for_vertices(vertices, deform.is_some() || self.evaluated_layout);
         if self.stream_layout || (self.evaluated_layout && !geometry.point_centers.is_empty()) { layout.uv = [0,1]; layout.color = true; layout.points = !geometry.point_centers.is_empty(); }
         layout.custom = self.attribute_names.len() as u8;
+        // Read-only meshes need no per-vertex copies of absent trailing fields.
+        // Raster fetch uses its zero stream; ray reconstruction already bounds
+        // each named read by attribute_stride. Evaluated layouts retain all slots
+        // because later stages can publish fields absent from the source.
+        layout.stored_custom = if layout.deform || self.stream_layout || geometry.refinement.is_some() {
+            layout.custom
+        } else {
+            self.attribute_names.iter().rposition(|name| attributes.contains_key(name))
+                .map_or(0, |slot| (slot + 1) as u8)
+        };
         if vertices.is_empty() || indices.is_empty() {
             return Ok(());
         }
@@ -594,7 +604,14 @@ impl GeometryUpload<'_> {
             },
             layout,
             uv_sets: *uv_sets,
-            exit_geometry: Some(std::sync::Arc::new(geometry.clone())),
+            // Static upload and retained consumers share the immutable decoded mesh.
+            // Evaluated uploads keep separate CPU identities: closure and topology
+            // plans distinguish them from static uses of the same decoded source.
+            exit_geometry: Some(if layout.deform {
+                std::sync::Arc::new((**geometry).clone())
+            } else {
+                std::sync::Arc::clone(geometry)
+            }),
             exit_bvh: None,
             open_edges: None,
             indices: index_buffer,
@@ -877,7 +894,7 @@ impl GeometryUpload<'_> {
                     attributes: bound_attributes,
                 };
                 self.upload(
-                    &geometry,
+                    &std::sync::Arc::new(geometry),
                     deform,
                     material,
                     (node.index(), node.name().unwrap_or("").to_owned()),

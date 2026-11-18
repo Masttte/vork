@@ -42,7 +42,7 @@ impl Store {
         // CPU decoding is independent of renderer builds and adapters. Codec
         // revisions belong in the caller's explicit format version.
         match kind {
-            "decoded-texture" | "native-decoded-texture" => {}
+            "decoded-texture" | "native-decoded-texture" | "decoded-display-table" | "curve-tubes" => {}
             // Slang emits native source/IR, not device machine code. Generated
             // scene text is the caller's key; embedded modules, generators and
             // pinned compiler inputs have their own content identity.
@@ -339,6 +339,50 @@ impl std::ops::Deref for MappedPayload {
     }
 }
 
+/// A verified immutable entry whose pages need not stay mapped between uploads.
+/// The open file survives eviction or replacement of its pathname.
+pub(crate) struct ReadOnlyPayload {
+    file: fs::File,
+    length: usize,
+}
+impl ReadOnlyPayload {
+    pub(crate) fn map(&self) -> std::io::Result<MappedPayload> {
+        // SAFETY: publication replaces files atomically and eviction only unlinks;
+        // neither changes this retained, already verified file.
+        let mapped = unsafe { memmap2::Mmap::map(&self.file) }?;
+        if mapped.len() != self.length + blake3::OUT_LEN {
+            return Err(std::io::Error::other("immutable cache entry changed length"));
+        }
+        Ok(MappedPayload(mapped))
+    }
+}
+
+/// Verify with bounded scratch instead of faulting a second whole pixel mapping
+/// while the caller still owns freshly decoded texels.
+pub(crate) fn open_payload(path: &Path, expected: usize) -> Option<ReadOnlyPayload> {
+    #[cfg(not(windows))]
+    let mut file = fs::File::open(path).ok()?;
+    #[cfg(windows)]
+    let mut file = fs::OpenOptions::new().read(true).write(true).open(path)
+        .or_else(|_| fs::File::open(path)).ok()?;
+    let length = usize::try_from(file.metadata().ok()?.len()).ok()?.checked_sub(blake3::OUT_LEN)?;
+    if length != expected { return None; }
+    let mut digest = [0; blake3::OUT_LEN];
+    file.read_exact(&mut digest).ok()?;
+    let mut checked = entry_hasher(path);
+    let mut scratch = [0; 64 * 1024];
+    let mut remaining = length;
+    while remaining != 0 {
+        let count = remaining.min(scratch.len());
+        file.read_exact(&mut scratch[..count]).ok()?;
+        checked.update(&scratch[..count]);
+        remaining -= count;
+    }
+    if checked.finalize().as_bytes() != &digest { return None; }
+    let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
+    Some(ReadOnlyPayload { file, length })
+}
+
 pub(crate) fn read_mapped(path: &Path) -> Option<MappedPayload> {
     #[cfg(not(windows))]
     let file = fs::File::open(path).ok()?;
@@ -545,6 +589,29 @@ mod tests {
     }
 
     #[test]
+    fn retained_payload_remaps_after_eviction_and_rejects_corruption() {
+        let root = std::env::temp_dir().join(format!("vork-remapped-test-{}", std::process::id()));
+        let path = root.join("pixels.entry");
+        write(&path, b"pixels").unwrap();
+        let retained = open_payload(&path, 6).unwrap();
+        assert_eq!(retained.map().unwrap().len(), 6);
+        assert_eq!(&*retained.map().unwrap(), b"pixels");
+        fs::remove_file(&path).unwrap();
+        assert_eq!(&*retained.map().unwrap(), b"pixels");
+        write(&path, b"replacement").unwrap();
+        assert_eq!(&*retained.map().unwrap(), b"pixels");
+        assert_eq!(&*open_payload(&path, 11).unwrap().map().unwrap(), b"replacement");
+        fs::write(&path, b"truncated").unwrap();
+        assert!(open_payload(&path, 6).is_none());
+        let mut corrupt = vec![0; blake3::OUT_LEN];
+        corrupt.extend_from_slice(b"pixels");
+        fs::write(&path, corrupt).unwrap();
+        assert!(open_payload(&path, 6).is_none());
+        drop(retained);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn mapped_payload_rejects_corrupt_and_truncated_entries() {
         let root = std::env::temp_dir().join(format!("vork-mapped-test-{}", std::process::id()));
         let path = root.join("test.entry");
@@ -603,6 +670,7 @@ mod tests {
         for kind in [
             "decoded-texture",
             "native-decoded-texture",
+            "curve-tubes",
             "compressed-texture",
         ] {
             assert_eq!(a.path(kind, 2, content), b.path(kind, 2, content));

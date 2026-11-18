@@ -25,7 +25,10 @@ p.add_argument('--shader-cache', type=Path, help='Portable bundle from scripts/p
 p.add_argument('--slang-toolchain', type=Path, required=True, help='Pinned Slang toolchain directory; its compiler, runtime libraries and notices ship')
 p.add_argument('--oidn-toolchain', type=Path, required=True, help='Pinned OIDN distribution from scripts/install-oidn; its runtime libraries and notices ship')
 p.add_argument('--msvc-runtime', type=Path, help='windows-x64: Visual Studio redist folder (VC\\Redist\\MSVC\\<version>\\x64\\Microsoft.VC14x.CRT); the VC++ runtime DLLs that shipped DLLs import are copied beside them')
+p.add_argument('--sign-windows', action='store_true', help='Sign and verify every staged PE before archiving (Windows host only)')
 a = p.parse_args()
+if a.sign_windows and (a.platform != 'windows-x64' or sys.platform != 'win32'):
+    p.error('--sign-windows requires a Windows host and windows-x64')
 subprocess.run([sys.executable, str(ROOT / 'scripts/sync-version'), '--check'], check=True)
 cargo_version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version']
 try:
@@ -214,6 +217,13 @@ with tempfile.TemporaryDirectory(dir=a.output) as tmp:
         p.error('release archive must not include integrations/')
     if a.platform == 'darwin-arm64':
         (stage / 'macos-runtime.json').write_text(json.dumps(macos_manifest(stage), indent=2) + '\n')
+    if a.sign_windows:
+        prepared_digest = hashlib.sha256((stage / 'vork.exe').read_bytes()).hexdigest()
+        subprocess.run(['pwsh', '-NoProfile', '-File', str(ROOT / 'scripts/sign-windows.ps1'),
+                        '-Root', str(stage.resolve()), '-NoticeFile',
+                        str((stage / 'licenses/windows-signing.txt').resolve())], check=True)
+        if hashlib.sha256((stage / 'vork.exe').read_bytes()).hexdigest() != prepared_digest:
+            p.error('sign vork.exe before preparing shaders; signing changed the prepared binary')
     archive = a.output / f'vork-{cargo_version}-{a.platform}.{"zip" if windows else "tar.gz"}'
     if windows:
         with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:

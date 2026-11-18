@@ -14,7 +14,6 @@ vork-scene = { path = "../vork-scene" }
 vork-slang = { path = "../vork-slang" }
 # The 2D canvas's text: Moda's text engine and its GPU drawing (crates/moda-text, crates/moda-text-draw).
 moda-text = { path = "../moda-text" }
-moda-plain-text = { path = "../moda-plain-text" }
 moda-text-draw = { path = "../moda-text-draw" }
 # The 2D canvas's drawing: Moda's 2D engine and the scene and asset layers it reads (crates/moda-engine, moda-scene,
 # moda-assets); vork writes each frame as a Moda document.
@@ -23,6 +22,7 @@ moda-scene = { path = "../moda-scene" }
 moda-assets = { path = "../moda-assets" }
 anyhow = "1"
 svgtypes = "0.16"
+smallvec = { version = "1", features = ["union"] }
 wgpu = { version = "29", features = ["noop"] }
 # Serialize detached worker bind-group descriptors without enabling wgpu tracing.
 wgpu-types = { version = "29", features = ["serde"] }
@@ -72,6 +72,8 @@ path = "../vork-scene"
 features = ["test-support"]
 
 [features]
+# Internal CPU-stage measurements; absent from ordinary builds.
+frame-profile = []
 test-support = ["vork-scene/test-support"]
 
 [[example]]

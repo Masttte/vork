@@ -32,10 +32,32 @@ pub(crate) enum Interpolation {
     Linear,
     Cubic,
 }
+/// A run of a curve's keys (its times, or its values) in a store of `f32` that many curves share. It reads as
+/// the slice it is. A curve made on its own has a store of its own; a compiled plan moves its tracks' keys into
+/// one store, in flat track order ([`Plan::gather_keys`]), so sampling the tracks in order reads memory in order
+/// wherever the allocator put each curve when it was made.
+#[derive(Clone)]
+pub(crate) struct Keys {
+    store: std::sync::Arc<Vec<f32>>,
+    start: usize,
+    len: usize,
+}
+impl std::ops::Deref for Keys {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        &self.store[self.start..self.start + self.len]
+    }
+}
+impl From<Vec<f32>> for Keys {
+    fn from(keys: Vec<f32>) -> Self {
+        Self { len: keys.len(), start: 0, store: std::sync::Arc::new(keys) }
+    }
+}
 /// Cubic samples use glTF's [incoming tangent, value, outgoing tangent] packing.
+#[derive(Clone)]
 pub(crate) struct Curve {
-    pub times: Vec<f32>,
-    pub values: Vec<f32>,
+    pub times: Keys,
+    pub values: Keys,
     pub width: usize,
     pub interpolation: Interpolation,
     pub rotation: bool,
@@ -49,9 +71,13 @@ impl Curve {
         *self.times.last().unwrap()
     }
     pub fn sample(&self, time: f32, out: &mut Vec<f32>) {
-        self.sample_interval(time, self.times.partition_point(|v| *v <= time), out);
+        out.resize(self.width, 0.);
+        self.sample_interval::<false>(time, self.times.partition_point(|v| *v <= time), out);
     }
-    fn sample_interval(&self, time: f32, upper: usize, out: &mut Vec<f32>) {
+    /// COMPARE fuses change detection into ordinary component writes. Rotations compare only
+    /// after normalization, through the caller's scratch sample instead.
+    fn sample_interval<const COMPARE: bool>(&self, time: f32, upper: usize, out: &mut [f32]) -> bool {
+        debug_assert!(!COMPARE || !self.rotation);
         let a = upper.saturating_sub(1);
         let b = upper.min(self.times.len() - 1);
         let dt = self.times[b] - self.times[a];
@@ -76,18 +102,18 @@ impl Curve {
                 value(a, 0, k) * (1. - u) + value(b, 0, k) * u
             };
             let euler = v2::Rotation::Euler { euler: [angle(0), angle(1), angle(2)] };
-            out.clear();
-            out.extend(euler.quaternion());
-            return;
+            out.copy_from_slice(&euler.quaternion());
+            return false;
         }
-        out.resize(self.width, 0.);
+        debug_assert_eq!(out.len(), self.width);
+        let mut changed = false;
         if self.rotation && self.interpolation == Interpolation::Linear {
             let q = |i| Quat::from_array(std::array::from_fn(|k| value(i, 0, k))).normalize();
             out.copy_from_slice(&q(a).slerp(q(b), u).normalize().to_array());
-            return;
+            return false;
         }
         for (k, out) in out.iter_mut().enumerate() {
-            *out = if cubic {
+            let next = if cubic {
                 let [h00,h10,h01,h11] = hermite_basis(u,1.,2.,3.);
                 h00 * value(a, 1, k)
                     + h10 * dt * value(a, 2, k)
@@ -98,9 +124,11 @@ impl Curve {
             } else {
                 value(a, 0, k) * (1. - u) + value(b, 0, k) * u
             };
+            changed |= COMPARE && out.to_bits() != next.to_bits();
+            *out = next;
         }
         if self.rotation {
-            let q = Quat::from_array(out.as_slice().try_into().unwrap());
+            let q = Quat::from_array((&*out).try_into().unwrap());
             let q = if q.length_squared() > 0. {
                 q
             } else {
@@ -108,6 +136,7 @@ impl Curve {
             };
             out.copy_from_slice(&q.normalize().to_array());
         }
+        changed
     }
 
     /// Compile explicit glTF CUBICSPLINE derivatives once.
@@ -180,8 +209,8 @@ impl Curve {
             v2::Interpolation::Cubic => Interpolation::Cubic,
         };
         Ok(Self {
-            times,
-            values,
+            times: times.into(),
+            values: values.into(),
             width,
             interpolation,
             rotation,
@@ -322,15 +351,24 @@ mod tests {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Sample {
-    Numeric(Vec<f32>),
+    Numeric(smallvec::SmallVec<[f32; 4]>),
     String(std::sync::Arc<str>),
     Bool(bool),
     Style(std::sync::Arc<super::style::StyleValue>),
 }
+impl Sample {
+    /// Short numeric values stay beside their tag in sample order; wider inputs spill normally.
+    pub(crate) fn numeric(values: Vec<f32>) -> Self {
+        Self::Numeric(values.into())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum Channel {
     Style(super::style::StyleTrack),
-    Numeric(std::sync::Arc<Curve>),
+    /// The curve itself, in the track: its keys are in a store ([`Keys`]), so reaching them is no pointer chase
+    /// through a curve allocated on its own.
+    Numeric(Curve),
     Discrete {
         times: Vec<f32>,
         values: Vec<Sample>,
@@ -413,9 +451,8 @@ pub(crate) struct Samples {
     /// sampling call starts it again. `None` for a consumer that reads every value it uses each time (the 3D
     /// renderer, the sound mix): nothing is compared to make an account nobody reads.
     changed: Option<Vec<u32>>,
-    /// Scratch for one numeric sample when changes are named: a track is sampled here, compared with the value it
-    /// holds, and copied into the track's own storage only when it differs. It grows to the widest track and is
-    /// never handed to one.
+    /// Scratch for a rotation when changes are named: compare its normalized result with the retained
+    /// sample. Ordinary numeric components compare their final bits while writing in place.
     scratch: Vec<f32>,
 }
 impl Samples {
@@ -454,7 +491,7 @@ impl Channel {
     /// The channel's key times.
     fn times(&self) -> &[f32] {
         match self {
-            Channel::Numeric(curve) => &curve.times,
+            Channel::Numeric(curve) => &curve.times[..],
             Channel::Style(track) => &track.times,
             Channel::Discrete { times, .. } => times,
         }
@@ -699,7 +736,7 @@ impl Plan {
                                 Curve::numeric(track, rotation, times.clone(), values, width)?
                             }
                         };
-                        Channel::Numeric(std::sync::Arc::new(curve))
+                        Channel::Numeric(curve)
                     }
                 };
                 span = Some(span.map_or((times[0], *times.last().unwrap()), |(a, b)| {
@@ -711,7 +748,7 @@ impl Plan {
                 }
                 let time_curve = if matches!(target, TrackTarget::ImageTime {..}) || target.is_speed() {
                     let Channel::Numeric(curve) = &channel else { anyhow::bail!("image time needs a scalar track") };
-                    Some(std::sync::Arc::new(exact::DeferredTimeCurve::new(track,curve.clone())))
+                    Some(std::sync::Arc::new(exact::DeferredTimeCurve::new(track,std::sync::Arc::new(curve.clone()))))
                 } else { None };
                 let discrete_keys = (!matches!(target, TrackTarget::ImageTime {..}|TrackTarget::Render(v2::RenderProperty::Camera)) && !target.is_speed() && match &channel {
                     Channel::Style(track) => track.step || track.clocks.is_some(),
@@ -770,6 +807,8 @@ impl Plan {
                 }
             }
         }
+        let mut layers = layers;
+        Self::gather_keys(&mut layers);
         Ok(Self {
             live: Default::default(),
             layers,
@@ -791,6 +830,35 @@ impl Plan {
             images_with_time,
             source_lengths,
         })
+    }
+    /// Move every numeric track's keys into one store, in flat track order (layer by layer, track by track: the
+    /// order `sampled` yields and a frame samples in): each curve's times, then its values. The keys are the
+    /// same numbers; what changes is that they sit side by side whatever the heap looked like when each curve
+    /// was decoded. A track with a time curve (an image's time, a node's speed) is left as it is: it is read
+    /// through that curve, exactly, never through this sampler, and the time curve holds the same keys, so
+    /// gathering them would only keep a second copy.
+    fn gather_keys(layers: &mut [CompiledLayer]) {
+        fn curves(layers: &[CompiledLayer]) -> impl Iterator<Item = &Curve> {
+            layers.iter().flat_map(|layer| &layer.tracks).filter_map(|track| match &track.channel {
+                Channel::Numeric(curve) if track.time_curve.is_none() => Some(curve),
+                _ => None,
+            })
+        }
+        let mut store: Vec<f32> = Vec::with_capacity(curves(layers).map(|curve| curve.times.len() + curve.values.len()).sum());
+        for curve in curves(layers) {
+            store.extend_from_slice(&curve.times);
+            store.extend_from_slice(&curve.values);
+        }
+        let store = std::sync::Arc::new(store);
+        let mut start = 0;
+        for track in layers.iter_mut().flat_map(|layer| &mut layer.tracks) {
+            if track.time_curve.is_some() { continue; }
+            let Channel::Numeric(curve) = &mut track.channel else { continue };
+            for keys in [&mut curve.times, &mut curve.values] {
+                *keys = Keys { store: store.clone(), start, len: keys.len() };
+                start += keys.len();
+            }
+        }
     }
     fn refresh_layer_starts(&mut self) {
         let mut start = 0;
@@ -834,7 +902,7 @@ impl Plan {
         layer.tracks.push(PropertyTrack {
             discrete_keys: (curve.interpolation == Interpolation::Step).then(||std::sync::Arc::new(exact::DiscreteKeys::new(curve.times.iter().map(|&t|vork_time::Clock::binary(t)).collect()))),
             target: None,
-            channel: Channel::Numeric(curve),
+            channel: Channel::Numeric((*curve).clone()),
             time_curve: None,
             camera_keys: None,
             weight_target: None,
@@ -996,8 +1064,8 @@ impl Plan {
                     Channel::Style(_) => unreachable!("style is not a material input"),
                     Channel::Numeric(curve) => {
                         hash.update(&[match curve.interpolation {Interpolation::Step=>0,Interpolation::Linear=>1,Interpolation::Cubic=>2}]);
-                        hash.update(bytemuck::cast_slice(&curve.times));
-                        hash.update(bytemuck::cast_slice(&curve.values));
+                        hash.update(bytemuck::cast_slice(&curve.times[..]));
+                        hash.update(bytemuck::cast_slice(&curve.values[..]));
                     },
                     Channel::Discrete { times, values } => {
                         hash.update(bytemuck::cast_slice(times));
@@ -1130,7 +1198,7 @@ impl Plan {
                 .flat_map(|l| &l.tracks)
                 .map(|track| match &track.channel {
                     Channel::Style(track) => Sample::Style(track.values[0].clone()),
-                    Channel::Numeric(curve) => Sample::Numeric(vec![0.; curve.width]),
+                    Channel::Numeric(curve) => Sample::Numeric(smallvec::smallvec![0.; curve.width]),
                     Channel::Discrete { values, .. } => values[0].clone(),
                 })
                 .collect(),
@@ -1351,7 +1419,8 @@ impl Plan {
             // A published live value stands in for the track's keys.
             let Sample::Numeric(sample) = &mut samples.values[index] else { unreachable!() };
             if sample.len() != value.len() || sample.iter().zip(value).any(|(a, b)| a.to_bits() != b.to_bits()) {
-                sample.clone_from(value);
+                sample.clear();
+                sample.extend_from_slice(value);
                 changed = true;
             }
             samples.held[index] = Held::No;
@@ -1378,10 +1447,15 @@ impl Plan {
                         let Sample::Numeric(value) = &mut samples.values[index] else {
                             unreachable!()
                         };
-                        // Into the scratch, then into the track's own storage when it differs: each track
-                        // keeps the allocation it was given, of its own width.
-                        if samples.changed.is_some() {
-                            curve.sample_interval(local, upper, &mut samples.scratch);
+                        changed |= samples.changed.is_some() && value.len() != curve.width;
+                        value.resize(curve.width, 0.);
+                        // Ordinary numeric components can compare their final bits as they are written.
+                        // Rotations normalize after interpolation, so compare those final values in scratch.
+                        if samples.changed.is_some() && !curve.rotation {
+                            changed |= curve.sample_interval::<true>(local, upper, value);
+                        } else if samples.changed.is_some() {
+                            samples.scratch.resize(curve.width, 0.);
+                            curve.sample_interval::<false>(local, upper, &mut samples.scratch);
                             if value.len() != samples.scratch.len() || value.iter().zip(&samples.scratch).any(|(a, b)| a.to_bits() != b.to_bits()) {
                                 value.clear();
                                 value.extend_from_slice(&samples.scratch);
@@ -1389,7 +1463,7 @@ impl Plan {
                             }
                         } else {
                             // Nobody reads this consumer's account: the value is sampled where it is kept.
-                            curve.sample_interval(local, upper, value);
+                            curve.sample_interval::<false>(local, upper, value);
                         }
                     }
                     Channel::Discrete { values, .. } => {
@@ -1593,13 +1667,13 @@ mod live_tests {
         assert_eq!(imported_copy.live_generation(), 0);
         let mut samples = imported_copy.samples();
         imported_copy.sample_into(0.75, &mut samples);
-        assert_eq!(samples.values[0], Sample::Numeric(vec![1.,2.,3.]));
+        assert_eq!(samples.values[0], Sample::numeric(vec![1.,2.,3.]));
         plan.publish_live([(binding, &[4.,5.,6.][..])].into_iter());
         assert_eq!(imported_copy.live_generation(), 1);
         plan.publish_live(std::iter::empty());
         assert_eq!(imported_copy.live_generation(), 1);
         imported_copy.sample_into(0.25, &mut samples);
-        assert_eq!(samples.values[0], Sample::Numeric(vec![4.,5.,6.]));
+        assert_eq!(samples.values[0], Sample::numeric(vec![4.,5.,6.]));
         Ok(())
     }
 }
@@ -1784,7 +1858,7 @@ impl Plan {
                             .get(node)
                             .with_context(|| format!("unknown track node {node}"))?,
                         property: property.clone(),
-                        base: Sample::Numeric(vec![]),
+                        base: Sample::numeric(vec![]),
                     },
                 };
                 let node = &mut nodes[binding.node];
@@ -1797,7 +1871,7 @@ impl Plan {
                         "unsupported property or value shape: {}",
                         path()
                     );
-                    binding.base = Sample::Numeric(base);
+                    binding.base = Sample::numeric(base);
                 } else {
                     let v2::NodeProperty::Visibility(ray) = binding.property else {
                         anyhow::bail!("{} requires numeric values", path());
@@ -2030,7 +2104,7 @@ mod camera_cut_tests {
     fn node_radius_blends_point_and_spot_emitters() {
         for shape in ["point", "spot"] {
             let mut node: v2::Node = vork_scene::v2::from_test_value(serde_json::json!({"type":"light","shape":shape,"radius":0.1})).unwrap();
-            apply_node(&mut node, &v2::NodeProperty::Radius, &Sample::Numeric(vec![0.3]), 0.5, false);
+            apply_node(&mut node, &v2::NodeProperty::Radius, &Sample::numeric(vec![0.3]), 0.5, false);
             let v2::NodeKind::Light { radius, .. } = node.kind else { unreachable!() };
             assert!((radius-0.2).abs()<1e-6);
         }
@@ -2378,7 +2452,7 @@ pub(crate) fn fold_material_inputs(scene: &mut v2::Scene, base: &std::path::Path
                 vec![0.; curve.width]
             }
         };
-        plan.bind_material(&(name.clone(), input.clone()), vec![MaterialBinding {slot, parameter: 0, storage: None, enum_tokens: None, default: Sample::Numeric(default), offset: 0.}])?;
+        plan.bind_material(&(name.clone(), input.clone()), vec![MaterialBinding {slot, parameter: 0, storage: None, enum_tokens: None, default: Sample::numeric(default), offset: 0.}])?;
     }
     let mut samples = plan.samples();
     plan.sample_material_offset(0., 0., &mut samples);
@@ -2386,7 +2460,7 @@ pub(crate) fn fold_material_inputs(scene: &mut v2::Scene, base: &std::path::Path
     for (binding, value) in plan.material_values(&samples, 0.) {
         let (name, input) = &fields[binding.slot];
         let Sample::Numeric(value) = value else {continue};
-        let value = if value.len() == 1 {v2::Input::Number(value[0])} else {v2::Input::Vector(value.clone())};
+        let value = if value.len() == 1 {v2::Input::Number(value[0])} else {v2::Input::Vector(value.to_vec())};
         let material = scene.materials.get_mut(name).unwrap();
         let factor = match &value {
             v2::Input::Number(v) => v2::Factor::Number(*v),
@@ -2421,7 +2495,7 @@ mod asset_index_tests {
     fn asset_index_work_is_independent_of_unrelated_population() -> Result<()> {
         let mut plan = Plan::default();
         plan.layers.push(CompiledLayer { owner: None, owner_node: None, source: serde_json::from_value(json!({"tracks":[]}))?, tracks: vec![], span: None, time_span: None });
-        let curve = std::sync::Arc::new(Curve { times: vec![0.,1.], values: vec![0.,0.,0.,1.,2.,3.], width: 3,
+        let curve = std::sync::Arc::new(Curve { times: vec![0.,1.].into(), values: vec![0.,0.,0.,1.,2.,3.].into(), width: 3,
             interpolation: Interpolation::Linear, rotation: false, euler: false });
         for asset in 0..1024 {
             plan.add_clip_curve(0, curve.clone(), AssetTarget { asset, node: 0, property: gltf::animation::Property::Translation, component: None });
@@ -2435,7 +2509,7 @@ mod asset_index_tests {
         plan.apply_asset(17,&samples,|target,value,_,_| {
             visits+=1;
             assert_eq!(target.asset,17);
-            assert_eq!(*value,Sample::Numeric(vec![0.5,1.,1.5]));
+            assert_eq!(*value,Sample::numeric(vec![0.5,1.,1.5]));
         });
         assert_eq!(visits,1);
         Ok(())
@@ -2460,7 +2534,7 @@ mod asset_index_tests {
         plan.bind_asset(&doc.document, "b", 1)?;
         // Importing a later asset extends an earlier layer, shifting every
         // following layer's sample address before the index is finalized.
-        plan.add_clip_curve(1, std::sync::Arc::new(Curve { times: vec![0.,2.], values: vec![1.,1.,1.,2.,2.,2.], width: 3,
+        plan.add_clip_curve(1, std::sync::Arc::new(Curve { times: vec![0.,2.].into(), values: vec![1.,1.,1.,2.,2.,2.].into(), width: 3,
             interpolation: Interpolation::Linear, rotation: false, euler: false }),
             AssetTarget { asset: 1, node: 0, property: gltf::animation::Property::Scale, component: None });
         plan.finish_asset_bindings()?;
@@ -2503,6 +2577,95 @@ mod asset_index_tests {
         plan.finish_asset_bindings()?;
         assert_eq!(plan.asset_bindings[0].transforms.len(),1);
         assert_eq!(plan.asset_bindings[1].transforms.len(),3);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod key_store_tests {
+    use super::*;
+    #[test]
+    fn component_writes_name_exactly_the_changed_bits_across_intervals() {
+        for interpolation in [Interpolation::Step, Interpolation::Linear, Interpolation::Cubic] {
+            for width in [1, 3, 8] {
+                let parts = if interpolation == Interpolation::Cubic { 3 } else { 1 };
+                let curve = Curve {
+                    times: vec![0., 1., 2.].into(),
+                    values: (0..3 * parts * width).map(|i| (i as f32 - 5.) / 7.).collect::<Vec<_>>().into(),
+                    width, interpolation, rotation: false, euler: false,
+                };
+                let mut held = vec![0.; width];
+                for time in [-1., 0., 0.25, 0.25, 1., 1.75, 2., 3., 0.25, -1.] {
+                    let before = held.clone();
+                    let mut expected = Vec::new();
+                    curve.sample(time, &mut expected);
+                    let upper = curve.times.partition_point(|t| *t <= time);
+                    let changed = curve.sample_interval::<true>(time, upper, &mut held);
+                    assert_eq!(held.iter().map(|f| f.to_bits()).collect::<Vec<_>>(), expected.iter().map(|f| f.to_bits()).collect::<Vec<_>>());
+                    assert_eq!(changed, before.iter().zip(&expected).any(|(a, b)| a.to_bits() != b.to_bits()));
+                }
+            }
+        }
+    }
+
+    /// A compiled plan's numeric keys sit in one store in flat track order, each curve's times then its values,
+    /// and are the keys that were authored.
+    #[test]
+    fn a_compiled_plan_holds_its_numeric_keys_side_by_side_in_track_order() -> Result<()> {
+        let scene: v2::Scene = vork_scene::v2::from_test_value(serde_json::json!({
+            "version":2,"nodes":[{"type":"camera","name":"cam"},{"name":"a"},{"name":"b"}],
+            "animation":[{"tracks":[
+                {"path":["nodes","a","translation"],"keys":[[0,[0,0,0]],[1,[1,2,3]]]},
+                {"path":["nodes","b","scale"],"keys":[[0,[1,1,1]],[2,[2,2,2]],[3,[4,4,4]]]}]}]
+        }))?;
+        let plan = Plan::compile(&scene, std::path::Path::new("."))?;
+        let curves: Vec<&Curve> = plan.layers.iter().flat_map(|layer| &layer.tracks).filter_map(|track| match &track.channel {
+            Channel::Numeric(curve) => Some(curve),
+            _ => None,
+        }).collect();
+        assert_eq!(curves.len(), 2);
+        assert_eq!(&curves[0].times[..], [0., 1.]);
+        assert_eq!(&curves[0].values[..], [0., 0., 0., 1., 2., 3.]);
+        assert_eq!(&curves[1].times[..], [0., 2., 3.]);
+        assert_eq!(&curves[1].values[..], [1., 1., 1., 2., 2., 2., 4., 4., 4.]);
+        assert!(curves.iter().all(|curve| std::sync::Arc::ptr_eq(&curve.times.store, &curves[0].times.store)
+            && std::sync::Arc::ptr_eq(&curve.values.store, &curves[0].times.store)));
+        assert_eq!([curves[0].times.start, curves[0].values.start, curves[1].times.start, curves[1].values.start], [0, 2, 8, 11]);
+        // A curve reads its own run of the store.
+        let mut out = Vec::new();
+        curves[1].sample(2.5, &mut out);
+        assert_eq!(out, [3., 3., 3.]);
+        curves[0].sample(0.5, &mut out);
+        assert_eq!(out, [0.5, 1., 1.5]);
+        Ok(())
+    }
+
+    /// A track read through a time curve keeps the one copy of its keys that curve holds; the tracks around it
+    /// are gathered as if it were not there.
+    #[test]
+    fn a_time_curve_track_keeps_one_copy_of_its_keys() -> Result<()> {
+        let scene: v2::Scene = vork_scene::v2::from_test_value(serde_json::json!({
+            "version":2,"nodes":[{"type":"camera","name":"cam"},{"name":"a","time":{}},{"name":"b"}],
+            "animation":[{"tracks":[
+                {"path":["nodes","b","translation"],"keys":[[0,[0,0,0]],[1,[1,2,3]]]},
+                {"path":["nodes","a","time","speed"],"keys":[[0,1],[1,2]]},
+                {"path":["nodes","b","scale"],"keys":[[0,[1,1,1]],[2,[2,2,2]]]}]}]
+        }))?;
+        let plan = Plan::compile(&scene, std::path::Path::new("."))?;
+        let tracks = &plan.layers[0].tracks;
+        let curve = |index: usize| match &tracks[index].channel {
+            Channel::Numeric(curve) => curve,
+            _ => panic!("track {index} is numeric"),
+        };
+        assert!(tracks[1].time_curve.is_some() && tracks[0].time_curve.is_none() && tracks[2].time_curve.is_none());
+        // The speed track's keys are its own, shared with its time curve (two holders of each run: no third).
+        assert!(!std::sync::Arc::ptr_eq(&curve(1).times.store, &curve(0).times.store));
+        assert_eq!(std::sync::Arc::strong_count(&curve(1).times.store), 2);
+        assert_eq!(std::sync::Arc::strong_count(&curve(1).values.store), 2);
+        assert_eq!(&curve(1).values[..], [1., 2.]);
+        // The other two are side by side.
+        assert!(std::sync::Arc::ptr_eq(&curve(0).times.store, &curve(2).values.store));
+        assert_eq!([curve(0).times.start, curve(0).values.start, curve(2).times.start, curve(2).values.start], [0, 2, 8, 10]);
         Ok(())
     }
 }

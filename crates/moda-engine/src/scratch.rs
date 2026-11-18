@@ -130,6 +130,7 @@ pub(crate) fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(queue: &wgpu::
 
 /// Submit everything held on this thread, in order (before a wait for the GPU, and when the outermost render ends).
 pub fn flush() {
+    if std::thread::panicking() { discard_pending(); return; }
     // A queue's held writes go first, where its own writes would land.
     let mut held = held_writes();
     held.extend(HELD.with(|h| std::mem::take(&mut h.borrow_mut().1)));
@@ -144,6 +145,33 @@ pub fn flush() {
     }
     if let Some(q) = to {
         q.submit(run);
+    }
+}
+
+/// Cancel a disposable render without allocating staging or submitting partial
+/// commands. Drop handles outside TLS borrows because their cleanup can inspect it.
+pub fn discard_pending() {
+    let held = HELD.with(|held| std::mem::take(&mut *held.borrow_mut()));
+    let writes = WRITES.with(|writes| std::mem::take(&mut *writes.borrow_mut()));
+    drop(held); drop(writes);
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn quota_unwind_discards_a_deferred_render_without_another_allocation() {
+        struct FlushOnDrop;
+        impl Drop for FlushOnDrop { fn drop(&mut self) { flush(); } }
+        let budget = wgpu::optional_allocations::Budget::new(65536, || Some(65536));
+        assert!(budget.run(|| {
+            HELD.with(|held| held.borrow_mut().0 = 1);
+            WRITES.with(|writes| writes.borrow_mut().1.extend_from_slice(&[1, 2, 3, 4]));
+            let _flush = FlushOnDrop;
+            std::panic::resume_unwind(Box::new(wgpu::optional_allocations::Refused));
+        }).is_err());
+        HELD.with(|held| assert_eq!(held.borrow().0, 0));
+        WRITES.with(|writes| assert!(writes.borrow().0.is_empty() && writes.borrow().1.is_empty()));
     }
 }
 

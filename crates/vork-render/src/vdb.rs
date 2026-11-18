@@ -4,6 +4,8 @@ use super::*;
 pub(crate) struct Grid {
     pub(crate) words: Vec<u32>,
     pub(crate) bounds: (Vec3, Vec3),
+    /// The least and greatest stored value, found once while validating the payload.
+    pub(crate) range: (f32, f32),
 }
 impl Grid {
     pub(crate) fn load(buffer: &vork_scene::v2::Buffer, base: &Path) -> Result<Self> {
@@ -81,14 +83,15 @@ impl Grid {
             .chunks_exact(4)
             .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
             .collect();
-        grid_maximum(&words,width)?;
-        Ok(Self { words, bounds })
+        let range=grid_range(&words,width)?;
+        Ok(Self { words, bounds, range })
     }
 }
 
-/// Visit actual stored values, including inactive voxels and sparse background.
-/// Do not trust optional NanoVDB min/max statistics (raw grids may omit them).
-pub(crate) fn grid_maximum(words:&[u32], width:u32)->Result<f32> {
+/// The least and greatest stored value, inactive voxels and the sparse
+/// background included. Optional NanoVDB min/max statistics are not trusted
+/// (raw grids may omit them).
+pub(crate) fn grid_range(words:&[u32], width:u32)->Result<(f32,f32)> {
     fn word(w:&[u32],at:usize)->Result<u32> {ensure!(at%4==0,"unaligned grid address");w.get(at/4).copied().context("grid value address out of bounds")}
     fn offset(w:&[u32],base:usize,at:usize)->Result<usize> {
         let bits=u64::from(word(w,at)?) | (u64::from(word(w,at+4)?)<<32);
@@ -96,39 +99,39 @@ pub(crate) fn grid_maximum(words:&[u32], width:u32)->Result<f32> {
         ensure!(address< w.len()*4,"grid child address out of bounds");
         Ok(address)
     }
-    fn value(w:&[u32],at:usize,width:u32,max:&mut f32)->Result<()> {
-        for c in 0..width as usize {let v=f32::from_bits(word(w,at+c*4)?);ensure!(v.is_finite(),"grid contains nonfinite values");*max=max.max(v);}
+    fn value(w:&[u32],at:usize,width:u32,range:&mut (f32,f32))->Result<()> {
+        for c in 0..width as usize {let v=f32::from_bits(word(w,at+c*4)?);ensure!(v.is_finite(),"grid contains nonfinite values");*range=(range.0.min(v),range.1.max(v));}
         Ok(())
     }
-    fn node(w:&[u32],at:usize,level:u32,width:u32,max:&mut f32)->Result<()> {
+    fn node(w:&[u32],at:usize,level:u32,width:u32,range:&mut (f32,f32))->Result<()> {
         let vector=width==3;
         if level==0 {
             let table=at+if vector {128}else{96};
-            for i in 0..512 {value(w,table+i*width as usize*4,width,max)?;}
+            for i in 0..512 {value(w,table+i*width as usize*4,width,range)?;}
         } else {
             let (count,mask,table)=if level==2 {(32768,4128,8256)}else{(4096,544,1088)};
             let stride=if vector {16}else{8};
             for i in 0..count {
                 let slot=at+table+i*stride;
-                if word(w,at+mask+(i/32)*4)? & (1<<(i%32)) !=0 {node(w,offset(w,at,slot)?,level-1,width,max)?;}
-                else {value(w,slot,width,max)?;}
+                if word(w,at+mask+(i/32)*4)? & (1<<(i%32)) !=0 {node(w,offset(w,at,slot)?,level-1,width,range)?;}
+                else {value(w,slot,width,range)?;}
             }
         }
         Ok(())
     }
     let root=offset(words,672,696)?;
-    let mut maximum=f32::NEG_INFINITY;
-    value(words,root+28,width,&mut maximum)?;
+    let mut range=(f32::INFINITY,f32::NEG_INFINITY);
+    value(words,root+28,width,&mut range)?;
     let size=if width==3 {96}else{64};
     let count=word(words,root+24)? as usize;
     ensure!(count<=words.len()/8,"invalid grid tile count");
     for i in 0..count {
         let tile=root+size+i*32;
         let child=offset(words,root,tile+8)?;
-        if child==root {value(words,tile+20,width,&mut maximum)?;}
-        else {node(words,child,2,width,&mut maximum)?;}
+        if child==root {value(words,tile+20,width,&mut range)?;}
+        else {node(words,child,2,width,&mut range)?;}
     }
-    Ok(maximum)
+    Ok(range)
 }
 
 

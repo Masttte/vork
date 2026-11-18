@@ -11,6 +11,8 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub struct Texture {
     pub(crate) inner: dispatch::DispatchTexture,
+    #[cfg(std)]
+    pub(crate) _reservation: Option<alloc::sync::Arc<crate::optional_allocations::Lease>>,
     pub(crate) descriptor: TextureDescriptor<'static>,
 }
 #[cfg(send_sync)]
@@ -77,6 +79,8 @@ impl Texture {
     ) -> Self {
         Self {
             inner: dispatch::DispatchTexture::custom(texture),
+            #[cfg(std)]
+            _reservation: None,
             descriptor: TextureDescriptor {
                 label: None,
                 view_formats: &[],

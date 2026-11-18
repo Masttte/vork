@@ -364,7 +364,22 @@ fn try_build_vector_batch(
 /// See PROVENANCE.md.
 pub type TextBuilder = std::rc::Rc<dyn Fn(&RawNode, [f32; 16], f64, [f32; 4], f64) -> Result<TextBuildOutcome>>;
 
+pub type TextPainter = std::rc::Rc<dyn Fn(&RawNode, &TextQuadBatch, f64) -> Option<Arc<TextQuadBatch>>>;
+
+pub fn install_text_painter(painter: Option<TextPainter>) {
+    TEXT_PAINTER.with(|p| *p.borrow_mut() = painter);
+}
+
+pub(crate) fn repaint_text(scene: &Scene, node_id: &str, old: &TextQuadBatch) -> Option<Arc<TextQuadBatch>> {
+    let node = scene.node(node_id)?;
+    if richtext_model_matrix(scene, node_id)? != old.model_matrix { return None; }
+    let opacity = node.f64("opacity").unwrap_or(1.) * scene.ancestor_opacity_product_except(node_id, |_| false);
+    if opacity <= 0. { return None; }
+    TEXT_PAINTER.with(|p| p.borrow().as_ref()?.as_ref()(node, old, opacity))
+}
+
 thread_local! {
+    static TEXT_PAINTER: RefCell<Option<TextPainter>> = const { RefCell::new(None) };
     static TEXT_BUILDER: RefCell<Option<TextBuilder>> = const { RefCell::new(None) };
 }
 
@@ -409,7 +424,7 @@ pub enum TextBuildOutcome {
 /// animation began driving text `scale` (every shape renders `scale¹`), at which
 /// point animated text grew quadratically AND off-center. Building the model
 /// straight from the canvas affine applies `scale` exactly once.
-fn richtext_model_matrix(scene: &Scene, node_id: &str) -> Option<[f32; 16]> {
+pub(crate) fn richtext_model_matrix(scene: &Scene, node_id: &str) -> Option<[f32; 16]> {
     let a = scene.node_canvas_affine(node_id)?;
     Some([
         a.a as f32, a.b as f32, 0.0, 0.0, //
@@ -2437,7 +2452,7 @@ pub fn greek_font_px(b: &crate::seams::TextQuadBatch) -> Option<f32> {
             moda_text::vector::VectorOpPipeline::Analytic
                 if !op.additive && op.blur_px == 0.0 && op.stroke_px == 0.0 && op.gradient.is_none() =>
             {
-                for r in &op.records {
+                for r in op.records.iter() {
                     if r.glyph_lin != [1.0, 0.0, 0.0, 1.0] || r.glyph_off != [0.0, 0.0] {
                         return None;
                     }
@@ -2474,7 +2489,7 @@ pub fn greek_batch(b: &crate::seams::TextQuadBatch) -> Option<crate::seams::Text
         };
         // Current word: (left, right, baseline, size).
         let mut word: Option<(f32, f32, f32, f32)> = None;
-        for r in &op.records {
+        for r in op.records.iter() {
             let s = r.font_size_px;
             let (l, rt) = (r.pen_x + r.em_box[0] * s, r.pen_x + r.em_box[2] * s);
             word = match word {
@@ -2503,8 +2518,8 @@ pub fn greek_batch(b: &crate::seams::TextQuadBatch) -> Option<crate::seams::Text
             blur_px: 0.0,
             stroke_px: 0.0,
             additive: false,
-            tris,
-            records: Vec::new(),
+            tris: tris.into(),
+            records: Default::default(),
             gradient: None,
             paint: None,
         });

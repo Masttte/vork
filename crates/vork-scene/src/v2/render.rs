@@ -136,7 +136,7 @@ pub struct Settings {
     /// Internal render-call intent; promotion may enable OIDN unless explicitly disabled.
     #[serde(skip)]
     pub promotion_denoise: Option<bool>,
-    /// Draft-only native secondary compilation strategy; never an authored scene knob.
+    /// Low-budget native secondary compilation strategy; never an authored scene knob.
     #[serde(skip)]
     pub bounded_secondary_compilation: bool,
     /// Raster profiles use owning-cell admission instead of incident-neighborhood search.

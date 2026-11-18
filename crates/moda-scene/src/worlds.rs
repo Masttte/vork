@@ -132,6 +132,9 @@ pub struct Worlds {
     // The columns.
     /// Per plain row, the node's accumulated transform in its page: [`Scene::accumulated_affine`]'s answer.
     own: Vec<Placed>,
+    /// Paint-order visibility derived along the same source ancestry.
+    hidden: Vec<bool>,
+    visibility_plain: Vec<bool>,
     /// Per frame-keeping row, its accumulated transform as a transform parent.
     frames: Vec<Placed>,
 
@@ -159,6 +162,11 @@ impl Worlds {
             return None;
         }
         self.own.get(row)
+    }
+
+    pub(crate) fn hidden(&self, clock: u64, row: usize) -> Option<bool> {
+        (self.current(clock) && *self.plain.get(row)? && *self.visibility_plain.get(row)?)
+            .then(|| self.hidden[row])
     }
 
     /// The position of the page of the node at `row` (of a row the columns answer for).
@@ -259,6 +267,8 @@ impl Worlds {
             parent => Some(self.frames[self.frame_of[parent as usize] as usize]),
         };
         self.own[row] = Placed::own(node).under(above.as_ref());
+        self.hidden[row] = Scene::hides_paint_subtree(node)
+            || (self.link[row] != NONE && self.hidden[self.link[row] as usize]);
         let frame = self.frame_of[row];
         if frame != NONE {
             // A plain row is its own resolved record and no boolean's source.
@@ -285,6 +295,8 @@ impl Worlds {
         reset(&mut self.parent, rows, false);
         reset(&mut self.frame_of, rows, NONE);
         reset(&mut self.own, rows, identity);
+        reset(&mut self.hidden, rows, false);
+        reset(&mut self.visibility_plain, rows, false);
         self.order.clear();
         self.order.reserve(rows);
         self.frames.clear();
@@ -406,6 +418,14 @@ impl Worlds {
                     }
                 }
             }
+        }
+        for &row in &self.order {
+            let row = row as usize;
+            self.visibility_plain[row] = match scene.parent_map.get(scene.doc.nodes[row].id())
+                .and_then(|id| scene.node_index.get(id)) {
+                Some(&parent) => self.link[row] == parent as u32 && self.visibility_plain[parent],
+                None => !scene.transient_parent_of.contains_key(scene.doc.nodes[row].id()),
+            };
         }
         // A plain row that holds children keeps a frame for them.
         for row in 0..rows {

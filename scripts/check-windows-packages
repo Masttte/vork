@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Extract Windows npm/native-wheel payloads for independent Authenticode checks."""
+import argparse
+from pathlib import Path
+import tarfile
+import zipfile
+
+
+def extract(dist, output):
+    # Require both formats, rather than silently verifying an empty directory or
+    # only the shared SDK wheel. Each package is extracted to its own directory.
+    packages = [sorted(dist.glob('voyager-so-vork-windows-x64-*.tgz')),
+                sorted(dist.glob('vork_native_windows_x64-*-win_amd64.whl'))]
+    for matches in packages:
+        if len(matches) != 1:
+            raise ValueError(f'expected one Windows native package, found {matches}')
+        archive = matches[0]
+        destination = output / archive.name
+        destination.mkdir(parents=True, exist_ok=False)
+        if archive.suffix == '.tgz':
+            with tarfile.open(archive) as source:
+                source.extractall(destination, filter='data')
+        else:
+            with zipfile.ZipFile(archive) as source:
+                for name in source.namelist():
+                    if not (destination / name).resolve().is_relative_to(destination.resolve()):
+                        raise ValueError(f'unsafe wheel member: {name}')
+                source.extractall(destination)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dist', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    extract(args.dist, args.output)

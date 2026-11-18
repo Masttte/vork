@@ -103,12 +103,13 @@ float4 blender_image(Image image,float2 uv,float2 x,float2 y,ShadingContext ctx)
 
 
 class Compiler:
-    def __init__(self, material, image_input, engine="EEVEE", *, best_effort=False, bake_input=None, curve_input=None, available_attributes=None, medium=False):
+    def __init__(self, material, image_input, engine="EEVEE", *, best_effort=False, bake_input=None, curve_input=None, available_attributes=None, attribute_images=None, medium=False):
         if engine not in ("EEVEE", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "CYCLES"):
             raise UnsupportedMaterial(f'unsupported surface engine {engine!r}')
         self.engine = "CYCLES" if engine == "CYCLES" else "EEVEE"
         self.medium = medium
         self.available_attributes = available_attributes
+        self.attribute_images = attribute_images or {}
         self.bake_input = bake_input
         self.object_specific = False
         self.curve_input = curve_input
@@ -465,6 +466,21 @@ class Compiler:
                 'float2 p=uv.value+uv.dx*off.x+uv.dy*off.y;'
                 'return float3(p.x,1.-p.y,0.);', 3)
 
+    def generated(self, node, socket):
+        if getattr(node, 'from_instancer', False):
+            self.fail(node, socket.name, 'instancer Generated coordinates are not translated')
+        from .source_coordinates import GENERATED
+        if self.available_attributes is not None and GENERATED in self.available_attributes:
+            self.field_types['source_generated'] = 'Attribute<float3>'
+            self.inputs['source_generated'] = dict(attribute=GENERATED)
+            return ('let p=read_attribute(inputs.source_generated,ctx);'
+                    'return p.value+p.dx*off.x+p.dy*off.y;', 3)
+        if not self.best_effort:
+            self.fail(node, socket.name, 'source Generated/ORCO coordinates are not retained for this primitive')
+        self.report(node, socket.name, 'source Generated/ORCO coordinates are not retained for this primitive',
+                    'normalized imported rest bounds; Generated coordinates approximated')
+        return 'float3 p=texture_coordinate(ctx,off).Generated;return float3(p.x,1.-p.z,p.y);', 3
+
     def lower(self, node, socket):
         get = lambda name, desired=None: self.input(node.inputs[name], desired)
         if node.mute:
@@ -520,21 +536,106 @@ class Compiler:
             preview = self.preview_input(socket, width(socket))
             value = preview or (vector(socket.default_value) if width(socket) == 3 else number(socket.default_value))
             return f'return {value};', width(socket)
+        if node.type == 'ATTRIBUTE' and node.attribute_type == 'GEOMETRY':
+            from .geometry import color_attribute
+            attribute = color_attribute(node.attribute_name)
+            if attribute in self.attribute_images:
+                if self.available_attributes is None or "_VORK_0_HAIR_COORDINATES" not in self.available_attributes:
+                    self.fail(node, socket.name, "missing exported strand coordinates")
+                if socket.name not in ('Color', 'Alpha', 'Vector'):
+                    self.fail(node, socket.name, 'named color scalar conversion is not translated')
+                self.field_types['strand_coordinates'] = 'Attribute<float3>'
+                self.inputs['strand_coordinates'] = dict(attribute='_VORK_0_HAIR_COORDINATES')
+                field = 'root_color_' + node.attribute_name.encode('utf8').hex()
+                self.field_types[field] = 'Image'
+                self.inputs[field] = dict(image=self.attribute_images[attribute])
+                channel = 'w' if socket.name == 'Alpha' else 'xyz'
+                return (f'float2 uv=read_attribute(inputs.strand_coordinates,ctx).value.xy;'
+                        f'return blender_image(inputs.{field},uv,uv,uv,ctx).{channel};',
+                        1 if socket.name == 'Alpha' else 3)
+            if self.available_attributes is None or attribute not in self.available_attributes:
+                self.fail(node, socket.name, f'missing exported named color {node.attribute_name!r}')
+            if socket.name not in ('Color', 'Alpha', 'Vector'):
+                self.fail(node, socket.name, 'named color scalar conversion is not translated')
+            field = 'color_' + node.attribute_name.encode('utf8').hex()
+            self.field_types[field] = 'Attribute<float4>'
+            self.inputs[field] = dict(attribute=attribute)
+            channel = 'w' if socket.name == 'Alpha' else 'xyz'
+            return f'return read_attribute(inputs.{field},ctx).value.{channel};', 1 if socket.name == 'Alpha' else 3
+        if node.type == 'HAIR_INFO' and socket.name == 'Intercept':
+            if self.available_attributes is None or '_VORK_0_HAIR_COORDINATES' not in self.available_attributes:
+                self.fail(node, socket.name, 'missing exported strand coordinates')
+            self.field_types['strand_coordinates'] = 'Attribute<float3>'
+            self.inputs['strand_coordinates'] = dict(attribute='_VORK_0_HAIR_COORDINATES')
+            return 'return read_attribute(inputs.strand_coordinates,ctx).value.z;', 1
+        if node.type == 'COMBXYZ':
+            return f'return float3({get("X",1)},{get("Y",1)},{get("Z",1)});', 3
+        if node.type == 'SEPXYZ':
+            return f'return ({get("Vector",3)}).{socket.name.lower()};', 1
+        if node.type in ('SEPRGB', 'SEPARATE_COLOR'):
+            if node.type == 'SEPARATE_COLOR' and node.mode != 'RGB':
+                self.fail(node, socket.name, f'{node.mode} colour separation is not translated')
+            channel = {'R':'x', 'G':'y', 'B':'z', 'Red':'x', 'Green':'y', 'Blue':'z'}.get(socket.name)
+            if channel is None:
+                self.fail(node, socket.name, 'colour channel is not translated')
+            return f'return ({self.input(node.inputs[0],3)}).{channel};', 1
+        if node.type in ('COMBRGB', 'COMBINE_COLOR'):
+            if node.type == 'COMBINE_COLOR' and node.mode != 'RGB':
+                self.fail(node, socket.name, f'{node.mode} colour combination is not translated')
+            return 'return float3('+','.join(self.input(s,1) for s in node.inputs[:3])+');', 3
+        if node.type == 'MAP_RANGE':
+            if node.data_type != 'FLOAT':
+                self.fail(node, socket.name, 'vector Map Range is not translated')
+            mode = node.interpolation_type
+            if mode not in ('LINEAR', 'STEPPED', 'SMOOTHSTEP', 'SMOOTHERSTEP'):
+                self.fail(node, socket.name, f'{mode} Map Range is not translated')
+            body = (f'float x={get("Value",1)},lo={get("From Min",1)},hi={get("From Max",1)};'
+                    f'float a={get("To Min",1)},b={get("To Max",1)};'
+                    'float t=hi!=lo?(x-lo)/(hi-lo):0.;')
+            if mode == 'STEPPED':
+                body += f'float steps={get("Steps",1)};t=steps!=0.?floor(t*(steps+1.))/steps:0.;'
+            elif mode == 'SMOOTHSTEP':
+                body += 't=saturate(t);t=t*t*(3.-2.*t);'
+            elif mode == 'SMOOTHERSTEP':
+                body += 't=saturate(t);t=t*t*t*(t*(t*6.-15.)+10.);'
+            body += 'float result=lerp(a,b,t);'
+            if node.clamp:
+                body += 'result=clamp(result,min(a,b),max(a,b));'
+            return body+'return result;', 1
         if node.type == 'REROUTE':
             if not node.inputs[0].is_linked:
                 self.fail(node, socket.name, 'unconnected reroute')
             name, result = self.output(node.inputs[0].links[0].from_socket)
             return f'return {name}(ctx,inputs,off);', result
+        if node.type == 'TEX_GRADIENT':
+            if node.inputs['Vector'].is_linked:
+                coordinates = f"float3 p={get('Vector', 3)};"
+            else:
+                body, _ = self.generated(node, socket)
+                helper = f'generated_{len(self.functions)}'
+                self.functions.append(f'float3 {helper}(ShadingContext ctx, Inputs inputs, float2 off) {{{body}}}')
+                coordinates = f'float3 p={helper}(ctx,inputs,off);'
+            expressions = {
+                'LINEAR': 'p.x',
+                'QUADRATIC': 'max(p.x,0.)*max(p.x,0.)',
+                'EASING': 'saturate(p.x)*saturate(p.x)*(3.-2.*saturate(p.x))',
+                'DIAGONAL': '(p.x+p.y)*.5',
+                'RADIAL': 'atan2(p.y,p.x)/6.283185307179586+.5',
+                'SPHERICAL': 'max(1.-length(p),0.)',
+                'QUADRATIC_SPHERE': 'max(1.-length(p),0.)*max(1.-length(p),0.)',
+            }
+            if node.gradient_type not in expressions:
+                self.fail(node, socket.name, 'unknown gradient type')
+            value = 'float3(value)' if socket.name == 'Color' else 'value'
+            return (f'{coordinates}float value=saturate({expressions[node.gradient_type]});return {value};',
+                    3 if socket.name == 'Color' else 1)
         if node.type == 'TEX_COORD':
             if socket.name == 'UV':
                 return self.uv(None, node)
             if node.object is not None:
                 self.fail(node, socket.name, 'external coordinate objects are not translated')
             if socket.name == 'Generated':
-                if not self.best_effort:
-                    self.fail(node, socket.name, 'source ORCO coordinates are not retained by glTF')
-                self.report(node, socket.name, 'source ORCO coordinates are not retained by glTF', 'normalized imported rest bounds; Generated coordinates approximated')
-                return 'float3 p=texture_coordinate(ctx,off).Generated;return float3(p.x,1.-p.z,p.y);', 3
+                return self.generated(node, socket)
             if socket.name in ('Object', 'Normal'):
                 return f'float3 p=texture_coordinate(ctx,off).{socket.name};return float3(p.x,-p.z,p.y);', 3
             self.fail(node, socket.name, 'coordinate output is not translated')
@@ -662,10 +763,15 @@ return 1.-pow(facing,exponent);''',1
             return f'float3 n={normal};return Diffuse_BSDF({get("Color",3)},{get("Roughness",1)},float3(n.x,n.z,-n.y));', 'Closure'
         if node.type == 'BSDF_TRANSPARENT':
             color = node.inputs['Color']
-            if color.is_linked or tuple(color.default_value[:3]) != (1.,1.,1.):
-                if not self.best_effort:
-                    self.fail(node, 'Color', 'coloured transparent transport is not translated')
-                self.report(node, 'Color', 'coloured transparent transport is not translated', 'neutral transparent coverage')
+            if not color.is_linked and tuple(color.default_value[:3]) == (1., 1., 1.):
+                # Coverage passthrough preserves the incoming ray permissions and
+                # camera background, unlike a physical index-matched sheet.
+                return 'Closure c={};c.base_weight=0.;c.specular_weight=0.;c.geometry_opacity=0.;return c;', 'Closure'
+            reason = 'RGB Transparent preserves tint but its source ray classification is not represented'
+            if not self.best_effort:
+                self.fail(node, 'Color', reason)
+            self.report(node, 'Color', reason,
+                        'RGB index-matched sheet; transmission visibility and lighting World after crossing')
             return f'return Transparent_BSDF({get("Color",3)});', 'Closure'
         if node.type == 'MATH':
             operations = {'ADD','SUBTRACT','MULTIPLY','DIVIDE','MULTIPLY_ADD','MINIMUM','MAXIMUM','LESS_THAN','GREATER_THAN','ABSOLUTE','FLOOR','CEIL','POWER','FRACT','TRUNC','SINE','COSINE','TANGENT','ARCTANGENT','SQRT','SIGN','RADIANS','DEGREES','EXPONENT','ROUND','MODULO','FLOORED_MODULO'}

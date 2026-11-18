@@ -359,9 +359,15 @@ impl Worker {
     /// Render the open document with the shot's options. The shot's `scene` and
     /// `document` are set here. Returns the shot report and how the installation was obtained.
     pub fn render(&mut self, mut shot: Shot) -> Result<(serde_json::Value, Reuse)> {
+        #[cfg(feature = "frame-profile")]
+        let _profile_event = crate::frame_profile::event("request", shot.frame_start.unwrap_or(0) as u32, shot.at.as_ref().map_or(0., |t| t.as_f32()));
         let open = self.open.as_mut().context("no scene is open; send open first").context(crate::failure::FailureKind::Usage)?;
         shot.scene = open.path.clone();
-        shot.document = Some(serde_json::to_vec(&open.document)?);
+        shot.document = Some({
+            #[cfg(feature = "frame-profile")]
+            let _profile = crate::frame_profile::span("request_serialize");
+            serde_json::to_vec(&open.document)?
+        });
         // Ordinary source admission can refuse before touching the device. Cache
         // identity cannot: untracked or unreadable hashes just force installation.
         // An unsupported destination refuses before this request takes or creates the device, and so does
@@ -369,14 +375,22 @@ impl Worker {
         // A caller's rewrite runs later and may change the scene, as it may change its sources below: the
         // shot then admits the rewritten scene itself, where its errors are every rewritten scene's.
         let target = crate::output_device::target(&shot.out)?;
-        let decoded = decode(&open.document, &open.path)?;
+        let decoded = {
+            #[cfg(feature = "frame-profile")]
+            let _profile = crate::frame_profile::span("request_decode_validate");
+            decode(&open.document, &open.path)?
+        };
         if shot.edit.is_none() { crate::output_device::admit(&decoded, &shot.out, target).map_err(crate::failure::scene)?; }
         let paths = crate::validate_files(&decoded, &open.base)?;
         // A caller's rewrite runs later and may introduce different sources.
         let files = tracked_files(paths).filter(|_| shot.edit.is_none());
-        let same_install = match (&open.installed, &files) {
+        let same_install = {
+            #[cfg(feature = "frame-profile")]
+            let _profile = crate::frame_profile::span("request_identity");
+            match (&open.installed, &files) {
             (Some(installed), Some(files)) => installed.files == *files && same_scene(&installed.snapshot, &decoded)?,
             _ => false,
+            }
         };
         // From here on the renderer and the installation leave together: a
         // failure drops both, and an installation never meets a device other
@@ -402,7 +416,11 @@ impl Worker {
         // Only options that rendered become the identity the next open prepares
         // under: refused options would make every later open fail on them.
         let mut template = shot.clone();
-        let rendered = shot.render_retained_decoded(retained, decoded.clone())?;
+        let rendered = {
+            #[cfg(feature = "frame-profile")]
+            let _profile = crate::frame_profile::span("request_render_inclusive");
+            shot.render_retained_decoded(retained, decoded.clone())?
+        };
         template.document = None;
         self.template = Some(template);
         let report = rendered.report.clone();

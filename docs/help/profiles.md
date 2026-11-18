@@ -2,7 +2,7 @@ PROFILES
 Choose with --profile; profile settings are separate from scene content.
 
 Profile     Speed       Use                         Main omissions
-std/previs  fastest     framing and direct light    no indirect bounce lighting
+std/previs  fastest     framing and direct light    low-budget emissive lighting
 std/draft   quick       lighting previews           approximate GI, 4 samples
 std/final   moderate    delivery (default)          approximate GI, 8 samples
 std/path    slowest     interiors, glass, caustics  finite depth/budget, 64 samples
@@ -10,8 +10,8 @@ std/path    slowest     interiors, glass, caustics  finite depth/budget, 64 samp
 Preview means std/previs; use the names above with --profile.
 Resolution does not change the per-pixel sample budget.
 
-std/previs: fast iteration on framing, materials and direct lighting. It omits
-indirect lighting; raster surfaces use central-emitter hard shadows. Broad-light
+std/previs: fast iteration on framing, materials and direct lighting. It omits general
+indirect bounce lighting; raster surfaces use central-emitter hard shadows. Broad-light
 highlights can narrow or change brightness; ray-camera effects can remain grainy.
 Judge the finished lighting with final or path.
 In std/previs, scalar std/openpbr geometry_opacity and alpha_cutoff use each
@@ -19,9 +19,11 @@ material's raster coverage, retaining direct lighting and visible emission. Samp
 or animation of either input, and opacity combined with transmission, retain
 whole-view path transport until qualified. Other effects can also require path
 transport. The sample budget and denoise setting stay unchanged.
-Raster previs uses analytic lights and environment approximations. Emissive
-meshes stay visible, but light they cast on other objects needs std/draft,
-std/final or std/path; the former alpha-triggered path view included that light.
+Raster previs uses analytic lights and environment approximations. When emissive
+materials can light other surfaces, it enables low-sample raster ray lighting and
+warns that indirect light, reflections and transmission may be noisy or incomplete.
+When available, fast GPU denoising cleans up emissive previews; --set denoise=false
+retains the raw estimate. Use std/final or std/path for exact lighting.
 Hair uses complete-camera path transport automatically, including render-image
 captures. Promoted views keep the sample budget and default to denoising;
 --set denoise=false turns it off. Glass and water retain final’s raster transport.

@@ -469,7 +469,7 @@ pub fn node_text_units(scene: &Scene, node_id: &str) -> Result<TextUnits, String
                 }
             }
             VectorOpPipeline::Analytic => {
-                for r in &op.records {
+                for r in op.records.iter() {
                     let unit = ((f64::from(r.glyph_opacity) * (count + 2) as f64).round() as usize)
                         .saturating_sub(1);
                     let mut rest = *r;

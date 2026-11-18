@@ -67,7 +67,7 @@ pub(crate) const ORIENTATION_EPSILON: f32 = 1e-10;
 pub(crate) const ORIENTATION_UP_PARALLEL: f32 = 0.999;
 
 /// One full-width source reference per OpenPBR input and glTF occlusion, vec4-aligned.
-pub(crate) const MATERIAL_INPUT_WORDS: usize = (vork_scene::v2::OPENPBR.len()+1).next_multiple_of(4);
+pub(crate) const MATERIAL_INPUT_WORDS: usize = (vork_scene::v2::OPENPBR_TABLE.len()+1).next_multiple_of(4);
 
 pub use vork_slang::registry::MATERIAL_TAP_INDEX_MASK;
 
@@ -292,3 +292,17 @@ pub(crate) const SIMULATION_GROUP_RETRY: u32 = 8;
 
 /// GiQuery in gi_ray.slang: six aligned float4 records per query.
 pub(crate) const GI_QUERY_BYTES: u64 = 96;
+
+// Frame workers retain independent mutable histories over shared installed 2D inputs.
+// Bound replicated draw caches; short exports keep the original startup path.
+pub(crate) const CANVAS_MAX_WORKERS: usize = 8;
+// Four workers limit GPU cache replication; extra producers can contend on submission.
+pub(crate) const CANVAS_DEFAULT_MAX_WORKERS: usize = 4;
+pub(crate) const CANVAS_PARALLEL_MIN_FRAMES: usize = 256;
+pub(crate) const CANVAS_PARALLEL_PROBE_FRAMES: usize = 8;
+// Reject isolated spikes; reconsider cheap introductions as the clip progresses.
+pub(crate) const CANVAS_PARALLEL_PROBE_WINDOWS: usize = 2;
+// Leave delivery headroom after frame work is spread across the proposed workers.
+pub(crate) const CANVAS_PARALLEL_DELIVERY_MARGIN: f64 = 3.;
+// Require predicted saved host time to exceed twice the summed replicated setup work.
+pub(crate) const CANVAS_PARALLEL_SETUP_MARGIN: f64 = 2.;

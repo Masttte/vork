@@ -27,6 +27,9 @@
 /// The plan caches' and resident scene's id-keyed maps hash with FxHash (std's SipHash showed up across a
 /// first frame's plan build in wasm). Keys are the document's own ids and content hashes.
 pub type HashMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHasher>;
+mod output_records;
+use output_records::OutputRecords;
+
 use std::hash::Hasher;
 use std::sync::Arc;
 
@@ -93,7 +96,7 @@ const TRANSFORM_ONLY: &[&str] = &["x", "y", "rotation", "scale", "scaleX", "scal
 /// too: its drop / inner shadows are paint-only (own DrawItems and instance
 /// data, rebuilt per frame), every other entry (blurs, backdrops, shaders,
 /// text effects) re-keys tessellation.
-const PAINT_ONLY: &[&str] = &["opacity", "blendMode"];
+const PAINT_ONLY: &[&str] = &["opacity", "blendMode", "vorkPaint"];
 
 /// Effect types that feed only per-frame paint (see [`PAINT_ONLY`]).
 const PAINT_ONLY_EFFECT_TYPES: &[&str] = &["drop-shadow", "inner-shadow"];
@@ -1868,7 +1871,7 @@ const PAGE_PLAN_BUDGET_ENTRIES: usize = 64;
 /// Give the single slot its own generous budget; one plan at this size is safe
 /// versus the coarse wasm memory guard, and a still-larger plan keeps the old
 /// behaviour (not retained → rebuilt each frame).
-const CAMERA_PLAN_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const CAMERA_PLAN_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 /// The retained camera plan (`camera_slot`) holds the viewport's plan too, and is
 /// what keeps a large document's edits and blurred pans off the full rebuild. Its
 /// byte count (`plan_bytes`) includes the bodies' geometry and text batches,
@@ -2574,6 +2577,7 @@ fn vector_batch_bytes(v: &moda_text::vector::VectorNodeOps) -> usize {
 /// under-counting. Instances/masks counted coarsely.
 fn plan_bytes(plan: &CoveragePlan) -> usize {
     1024 + plan.masks.len() * 4096 + items_bytes(&plan.items)
+        + plan.item_order.as_ref().map_or(0, crate::plan_items::ItemOrder::bytes)
 }
 
 /// Heap a copy of `items` owns: [`items_bytes`] without body geometry, which is an
@@ -2600,6 +2604,7 @@ pub(crate) fn items_bytes(items: &[crate::seams::DrawItem]) -> usize {
     let mut bytes = 0;
     for item in items {
         bytes += match item {
+            DrawItem::Vacant => std::mem::size_of::<DrawItem>(),
             DrawItem::Body { geometry, .. } => {
                 geometry_bytes(geometry) + std::mem::size_of::<crate::seams::PaintInstance>() + 128
             }
@@ -4448,6 +4453,25 @@ pub(crate) fn capture_key<'a>(
     if clocked && !group.filters.motion {
         return (None, None);
     }
+    if crate::layer_blur::translation::eligible(group) {
+        let mut h = FxHasher::default();
+        h.write(b"local-solid-capture");
+        h.write_u32(group.width_px);
+        h.write_u32(group.height_px);
+        h.write(format!("{:?}", group.filters.blur).as_bytes());
+        for item in &group.items {
+            if let crate::seams::DrawItem::Body { node_id, z, phase, instance, blend_mode, .. } = item {
+                h.write(node_id.as_bytes());
+                h.write_u64(z.to_bits());
+                h.write(format!("{phase:?}{blend_mode:?}").as_bytes());
+                h.write(bytemuck::bytes_of(&crate::layer_blur::translation::instance(instance, group.region_canvas)));
+            }
+        }
+        fold_item_geometry(&mut h, &group.items);
+        fold_render_options_fingerprint(&mut h, opts);
+        h.write_u64(crate::surface::epoch_total());
+        return (Some(h.finish()), None);
+    }
     let mut h = FxHasher::default();
     h.write(b"layer-capture");
     if clocked {
@@ -4502,6 +4526,9 @@ pub(crate) fn capture_key<'a>(
             if let crate::seams::DrawItem::LayerBlurComposite {
                 group: nested, page_clip_bounds, clip_rrect, ..
             } = item {
+                // A child may reuse local pixels at a different canvas origin.
+                // Its placement still changes the enclosing capture's pixels.
+                for v in nested.region_canvas { h.write_u64(v.to_bits()); }
                 match nested.cache_key {
                     Some(key) => h.write_u64(key),
                     None => fold_group(h, nested),
@@ -4579,8 +4606,12 @@ fn fold_clip_rrect(h: &mut FxHasher, rr: Option<crate::seams::ClipRRect>) {
 
 /// Whether a built plan bakes the shader clock anywhere (R5 hit condition).
 pub fn plan_uses_shader_time(plan: &CoveragePlan) -> bool {
-    items_use_shader_time(&plan.items)
-        || plan.masks.iter().any(|mask| mask.image.as_ref().is_some_and(|image| image.rendered.is_some()))
+    items_use_shader_time(&plan.items) || masks_use_shader_time(&plan.masks)
+}
+
+fn masks_use_shader_time(masks: &[crate::seams::MaskPlan]) -> bool {
+    masks.iter().any(|mask| mask.image.as_ref().and_then(|image| image.rendered.as_ref())
+        .is_some_and(|rendered| rendered.shader_clock.get().copied().unwrap_or(true)))
 }
 
 /// rust-edit-incremental-z4: whether any of these draw items bakes the shader
@@ -5020,6 +5051,8 @@ pub struct FramePlanIndex {
 /// `frame::ChangedItems::Written`).
 #[derive(Default)]
 pub struct PlanWritten {
+    /// A derived mask value changed; recorded passes must bind the current atlas.
+    pub masks_changed: bool,
     /// Bodies whose placement values were written by their recipe, ascending: their draw stands.
     pub placed: Vec<u32>,
     /// Items the planner prepared again, each with the item it replaced.
@@ -5032,19 +5065,29 @@ struct FrameIndexEntry {
     /// The host's key for the scene state the plan stands at, and the shader clock it was planned for.
     key: u64,
     shader_time_s: f64,
+    built_at: u64,
     uses_shader_time: bool,
+    /// The immutable body proof from emission. Successful patches check only their changed output and drop
+    /// the slot if any body starts reading the clock; mask execution may resolve its pending proof later.
+    body_uses_shader_time: bool,
     bytes: usize,
     /// What following a change in place needs; `None` for a plan that is only held (a plan that reads the
     /// shader clock, or incremental planning switched off).
     patchable: Option<Patchable>,
 }
 
+impl FrameIndexEntry {
+    fn reads_clock(&self) -> bool {
+        self.uses_shader_time && (self.body_uses_shader_time || masks_use_shader_time(&self.plan.masks))
+    }
+}
+
 struct Patchable {
     index: PlanIndex,
     surface_epoch: u64,
     /// `Some` for a page with captures, cut-outs or groups painting their appearance. Such a unit bakes its
-    /// content's placement, so it and everything under it is planned whole; every other plain span still
-    /// follows its recipe (`place`) or is prepared node by node (`patch`).
+    /// content's placement. A changed input re-plans its recorded range; other plain spans still follow
+    /// their recipes (`place`) or are prepared node by node (`patch`).
     units: Option<Units>,
     /// The plan's spans by scene row, made with the plan. `None` for a plan that is not placed by rows.
     rows: Option<PlacedRows>,
@@ -5114,7 +5157,7 @@ impl PlacedRows {
                 let id = scene.row(row as u32)?.id();
                 // A unit that moves, sits under a node that moves, or holds one, is planned again whole. A moved
                 // node is asked directly: one that draws nothing yet has no span to ask.
-                *slot |= units.above.contains(id) || units.holds(scene, id);
+                *slot |= units.above.contains(id) || units.holds(scene, id) || units.reads_source(id);
             }
         }
         Some(Self { hierarchy: worlds.hierarchy(), span, row: row_of_span, unit, culled })
@@ -5124,30 +5167,77 @@ impl PlacedRows {
 /// The nodes of a page that own a unit, from the scene rather than from what the plan emitted: a unit that
 /// draws nothing yet (a background effect outside the target) still splits the plan once it moves into view.
 struct Units {
+    output_order: Option<crate::plan_items::ItemOrder>,
+    sdf_blockers: std::collections::HashSet<String>,
+    outputs: Vec<Option<OutputRecords>>,
     /// A fading group, a blurred, shadowed or mask-captured node, a background effect, a split blend, a group
     /// painting its appearance.
     owners: std::collections::HashSet<String>,
     /// Every node above an owner: moving one moves the unit.
     above: std::collections::HashSet<String>,
+    segment: Option<crate::frame::CameraSegment>,
+    /// Each source node names the outer recorded unit that consumes it.
+    by_node: HashMap<String, usize>,
+    /// Recorded units reading each mask, including reads through descendant masks.
+    mask_users: Vec<Vec<usize>>,
+    /// Rows read by each derived mask: its source subtree and inherited source inputs.
+    mask_inputs: HashMap<String, Vec<usize>>,
+    /// Conservative whole-scene reads are a scope, not one duplicate edge per scene row.
+    global_mask_inputs: Vec<usize>,
+    recorded_by_node: HashMap<String, usize>,
+    hidden_sources: std::collections::HashSet<String>,
+}
+
+fn mask_reads_whole_scene(mask: &crate::seams::MaskPlan) -> bool {
+    mask.image.as_ref().and_then(|image| image.rendered.as_ref()).is_some_and(|rendered| rendered.cache_key.is_none())
 }
 
 impl Units {
-    fn of(scene: &Scene, plan: &CoveragePlan) -> Self {
+    /// The same source-role selector governs initial ownership and later interval promotion.
+    /// A content value write alone does not replace a plain span's existing writer.
+    fn owns_source(scene: &Scene, id: &str) -> bool {
+        scene.group_appearance_by_id().contains_key(id) || scene.effective_node(id).is_some_and(|node|
+            crate::backdrop::plan::has_active_background_blur(node)
+                || crate::layer_blur::plan::needs_layer_capture_in(scene, node)
+                || crate::backdrop::blend::node_splits(scene, id, false)
+                || crate::backdrop::blend::node_splits(scene, id, true))
+    }
+
+    fn of(scene: &Scene, plan: &CoveragePlan, segment: Option<crate::frame::CameraSegment>, spans: &[crate::frame::NodeSpan], mut budget: usize) -> Self {
         use crate::seams::DrawItem;
         let mut owners: std::collections::HashSet<String> = plan.items.iter().filter_map(|item| match item {
             DrawItem::BackdropSplit(split) => Some(split.node_id.clone()),
             DrawItem::LayerBlurComposite { node_id, .. } => Some(node_id.clone()),
             _ => None,
         }).chain(scene.group_appearance_by_id().keys().cloned()).collect();
-        for id in scene.flattened_z_order_for_page(&plan.page_id) {
-            if owners.contains(id.as_str()) { continue; }
-            let Some(node) = scene.effective_node(&id) else { continue };
-            // A split blend depends on the target's alpha mode; either answer makes the node an owner.
-            if crate::backdrop::plan::has_active_background_blur(node) || crate::layer_blur::plan::needs_layer_capture_in(scene, node)
-                || crate::backdrop::blend::node_splits(scene, &id, false) || crate::backdrop::blend::node_splits(scene, &id, true) {
-                owners.insert(id.to_string());
+        // The ordinary executor has already established whether this segment can emit split or
+        // capture output, including sources outside the target. With neither context, there is no
+        // effect output to rediscover. Empty body writers below still exist, and a later content
+        // write promotes its source through owns_source before re-executing the interval.
+        if segment.as_ref().is_none_or(|seg| seg.backdrop.is_some() || seg.layer_blur) {
+            for id in scene.flattened_z_order_for_page(&plan.page_id) {
+                if owners.contains(id.as_str()) { continue; }
+                if Self::owns_source(scene, &id) {
+                    owners.insert(id.to_string());
+                }
             }
         }
+        // Every recorded leaf output has one writer. Ordinary emission can return an empty
+        // output before producing a plain span (for example, a null clip); its source interval
+        // still belongs to the range executor, just as a capture's interval does.
+        if let Some(seg) = &segment {
+            let plain: std::collections::HashSet<&str> = spans.iter().map(|span| span.node_id.as_str()).collect();
+            for item in seg.dl.items.iter().filter(|item| item.is_primary_node_item) {
+                if crate::frame::source_has_body(item)
+                    && !plain.contains(item.node_id.as_str())
+                    && scene.effective_node(&item.node_id).is_some_and(|node| !moda_scene::scene::is_parent_node(node))
+                    && !scene.transient_by_parent().contains_key(&item.node_id) {
+                    owners.insert(item.node_id.clone());
+                }
+            }
+        }
+        let transparent = segment.as_ref().is_some_and(|seg| seg.node_transparent);
+        let sdf_blockers = owners.iter().filter(|id| crate::backdrop::blend::node_precludes_shape_sdf(scene, id, transparent)).cloned().collect();
         let mut above = std::collections::HashSet::new();
         for owner in &owners {
             let mut cursor = owner.as_str();
@@ -5157,7 +5247,530 @@ impl Units {
                 cursor = parent;
             }
         }
-        Self { owners, above }
+        let mut by_node = HashMap::default();
+        if let Some(seg) = &segment {
+            for (ui, unit) in seg.units.iter().enumerate() {
+                let items = &seg.dl.items[unit.dl_start..unit.dl_end];
+                if items.iter().any(|item| owners.contains(&item.node_id)) {
+                    for item in items { by_node.insert(item.node_id.clone(), ui); }
+                }
+            }
+        }
+        let mut mask_users = vec![Vec::new(); plan.masks.len()];
+        if let Some(seg) = &segment {
+            for (ui, unit) in seg.units.iter().enumerate() {
+                for &read in &unit.mask_reads {
+                    let mut mask = Some(seg.mask_start + read);
+                    let mut remaining = plan.masks.len();
+                    while let Some(mi) = mask {
+                        if remaining == 0 { break; }
+                        remaining -= 1;
+                        let Some(users) = mask_users.get_mut(mi) else { break };
+                        if users.last() != Some(&ui) { users.push(ui); }
+                        mask = plan.masks[mi].ancestor;
+                    }
+                }
+            }
+        }
+        let mut mask_inputs: HashMap<String, Vec<usize>> = HashMap::default();
+        let mut global_mask_inputs = Vec::new();
+        for (mi, mask) in plan.masks.iter().enumerate() {
+            if mask_reads_whole_scene(mask) { global_mask_inputs.push(mi); continue; }
+            let mut pending = if mask.source_node_id != mask.owner_node_id { vec![mask.source_node_id.as_str()] } else { Vec::new() };
+            if mask.invert { pending.push(mask.owner_node_id.as_str()); }
+            let mut inputs = std::collections::HashSet::new();
+            while let Some(id) = pending.pop() {
+                if !inputs.insert(id) { continue; }
+                if let Some(children) = scene.children_by_parent().get(id) { pending.extend(children.iter().map(String::as_str)); }
+                if let Some(children) = scene.transient_by_parent().get(id) { pending.extend(children.iter().map(String::as_str)); }
+            }
+            inputs.insert(mask.source_node_id.as_str());
+            let mut cursor = mask.source_node_id.as_str();
+            while let Some(parent) = scene.parent_map().get(cursor).or_else(|| scene.transient_parent_of().get(cursor)) {
+                if !inputs.insert(parent.as_str()) { break; }
+                cursor = parent;
+            }
+            for id in inputs { mask_inputs.entry(id.to_string()).or_default().push(mi); }
+        }
+        let mut recorded_by_node = HashMap::default();
+        let mut hidden_sources = std::collections::HashSet::new();
+        if let Some(seg) = &segment {
+            for (ui, unit) in seg.units.iter().enumerate() {
+                for item in &seg.dl.items[unit.dl_start..unit.dl_end] {
+                    recorded_by_node.insert(item.node_id.clone(), ui);
+                    if item.fallback_reasons.contains(&"text-mask-source") { hidden_sources.insert(item.node_id.clone()); }
+                }
+            }
+        }
+        let outputs = segment.as_ref().map(|seg| seg.units.iter().map(|unit| {
+            // Plain source spans already have their writer. Only a range owned by a capture or
+            // composition can call its retained output graph; promotion installs that ownership.
+            if !seg.dl.items[unit.dl_start..unit.dl_end].first()
+                .is_some_and(|item| by_node.contains_key(&item.node_id)) { return None; }
+            let start = seg.prefix + unit.item_start;
+            let record = OutputRecords::read(scene, &seg.dl.items[unit.dl_start..unit.dl_end], unit,
+                &plan.items[start..start + unit.item_len], seg.prepared.as_ref())?;
+            budget = budget.checked_sub(record.bytes())?;
+            Some(record)
+        }).collect()).unwrap_or_default();
+        let output_order = segment.as_ref().and_then(|seg| {
+            let ranges = std::iter::once(0..seg.prefix).chain(seg.units.iter().map(|unit| {
+                let start = seg.prefix + unit.item_start;
+                start..start + unit.item_len
+            })).collect();
+            crate::plan_items::ItemOrder::new(ranges, plan.items.len())
+        });
+        Self { output_order, sdf_blockers, outputs, owners, above, segment, by_node, mask_users, mask_inputs, global_mask_inputs, recorded_by_node, hidden_sources }
+    }
+
+    /// A content write can make an existing source subtree start emitting a capture. Its recorded
+    /// source interval already exists; coalesce just that interval into one retained execution unit.
+    /// Output addresses outside the interval and every unrelated dependency edge stay in place.
+    fn promote_sources(&mut self, scene: &Scene, changed: &[String], at: u64,
+        plan: &mut Arc<CoveragePlan>, rows: &mut Option<PlacedRows>, written: &mut PlanWritten,
+        index: &PlanIndex,
+    ) -> Option<i64> {
+        use moda_scene::stamps::Group;
+        let worlds = scene.world_rows()?;
+        let mut candidates = Vec::new();
+        let mut restriction_memo = HashMap::default();
+        for id in changed {
+            if self.by_node.contains_key(id) { continue; }
+            let row = scene.row_of(id)?;
+            let hidden = scene.hidden_from_paint_order(id);
+            if scene.stamps().current(row, Group::Content, at) && !hidden { continue; }
+            if !hidden && !Self::owns_source(scene, id) && index.by_node.contains_key(id)
+                && plain_source_eligible(scene, index, id, &mut restriction_memo) { continue; }
+            let (from, to) = worlds.range(row)?;
+            candidates.push((from, to, id));
+        }
+        candidates.sort_unstable_by_key(|&(from, to, _)| (from, std::cmp::Reverse(to)));
+        let mut bytes = 0i64;
+        for (from, to, id) in candidates {
+            // An enclosing changed range claims its descendants first, so overlapping changes do not
+            // coalesce or copy the same outputs again.
+            if self.by_node.contains_key(id) { continue; }
+            let source_rows: std::collections::HashSet<u32> = worlds.ordered(from, to).iter().copied().collect();
+            let mut members: Vec<usize> = source_rows.iter().filter_map(|&row|
+                self.recorded_by_node.get(scene.row(row)?.id()).copied()).collect();
+            members.sort_unstable(); members.dedup();
+            let first = *members.first()?;
+            let last = *members.last()?;
+            let seg = self.segment.as_mut()?;
+            let source_start = seg.units.get(first)?.dl_start;
+            let source_end = seg.units.get(last)?.dl_end;
+            if !seg.dl.items.get(source_start..source_end)?.iter().all(|item|
+                scene.row_of(&item.node_id).is_some_and(|row| source_rows.contains(&row))) { return None; }
+            // The source interval is contiguous in painter order even if previous output growth moved
+            // some of its storage. Empty retired unit descriptors may sit between its active members.
+            let mut merged = seg.units[first].clone();
+            merged.dl_end = source_end;
+            merged.z_consumed = 0;
+            merged.mask_reads.clear(); merged.compositions.clear(); merged.captures.clear();
+            merged.skipped.clear(); merged.dropped.clear();
+            merged.culled = true; merged.part_culled = false; merged.flags = 0; merged.reads_body_mode = false;
+            let mut items = Vec::new();
+            for ui in first..=last {
+                let unit = &seg.units[ui];
+                if unit.dl_start == unit.dl_end { continue; }
+                if unit.z != merged.z + merged.z_consumed { return None; }
+                merged.z_consumed += unit.z_consumed;
+                merged.mask_reads.extend_from_slice(&unit.mask_reads);
+                merged.compositions.extend(unit.compositions.iter().cloned());
+                merged.captures.extend(unit.captures.iter().cloned());
+                merged.skipped.extend(unit.skipped.iter().cloned());
+                merged.dropped.extend(unit.dropped.iter().cloned());
+                merged.culled &= unit.culled; merged.part_culled |= unit.part_culled;
+                merged.flags |= unit.flags; merged.reads_body_mode |= unit.reads_body_mode;
+                let start = seg.prefix + unit.item_start;
+                items.extend_from_slice(plan.items.get(start..start + unit.item_len)?);
+                if let Some(record) = self.outputs.get_mut(ui) {
+                    bytes -= record.take().as_ref().map_or(0, OutputRecords::bytes) as i64;
+                }
+            }
+            merged.mask_reads.sort_unstable(); merged.mask_reads.dedup();
+            merged.item_len = items.len();
+            let (start, delta) = crate::plan_items::replace_unit(Arc::make_mut(plan), &mut self.output_order,
+                first + 1, items, written)?;
+            bytes += delta;
+            merged.item_start = start.checked_sub(seg.prefix)?;
+            for ui in first + 1..=last {
+                let (_, delta) = crate::plan_items::replace_unit(Arc::make_mut(plan), &mut self.output_order,
+                    ui + 1, Vec::new(), written)?;
+                bytes += delta;
+                let unit = &mut seg.units[ui];
+                unit.dl_end = unit.dl_start; unit.item_len = 0; unit.z_consumed = 0;
+                unit.mask_reads.clear(); unit.compositions.clear(); unit.captures.clear(); unit.reads_body_mode = false;
+            }
+            // Replace the reached consumers' mask edges, including ancestor-mask dependencies.
+            let mut masks = std::collections::HashSet::new();
+            for &read in &merged.mask_reads {
+                let mut next = Some(seg.mask_start + read);
+                while let Some(mi) = next {
+                    if !masks.insert(mi) { break; }
+                    next = plan.masks.get(mi)?.ancestor;
+                }
+            }
+            for mi in masks {
+                let users = self.mask_users.get_mut(mi)?;
+                users.retain(|ui| *ui < first || *ui > last);
+                if !users.contains(&first) { users.push(first); }
+            }
+            seg.units[first] = merged;
+            for item in &seg.dl.items[source_start..source_end] {
+                self.by_node.insert(item.node_id.clone(), first);
+                self.recorded_by_node.insert(item.node_id.clone(), first);
+            }
+            self.owners.insert(id.clone());
+            let mut parent = scene.parent_map().get(id).or_else(|| scene.transient_parent_of().get(id));
+            while let Some(id) = parent {
+                self.above.insert(id.clone());
+                if let Some(rows) = rows.as_mut() {
+                    if let Some(row) = scene.row_of(id) { *rows.unit.get_mut(row as usize)? = true; }
+                }
+                parent = scene.parent_map().get(id).or_else(|| scene.transient_parent_of().get(id));
+            }
+            if let Some(rows) = rows.as_mut() {
+                for &row in &source_rows {
+                    *rows.unit.get_mut(row as usize)? = true;
+                    let span = *rows.span.get(row as usize)?;
+                    if span != u32::MAX { *rows.row.get_mut(span as usize)? = u32::MAX; }
+                }
+            }
+        }
+        Some(bytes)
+    }
+
+    fn reads_source(&self, id: &str) -> bool {
+        !self.global_mask_inputs.is_empty() || self.mask_inputs.contains_key(id)
+    }
+
+    /// Follow source ancestry to its recorded output graph. A source absent from that graph's reads
+    /// can keep empty output while the same paint-order selector still prunes it. Other consumers,
+    /// including masks outside this unit, are reached independently below.
+    fn keeps_empty_source(&self, scene: &Scene, id: &str, row: u32) -> bool {
+        if !scene.placeable(row) || !scene.hidden_from_paint_order(id) { return false; }
+        let mut cursor = id;
+        for _ in 0..4096 {
+            if let Some(&unit) = self.by_node.get(cursor) {
+                return self.outputs.get(unit).and_then(Option::as_ref)
+                    .is_some_and(|record| record.ignores_source(row));
+            }
+            let Some(parent) = scene.parent_map().get(cursor).or_else(|| scene.transient_parent_of().get(cursor)) else {
+                return false;
+            };
+            cursor = parent;
+        }
+        false
+    }
+
+    /// Re-run only recorded units reached by the changed rows. Their output shape and render-z must
+    /// stand; structural changes still go through the cold build. The ordinary node executor is shared.
+    #[allow(clippy::too_many_arguments)]
+    fn patch(&mut self, scene: &Scene, plan: &mut Arc<CoveragePlan>, hashes: &HashMap<String, NodeHashes>,
+        opts: &RenderOptions, changed: &[String], index: &mut PlanIndex, warnings: &PlanWarnings, caches: &mut PlanCaches,
+        bytes: usize, written: &mut PlanWritten, built_at: u64, rows: &mut Option<PlacedRows>,
+    ) -> Option<(usize, HashMap<String, usize>, Vec<usize>)> {
+        let source_rows = rows.as_ref().filter(|rows|
+            scene.world_rows().is_some_and(|worlds| worlds.hierarchy() == rows.hierarchy))
+            .map(|rows| rows.unit.as_slice());
+        let mut stack: Vec<(&str, bool)> = changed.iter().map(|id| (id.as_str(), false)).collect();
+        let mut visited = std::collections::HashSet::new();
+        let mut affected = Vec::new();
+        let mut excluded = HashMap::default();
+        if !changed.is_empty() {
+            for &mi in &self.global_mask_inputs {
+                let users = &self.mask_users[mi];
+                if users.is_empty() { return None; }
+                affected.extend(users.iter().copied());
+            }
+        }
+        while let Some((id, inherited)) = stack.pop() {
+            let row = scene.row_of(id);
+            // The existing row index records every unit's source subtree and ancestors, including
+            // non-emitting rows and mask reads. An unrelated write cannot reach a unit through its children.
+            if row.and_then(|row| source_rows?.get(row as usize)).is_some_and(|read| !read) { continue; }
+            let propagates = inherited || row.is_none_or(|row| {
+                use moda_scene::stamps::Group;
+                !scene.stamps().current(row, Group::Placement, built_at)
+                    || !scene.stamps().current(row, Group::Content, built_at)
+            });
+            if !visited.insert((id, propagates)) { continue; }
+            let unrecorded = self.holds(scene, id) && !self.by_node.contains_key(id);
+            let empty_source = unrecorded && row.is_some_and(|row| self.keeps_empty_source(scene, id, row));
+            if unrecorded && !empty_source { return None; }
+            if empty_source { excluded.insert(id.to_string(), usize::MAX); }
+            if let Some(masks) = self.mask_inputs.get(id) {
+                for &mi in masks {
+                    let users = &self.mask_users[mi];
+                    if users.is_empty() { return None; }
+                    affected.extend(users.iter().copied());
+                }
+            }
+            if self.reads_source(id) {
+                if self.hidden_sources.contains(id) { excluded.insert(id.to_string(), usize::MAX); }
+                // A mask source may also draw normally (clip to the layer below). Its own recorded
+                // output follows the same executor as its consumers, instead of the plain-span gate.
+                if index.by_node.contains_key(id) { affected.push(*self.recorded_by_node.get(id)?); }
+            }
+            if self.by_node.contains_key(id) || self.reads_source(id) {
+                let mut cursor = Some(id);
+                let mut remaining = 4096;
+                while let Some(input) = cursor {
+                    if remaining == 0 || index.blend_related_ids.contains(input)
+                        || (index.mask_source_ids.contains(input) && !self.reads_source(input)) { return None; }
+                    remaining -= 1;
+                    cursor = scene.parent_map().get(input).or_else(|| scene.transient_parent_of().get(input)).map(String::as_str);
+                }
+            }
+            if let Some(&ui) = self.by_node.get(id) { affected.push(ui); }
+            // Source ancestry already indexes every mask read below this row. Its own output graph
+            // reads none of this hidden source, so there are no child outputs to revisit.
+            if empty_source { continue; }
+            // Paint values do not change descendant content or placement. Their composition record is
+            // already named above; only placement/content writes propagate through the hierarchy.
+            if !propagates { continue; }
+            if let Some(children) = scene.children_by_parent().get(id) {
+                stack.extend(children.iter().map(|id| (id.as_str(), true)));
+            }
+            if let Some(children) = scene.transient_by_parent().get(id) {
+                stack.extend(children.iter().map(|id| (id.as_str(), true)));
+            }
+        }
+        let mut body_delta = 0i64;
+        if let Some(seg) = self.segment.as_mut() {
+            // A derived page input reaches only the units that recorded a read in ordinary emission.
+            // Prepared rows carry the value they read, so standing text/sibling output can still replay.
+            if scene.stamps().all() > built_at || scene.stamps().latest(moda_scene::stamps::Group::Content) > built_at {
+                let had_blockers = !self.sdf_blockers.is_empty();
+                for &(id, _) in &visited {
+                    let node = scene.effective_node(id)?;
+                    // The ordinary executor needs the same target/capture contexts as cold planning.
+                    // A newly required context is a changed derived input, not permission to omit an effect.
+                    if (!seg.layer_blur && crate::layer_blur::plan::needs_layer_capture_in(scene, node))
+                        || (crate::backdrop::plan::has_active_background_blur(node)
+                            && (plan.sample_count != 1 || plan.transparent)) { return None; }
+                    if crate::backdrop::blend::node_precludes_shape_sdf(scene, id, seg.node_transparent) {
+                        self.sdf_blockers.insert(id.to_string());
+                    } else { self.sdf_blockers.remove(id); }
+                }
+                if had_blockers != !self.sdf_blockers.is_empty() {
+                    seg.backdrop = Some(self.sdf_blockers.is_empty());
+                    for (ui, unit) in seg.units.iter().enumerate().filter(|(_, unit)| unit.reads_body_mode) {
+                        affected.push(ui);
+                        body_delta -= self.outputs.get_mut(ui).and_then(Option::take)
+                            .as_ref().map_or(0, OutputRecords::bytes) as i64;
+                        // This range now owns outputs reached by a derived page input, just as a
+                        // capture owns its source outputs. Existing physical addresses remain stable.
+                        for item in &seg.dl.items[unit.dl_start..unit.dl_end] {
+                            self.by_node.insert(item.node_id.clone(), ui);
+                            self.owners.insert(item.node_id.clone());
+                            let mut cursor = Some(item.node_id.as_str());
+                            while let Some(id) = cursor {
+                                if id != item.node_id { self.above.insert(id.to_string()); }
+                                if let (Some(rows), Some(row)) = (rows.as_mut(), scene.row_of(id)) {
+                                    *rows.unit.get_mut(row as usize)? = true;
+                                    let span = *rows.span.get(row as usize)?;
+                                    if span != u32::MAX { *rows.row.get_mut(span as usize)? = u32::MAX; }
+                                }
+                                cursor = scene.parent_map().get(id).or_else(|| scene.transient_parent_of().get(id)).map(String::as_str);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        affected.sort_unstable(); affected.dedup();
+        if !affected.is_empty() {
+            let seg = self.segment.as_ref()?;
+            for &ui in &affected {
+                let unit = seg.units.get(ui)?;
+                let dl = &seg.dl.items[unit.dl_start..unit.dl_end];
+                if dl.first().is_some_and(|item| !self.by_node.contains_key(&item.node_id)) {
+                    for item in dl { excluded.insert(item.node_id.clone(), ui); }
+                }
+            }
+        }
+        let plain = match plain_patch_spans(scene, index, warnings, changed, Some((&self.by_node, &excluded))) {
+            Some(spans) => spans,
+            None => { caches.incr_fallbacks = caches.incr_fallbacks.wrapping_add(1); return None; }
+        };
+        if affected.is_empty() { return Some((bytes, excluded, plain)); }
+        let seg = self.segment.as_mut()?;
+        let mut bytes = bytes as i64 + body_delta;
+        let mut mask_owners = None;
+        let mut selected: std::collections::HashSet<usize> = affected.iter().copied().collect();
+        let mut cursor = 0;
+        while cursor < affected.len() {
+            let ui = affected[cursor];
+            cursor += 1;
+            let start = seg.prefix + seg.units[ui].item_start;
+            if self.global_mask_inputs.is_empty() && !changed.iter().any(|id| self.mask_inputs.contains_key(id)) {
+                if let Some(delta) = self.outputs.get_mut(ui).and_then(Option::as_mut)
+                    .and_then(|records| records.patch(scene, changed, plan, start, seg, written, opts, caches, hashes)) {
+                    bytes += delta;
+                    continue;
+                }
+            }
+            let unit = &seg.units[ui];
+            // Offscreen range execution does not cull. It consumes the recorded membership, primary
+            // kinds and mask-source roles; values, transforms, clips and effects come from the scene's
+            // current rows. Those structural inputs stand under the caller's stamp proof, so no display
+            // list is rebuilt for the unit's placement, paint or node-local content writes.
+            let dl = &seg.dl.items[unit.dl_start..unit.dl_end];
+            let before_bytes = seg.prepared.as_ref().map_or(0, |rows| rows.bytes());
+            let mut prepared = seg.prepared.take();
+            if let Some(rows) = &mut prepared { rows.begin_range(); }
+            let mut build = crate::frame::rebuild_page_range(scene, plan, seg, dl, opts,
+                Some((caches, hashes)), unit.z, prepared, &[],
+                dl.first().is_some_and(|item| self.by_node.contains_key(&item.node_id)));
+            seg.prepared = build.prepared.take();
+            bytes += seg.prepared.as_ref().map_or(0, |rows| rows.bytes()) as i64 - before_bytes as i64;
+            if !build.mask_warnings.is_empty()
+                || build.units.iter().flat_map(|part| part.skipped.iter()).ne(unit.skipped.iter())
+                || build.units.iter().flat_map(|part| part.dropped.iter()).ne(unit.dropped.iter()) { return None; }
+            // The retained unit owns a source range, not the executor's temporary subdivision.
+            // A fade may disappear while its source membership and consumed z remain unchanged.
+            let dz = build.end_z as i64 - (unit.z + unit.z_consumed) as i64;
+            let mut emitted = unit.clone();
+            emitted.z_consumed = build.end_z - unit.z;
+            emitted.item_len = build.items.len();
+            emitted.compositions = build.units.iter().flat_map(|part| part.compositions.iter().cloned()).collect();
+            emitted.captures = build.units.iter().flat_map(|part| part.captures.iter().cloned()).collect();
+            emitted.culled = build.units.iter().all(|part| part.culled);
+            emitted.part_culled = build.units.iter().any(|part| part.part_culled);
+            emitted.flags = build.units.iter().fold(0, |flags, part| flags | part.flags);
+            emitted.reads_body_mode = build.units.iter().any(|part| part.reads_body_mode);
+            let mut mask_writes = Vec::new();
+            if !remap_scratch_masks_record(&mut build.items, &build.masks, &plan.masks,
+                &mut mask_owners, Some(&mut mask_writes)) { return None; }
+            let mapping: Vec<usize> = build.masks.iter().map(|mask|
+                mask_owners.as_ref()?.get(&mask.owner_node_id).copied()).collect::<Option<_>>()?;
+            if !seg.prepared.as_mut().is_none_or(|rows| rows.remap_emitted_masks(&mapping)) { return None; }
+            for capture in &mut emitted.captures {
+                for id in capture.strip_masks.iter_mut().chain(&mut capture.mask_table) {
+                    *id = *mapping.get(*id as usize)? as u64;
+                }
+            }
+            // Membership belongs to the retained dependency index. A changed read set must reseed it,
+            // including reads hidden inside captures whose top-level slots can remain unchanged.
+            let mut reads: Vec<usize> = build.units.iter().flat_map(|part| part.mask_reads.iter()).map(|&mi| {
+                mask_owners.as_ref()?.get(&build.masks.get(mi)?.owner_node_id).copied()
+            }).collect::<Option<_>>()?;
+            reads.sort_unstable();
+            reads.dedup();
+            if reads != unit.mask_reads {
+                // Queries may start or stop reading an existing mask as bounds move. Patch the
+                // reverse edges from the executor's actual reads, including inherited mask inputs.
+                let ancestors = |reads: &[usize]| -> Option<std::collections::HashSet<usize>> {
+                    let mut result = std::collections::HashSet::new();
+                    for &read in reads {
+                        let mut next = Some(read);
+                        while let Some(mi) = next {
+                            if !result.insert(mi) { break; }
+                            next = plan.masks.get(mi)?.ancestor;
+                        }
+                    }
+                    Some(result)
+                };
+                let old_reads = ancestors(&unit.mask_reads)?;
+                let new_reads = ancestors(&reads)?;
+                for &mi in old_reads.difference(&new_reads) { self.mask_users.get_mut(mi)?.retain(|&user| user != ui); }
+                for &mi in new_reads.difference(&old_reads) { self.mask_users.get_mut(mi)?.push(ui); }
+                emitted.mask_reads = reads;
+            }
+            // Mask values are derived inputs. Re-prepare their consumers with the ordinary executor,
+            // including units not reached by the original row writes. An ancestor mask is an input of
+            // every descendant mask's consumers too. Membership and slots still stand structurally.
+            if !mask_writes.is_empty() {
+                written.masks_changed = true;
+                let plan = Arc::make_mut(plan);
+                for (mi, mask) in mask_writes {
+                    // Inversion reads the owner's bounds as well as the source: a changed input set
+                    // must reseed the reverse index, like a changed source binding or mask-read set.
+                    if plan.masks[mi].invert != mask.invert
+                        || mask_reads_whole_scene(&plan.masks[mi]) != mask_reads_whole_scene(&mask) { return None; }
+                    plan.masks[mi] = mask;
+                    for &consumer in &self.mask_users[mi] {
+                        if selected.insert(consumer) { affected.push(consumer); }
+                    }
+                }
+            }
+            let start = seg.prefix + unit.item_start;
+            let old = plan.items.get(start..start + unit.item_len)?;
+            let same_slots = items_slots_match(&build.items, old);
+            // Plain spans still address their original slots. Owned ranges have their own output index.
+            if (!same_slots && !dl.first().is_some_and(|item| self.by_node.contains_key(&item.node_id)))
+                || items_use_shader_time(&build.items) { return None; }
+            let resize = build.items.len() != old.len();
+            if !resize { bytes += items_bytes(&build.items) as i64 - items_bytes(old) as i64; }
+            if dl.first().is_some_and(|item| !self.by_node.contains_key(&item.node_id)) {
+                for item in dl { excluded.insert(item.node_id.clone(), ui); }
+            }
+            if let Some(record) = self.outputs.get_mut(ui) {
+                bytes -= record.as_ref().map_or(0, OutputRecords::bytes) as i64;
+                if !dl.first().is_some_and(|item| self.by_node.contains_key(&item.node_id)) {
+                    *record = None;
+                } else if !record.as_mut().is_some_and(|record| same_slots && record.refresh(scene, &emitted, &build.items, seg.prepared.as_ref())) {
+                    *record = OutputRecords::read(scene, dl, &emitted, &build.items, seg.prepared.as_ref());
+                }
+                if record.as_ref().is_some_and(|record| (bytes.max(0) as usize).saturating_add(record.bytes()) > CAMERA_PLAN_BUDGET_BYTES) { *record = None; }
+                bytes += record.as_ref().map_or(0, OutputRecords::bytes) as i64;
+            }
+            if resize {
+                let (new_start, delta) = crate::plan_items::replace_unit(Arc::make_mut(plan), &mut self.output_order,
+                    ui + 1, build.items, written)?;
+                bytes += delta;
+                emitted.item_start = new_start.checked_sub(seg.prefix)?;
+                seg.units[ui] = emitted;
+                Self::shift_depths(scene, seg, ui, dz, plan, index, written)?;
+                continue;
+            }
+            let dest = Arc::make_mut(plan).items.get_mut(start..start + unit.item_len)?;
+            for (i, (slot, item)) in dest.iter_mut().zip(build.items).enumerate() {
+                if same_slots && drawitem_node_id(&item).and_then(|id| scene.row_of(id)).is_some_and(|row|
+                    seg.prepared.as_ref().is_some_and(|rows| rows.kept(row))) { continue; }
+                written.replaced.push(((start + i) as u32, std::mem::replace(slot, item)));
+            }
+            seg.units[ui] = emitted;
+            Self::shift_depths(scene, seg, ui, dz, plan, index, written)?;
+        }
+        if let Some(rows) = seg.prepared.as_mut() {
+            let without = bytes.max(0) as usize - rows.bytes();
+            rows.fit_budget(CAMERA_PLAN_BUDGET_BYTES.saturating_sub(without));
+            bytes = (without + rows.bytes()) as i64;
+        }
+        Some((bytes.max(0) as usize, excluded, plain))
+    }
+
+    /// Render depth is an ordered derived column. Changed source visibility shifts later depths,
+    /// without preparing their geometry, paint or dependency graphs again.
+    fn shift_depths(scene: &Scene, seg: &mut crate::frame::CameraSegment, after: usize, dz: i64,
+        plan: &mut Arc<CoveragePlan>, index: &mut PlanIndex, written: &mut PlanWritten) -> Option<()> {
+        if dz == 0 { return Some(()); }
+        seg.z_end = seg.z_end.checked_add_signed(dz)?;
+        if seg.z_end > crate::depth::MAX_RENDER_Z { return None; }
+        let plan = Arc::make_mut(plan);
+        for unit in &mut seg.units[after + 1..] {
+            unit.z = unit.z.checked_add_signed(dz)?;
+            let start = seg.prefix + unit.item_start;
+            for (offset, item) in plan.items.get_mut(start..start + unit.item_len)?.iter_mut().enumerate() {
+                if !crate::camera_slot::z_shiftable(item, dz) { return None; }
+                let old = item.clone();
+                crate::camera_slot::shift_item_z(item, dz);
+                written.replaced.push(((start + offset) as u32, old));
+            }
+            for source in &seg.dl.items[unit.dl_start..unit.dl_end] {
+                if !source.is_primary_node_item { continue; }
+                if let Some(&span) = index.by_node.get(&source.node_id) {
+                    index.spans[span].z = index.spans[span].z.checked_add_signed(dz)?;
+                }
+                if let (Some(prepared), Some(row)) = (seg.prepared.as_mut(), scene.row_of(&source.node_id)) {
+                    prepared.shift_source_z(row, dz)?;
+                }
+            }
+        }
+        Some(())
     }
 
     /// Whether `id` is a unit owner or sits under one.
@@ -5180,25 +5793,32 @@ impl FramePlanIndex {
     /// place of, when one was held: the host hands it to the engine, which compares the two.
     #[allow(clippy::too_many_arguments)]
     pub fn seed(&mut self, scene: &Scene, opts: &RenderOptions,
-        plan: &Arc<CoveragePlan>, warnings: &Arc<PlanWarnings>, aux: crate::frame::PlanBuildAux,
+        plan: &Arc<CoveragePlan>, warnings: &Arc<PlanWarnings>, mut aux: crate::frame::PlanBuildAux,
         generation: u64, key: u64, caches: &mut PlanCaches) -> Option<Arc<CoveragePlan>> {
         let replaced = self.entry.take().map(|entry| entry.plan);
         self.written = PlanWritten::default();
-        let bytes = plan_bytes(plan);
+        let mut bytes = plan_bytes(plan);
+        if let Some(rows) = aux.segment.as_mut().and_then(|segment| segment.prepared.as_mut()) {
+            rows.fit_budget(CAMERA_PLAN_BUDGET_BYTES.saturating_sub(bytes));
+            bytes += rows.bytes();
+        }
         // The same bound the whole-frame slot keeps: a plan past it is not held.
         if bytes > CAMERA_PLAN_BUDGET_BYTES { return replaced; }
-        let uses_shader_time = plan_uses_shader_time(plan);
-        let patchable = (!caches.incremental_disabled && !uses_shader_time).then(|| {
-            // One blur or fading group no longer turns the index off for the canvas: it becomes a unit.
-            let units = (aux.has_backdrop || aux.has_layer_blur || page_has_group_appearance(scene, &plan.page_id))
-                .then(|| Units::of(scene, plan));
+        let body_uses_shader_time = items_use_shader_time(&plan.items);
+        let uses_shader_time = body_uses_shader_time || masks_use_shader_time(&plan.masks);
+        let patchable = (!caches.incremental_disabled && !body_uses_shader_time).then(|| {
+            // Source ownership exists independently of today's emitted effects. A currently empty
+            // source can reveal, and an ordinary group can begin composing, through the same writer.
+            let units = aux.segment.is_some()
+                .then(|| Units::of(scene, plan, aux.segment.take(), &aux.spans, CAMERA_PLAN_BUDGET_BYTES.saturating_sub(bytes)));
+            bytes += units.as_ref().map_or(0, |units| units.outputs.iter().flatten().map(OutputRecords::bytes).sum::<usize>() + units.output_order.as_ref().map_or(0, crate::plan_items::ItemOrder::bytes));
             let index = build_plan_index(scene, plan.page_index, opts, aux, generation, &mut caches.reverse_deps);
             let rows = PlacedRows::read(scene, &index, units.as_ref(), warnings, plan);
             Patchable { units, rows, index, surface_epoch: crate::surface::epoch_total() }
         });
         self.entry = Some(FrameIndexEntry {
             plan: plan.clone(), warnings: warnings.clone(), key, shader_time_s: opts.shader_time_s,
-            uses_shader_time, bytes, patchable,
+            built_at: scene.stamps().clock(), uses_shader_time, body_uses_shader_time, bytes, patchable,
         });
         replaced
     }
@@ -5208,7 +5828,7 @@ impl FramePlanIndex {
     /// shader clock is the plan of its exact clock only.
     pub fn held(&self, key: u64, shader_time_s: f64) -> Option<(Arc<CoveragePlan>, Arc<PlanWarnings>)> {
         let entry = self.entry.as_ref()?;
-        (entry.key == key && (!entry.uses_shader_time || entry.shader_time_s == shader_time_s))
+        (entry.key == key && (!entry.reads_clock() || entry.shader_time_s == shader_time_s))
             .then(|| (entry.plan.clone(), entry.warnings.clone()))
     }
 
@@ -5240,6 +5860,8 @@ impl FramePlanIndex {
     ) -> Option<(Arc<CoveragePlan>, Arc<PlanWarnings>)> {
         self.written = PlanWritten::default();
         let entry = self.entry.as_mut()?;
+        if entry.reads_clock() { return None; }
+        entry.uses_shader_time = false;
         let patchable = entry.patchable.as_mut()?;
         if patchable.index.opts_key != render_options_key(opts)
             || patchable.index.resource_key != resource_key()
@@ -5299,6 +5921,7 @@ impl FramePlanIndex {
         self.written.placed = written;
         index.built_at_generation = generation;
         entry.key = key;
+        entry.built_at = scene.stamps().clock();
         caches.incr_patch_hits = caches.incr_patch_hits.wrapping_add(1);
         caches.incr_patch_nodes = caches.incr_patch_nodes.wrapping_add(affected.len() as u64);
         caches.incr_placement_nodes = caches.incr_placement_nodes.wrapping_add(affected.len() as u64);
@@ -5312,39 +5935,74 @@ impl FramePlanIndex {
     }
 
     /// `changed` is the complete batch since the last plan, with no bounded
-    /// edit-log truncation. The caller proves these are dependency-safe
-    /// translations: unchanged content, opacity, topology and derived records.
-    /// General topology-preserving edits are not sufficient (text flow and
-    /// boolean sources can change other nodes). The plan held here is written in place and then stands at `key`.
+    /// edit-log truncation. The caller proves topology and derived records stand (the scene has no
+    /// Structure stamp or whole-scene invalidation). Each span checks its source row's Content and Paint
+    /// stamps: current content can follow placement or external text repaint; changed node-local content
+    /// uses ordinary node preparation. Cross-node sources and compositing dependencies still decline.
+    /// The plan held here is
+    /// written in place and then stands at `key`.
     /// A patch that fails part way leaves nothing held: the caller plans whole.
     #[allow(clippy::too_many_arguments)]
     pub fn patch(&mut self, scene: &Scene, hashes: &HashMap<String, NodeHashes>,
         opts: &RenderOptions, generation: u64, key: u64, changed: Vec<String>, caches: &mut PlanCaches,
     ) -> Option<(Arc<CoveragePlan>, Arc<PlanWarnings>)> {
         self.written = PlanWritten::default();
-        // Preparing a node alone is safe beside a unit, but not inside one or above one: those placements
-        // change the unit's capture. Ask only the changed nodes, including unit owners that emitted no items.
-        // Decline before taking the entry so the caller can replace it with a whole plan.
+        // Resource and option identity stand before following row dependencies. Unit inputs are prepared
+        // through their recorded range below; plain spans keep the node-local writer.
+        let entry = self.entry.as_mut()?;
+        if entry.reads_clock() { return None; }
+        entry.uses_shader_time = false;
         let patchable = self.entry.as_ref()?.patchable.as_ref()?;
-        if patchable.units.as_ref().is_some_and(|units| changed.iter()
-            .any(|id| units.above.contains(id) || units.holds(scene, id)))
-            || patchable.index.opts_key != render_options_key(opts)
+        if patchable.index.opts_key != render_options_key(opts)
             || patchable.index.resource_key != resource_key()
             || patchable.surface_epoch != crate::surface::epoch_total() { return None; }
+        let at = self.entry.as_ref()?.built_at;
+        // The global group stamp proves every source's content when only placement/paint was written.
+        // Do not resolve every changed name just to repeat that proof per row.
+        if (scene.stamps().all() > at || scene.stamps().latest(moda_scene::stamps::Group::Content) > at)
+            && changed.iter().any(|id| !patchable.units.as_ref().is_some_and(|units| (units.by_node.contains_key(id) || units.recorded_by_node.contains_key(id) || (units.hidden_sources.contains(id) && units.reads_source(id))))
+            && scene.row_of(id).is_none_or(|row|
+            !scene.stamps().current(row, moda_scene::stamps::Group::Content, at)
+                && scene.effective_node(id).is_none_or(|node|
+                    moda_scene::scene::is_parent_node(node)
+                    || crate::layer_blur::plan::needs_layer_capture_in(scene, node)
+                    || crate::backdrop::plan::has_active_background_blur(node)))) {
+            return None;
+        }
         let mut entry = self.entry.take()?;
-        let index = &mut entry.patchable.as_mut()?.index;
+        let patchable = entry.patchable.as_mut()?;
+        let mut written = PlanWritten::default();
+        let mut patched_units = HashMap::default();
+        let mut admitted_plain = None;
+        if let Some(units) = &mut patchable.units {
+            let delta = units.promote_sources(scene, &changed, entry.built_at, &mut entry.plan,
+                &mut patchable.rows, &mut written, &patchable.index)?;
+            entry.bytes = (entry.bytes as i64 + delta).max(0) as usize;
+            let (bytes, excluded, plain) = units.patch(scene, &mut entry.plan, hashes, opts, &changed,
+                &mut patchable.index, &entry.warnings, caches, entry.bytes, &mut written, entry.built_at, &mut patchable.rows)?;
+            entry.bytes = bytes;
+            patched_units = excluded;
+            admitted_plain = Some(plain);
+        }
+        let excluded = patchable.units.as_ref().map(|units| (&units.by_node, &patched_units));
+        let index = &mut patchable.index;
         let changes = if generation == index.built_at_generation { DirtySince::Unchanged }
             else { DirtySince::Nodes(changed) };
-        let mut written = PlanWritten::default();
         match apply_incremental_patch(index, &mut entry.plan, &entry.warnings,
             changes, generation, true, scene, hashes, caches, opts, CAMERA_PLAN_BUDGET_BYTES, entry.bytes, &[],
-            Some(&mut written)) {
+            Some(&mut written), Some(entry.built_at), excluded, admitted_plain,
+            patchable.units.as_ref().and_then(|units| units.segment.as_ref())) {
             IncrementalOutcome::Fallback => None,
             // Served this once; past the budget, or a shader clock now in it: not held.
             IncrementalOutcome::ServedDropSlot => Some((entry.plan, entry.warnings)),
             IncrementalOutcome::Served { bytes } => {
                 if let Some(bytes) = bytes { entry.bytes = bytes; }
                 entry.key = key;
+                entry.built_at = scene.stamps().clock();
+                entry.shader_time_s = opts.shader_time_s;
+                // Unchanged body output keeps its emission proof. Only newly written masks can add a
+                // pending capture proof; do not walk the whole page again after a small patch.
+                if written.masks_changed { entry.uses_shader_time = masks_use_shader_time(&entry.plan.masks); }
                 let served = (entry.plan.clone(), entry.warnings.clone());
                 self.entry = Some(entry);
                 self.written = written;
@@ -5590,11 +6248,14 @@ fn has_blend_or_mask_ancestor(scene: &Scene, id: &str, index: &PlanIndex,
 fn collect_affected_item_nodes<'a>(
     scene: &'a Scene,
     index: &PlanIndex,
+    warnings: &PlanWarnings,
     root: &'a str,
     out: &mut Vec<usize>,
     out_seen: &mut std::collections::HashSet<usize>,
     walked: &mut std::collections::HashSet<&'a str>,
+    excluded: Option<(&HashMap<String, usize>, &HashMap<String, usize>)>,
 ) -> bool {
+    if excluded.is_some_and(|nodes| nodes.0.contains_key(root) || nodes.1.contains_key(root)) { return true; }
     let Some(root_node) = scene.effective_node(root) else {
         return false; // unknown id — be conservative
     };
@@ -5615,7 +6276,12 @@ fn collect_affected_item_nodes<'a>(
         || scene.transient_by_parent().contains_key(root);
     if !walk_subtree {
         let Some(&si) = index.by_node.get(root) else {
-            return false;
+            // An absent leaf remains empty under the ordinary visibility selector. Derived-node
+            // sources still decline (placeable); mask consumers were handled by the unit index.
+            return scene.row_of(root).is_some_and(|row| scene.placeable(row))
+                && scene.hidden_from_paint_order(root)
+                && !warnings_mention_node(&warnings.skipped, root)
+                && !warnings_mention_node(&warnings.dropped, root);
         };
         if out_seen.insert(si) {
             out.push(si);
@@ -5639,6 +6305,7 @@ fn collect_affected_item_nodes<'a>(
     let cap = scene.node_order().len() + scene.transient_by_id().len() + 16;
     let mut stack: Vec<&'a str> = vec![root];
     while let Some(id) = stack.pop() {
+        if excluded.is_some_and(|nodes| nodes.0.contains_key(id) || nodes.1.contains_key(id)) { continue; }
         if !walked.insert(id) {
             continue; // already visited — cycle-safe
         }
@@ -5689,6 +6356,64 @@ enum IncrementalOutcome {
     Fallback,
 }
 
+/// The ordinary span writer's source-role proof, shared with source-interval promotion.
+fn plain_source_eligible(scene: &Scene, index: &PlanIndex, id: &str,
+    restriction_memo: &mut HashMap<String, bool>) -> bool {
+    !index.blend_related_ids.contains(id) && !index.mask_source_ids.contains(id)
+        && !has_blend_or_mask_ancestor(scene, id, index, restriction_memo)
+}
+
+/// Admit all plain source writes before any unit performs ordinary preparation.
+fn plain_patch_spans(
+    scene: &Scene, index: &PlanIndex, seed_warnings: &PlanWarnings, dirty: &[String],
+    excluded: Option<(&HashMap<String, usize>, &HashMap<String, usize>)>,
+) -> Option<Vec<usize>> {
+    let mut affected: Vec<usize> = Vec::with_capacity(dirty.len());
+    let mut affected_seen: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut walked = std::collections::HashSet::new();
+    for id in dirty {
+        if !collect_affected_item_nodes(scene, index, seed_warnings, id, &mut affected, &mut affected_seen, &mut walked, excluded)
+        {
+            return None;
+        }
+    }
+    // Gather the spans to patch, bailing (full rebuild) on any node that is
+    // not fast-path-eligible. Also bail if a node carried a warning in the
+    // SEED build (`skipped` OR a fail-closed `dropped` refusal): the patch
+    // path returns the seed warnings unchanged, so a node that warned then
+    // could leave a stale entry once it stops warning — fall back to keep the
+    // host-visible warning set authoritative (the rebuild below independently
+    // bails if a patched node produces a NEW warning of either kind).
+    // `affected` holds span indices, so the node id comes straight from the
+    // span (no second `by_node` lookup, no alloc).
+    let mut to_patch: Vec<usize> = Vec::with_capacity(affected.len());
+    let mut restriction_memo = HashMap::default();
+    for &si in &affected {
+        // Checked span lookup (`.get`, not `[]`) so a desynced index can
+        // never panic — any miss just falls back to the full rebuild.
+        let Some(span) = index.spans.get(si) else {
+            return None;
+        };
+        let id = span.node_id.as_str();
+        // Eligibility: the node must not be a blend/mask source nor nested
+        // inside one (editing it changes a CONSUMER's composite, not just
+        // this node's own span). Container bodies (a parent WITH a span) are
+        // allowed — `rebuild_node_items` drives the exact same
+        // `append_node_draw_items` route for them, and the post-rebuild
+        // shape/mask checks below catch anything unexpected.
+        let eligible = plain_source_eligible(scene, index, id, &mut restriction_memo);
+        if !eligible
+            || warnings_mention_node(&seed_warnings.skipped, id)
+            || warnings_mention_node(&seed_warnings.dropped, id)
+        {
+            return None;
+        }
+        to_patch.push(si);
+    }
+    Some(to_patch)
+}
+
 /// rust-edit-incremental-z4: the shared incremental-patch CORE for BOTH the page
 /// (`build_plan_retained`) and camera (`build_camera_plan_retained`) lanes. Given a
 /// taken-out slot's `index` + `plan` + the seed build's warnings, applies
@@ -5714,6 +6439,11 @@ fn apply_incremental_patch(
     extra_dirty: &[String],
     // Where to note the items written, for a host that tells the engine what changed (`FramePlanIndex::patch`).
     mut written: Option<&mut PlanWritten>,
+    // Host-owned plans use the scene clock to validate each span's content independently.
+    built_at: Option<u64>,
+    excluded: Option<(&HashMap<String, usize>, &HashMap<String, usize>)>,
+    admitted: Option<Vec<usize>>,
+    page_segment: Option<&crate::frame::CameraSegment>,
 ) -> IncrementalOutcome {
     let since = match (changes, extra_dirty) {
         (d, []) => d,
@@ -5748,56 +6478,26 @@ fn apply_incremental_patch(
             // shape-checked; byte-exactness is proven by `MODA_INCREMENTAL_VERIFY`
             // + the `mutation_replay` GPU gate. Any doubt (unknown id, dirty leaf
             // with no span, cyclic/runaway subtree) → full rebuild.
-            let mut affected: Vec<usize> = Vec::with_capacity(dirty.len());
-            let mut affected_seen: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            let mut walked = std::collections::HashSet::new();
-            for id in &dirty {
-                if !collect_affected_item_nodes(scene, index, id, &mut affected, &mut affected_seen, &mut walked)
-                {
-                    caches.incr_fallbacks = caches.incr_fallbacks.wrapping_add(1);
-                    return IncrementalOutcome::Fallback;
-                }
-            }
-            // Gather the spans to patch, bailing (full rebuild) on any node that is
-            // not fast-path-eligible. Also bail if a node carried a warning in the
-            // SEED build (`skipped` OR a fail-closed `dropped` refusal): the patch
-            // path returns the seed warnings unchanged, so a node that warned then
-            // could leave a stale entry once it stops warning — fall back to keep the
-            // host-visible warning set authoritative (the rebuild below independently
-            // bails if a patched node produces a NEW warning of either kind).
-            // `affected` holds span indices, so the node id comes straight from the
-            // span (no second `by_node` lookup, no alloc).
-            let mut to_patch: Vec<usize> = Vec::with_capacity(affected.len());
-            let mut restriction_memo = HashMap::default();
-            for &si in &affected {
-                // Checked span lookup (`.get`, not `[]`) so a desynced index can
-                // never panic — any miss just falls back to the full rebuild.
-                let Some(span) = index.spans.get(si) else {
-                    caches.incr_fallbacks = caches.incr_fallbacks.wrapping_add(1);
-                    return IncrementalOutcome::Fallback;
-                };
-                let id = span.node_id.as_str();
-                // Eligibility: the node must not be a blend/mask source nor nested
-                // inside one (editing it changes a CONSUMER's composite, not just
-                // this node's own span). Container bodies (a parent WITH a span) are
-                // allowed — `rebuild_node_items` drives the exact same
-                // `append_node_draw_items` route for them, and the post-rebuild
-                // shape/mask checks below catch anything unexpected.
-                let eligible = !index.blend_related_ids.contains(id)
-                    && !index.mask_source_ids.contains(id)
-                    && !has_blend_or_mask_ancestor(scene, id, index, &mut restriction_memo);
-                if !eligible
-                    || warnings_mention_node(&seed_warnings.skipped, id)
-                    || warnings_mention_node(&seed_warnings.dropped, id)
-                {
-                    caches.incr_fallbacks = caches.incr_fallbacks.wrapping_add(1);
-                    return IncrementalOutcome::Fallback;
-                }
-                to_patch.push(si);
+            let mut to_patch = match admitted {
+                Some(spans) => spans,
+                None => match plain_patch_spans(scene, index, seed_warnings, &dirty, excluded) {
+                    Some(spans) => spans,
+                    None => {
+                        caches.incr_fallbacks = caches.incr_fallbacks.wrapping_add(1);
+                        return IncrementalOutcome::Fallback;
+                    }
+                },
+            };
+            // A derived mask value may reach another unit during execution. Its source slots now
+            // belong to that executor too; never apply the plain writer over those replaced outputs.
+            if let Some((owners, reached)) = excluded {
+                to_patch.retain(|&si| index.spans.get(si).is_some_and(|span|
+                    !owners.contains_key(&span.node_id) && !reached.contains_key(&span.node_id)));
             }
             let page_clip = index.page_clip;
             let transparent = index.transparent;
+            let (backdrop_ctx, layer_blur_ctx) = page_segment.map_or((None, None), |seg|
+                crate::frame::page_range_contexts(scene, plan, seg, opts));
             // `make_mut` is in-place when the slot UNIQUELY owns the Arc (the page
             // editor lane between frames → true O(k)). On the CAMERA lane the
             // engine's prepared-frame holds a second strong ref, so it clones —
@@ -5819,9 +6519,30 @@ fn apply_incremental_patch(
             let mut delta_bytes: i64 = 0;
             // Owner id → index in the plan's mask table, built on the first masked node.
             let mut mask_owners: Option<HashMap<String, usize>> = None;
+            use moda_scene::stamps::Group;
+            // A group that has no writes since emission stands for every row. Resolve a source row
+            // only when a changed group needs its local proof; placement-only frames do neither lookup.
+            let content_stands = built_at.is_none_or(|at| scene.stamps().latest(Group::Content) <= at);
+            let paint_stands = built_at.is_none_or(|at| scene.stamps().latest(Group::Paint) <= at);
             for &si in &to_patch {
                 let span = &mut index.spans[si];
-                if translation_only {
+                let row = (!content_stands || !paint_stands).then(|| scene.row_of(&span.node_id)).flatten();
+                let content_current = content_stands || row.is_some_and(|row|
+                    scene.stamps().current(row, Group::Content, built_at.unwrap()));
+                let paint_current = paint_stands || row.is_some_and(|row|
+                    scene.stamps().current(row, Group::Paint, built_at.unwrap()));
+                if translation_only && content_current && span.len == 1 {
+                    if let Some(crate::seams::DrawItem::Text(old)) = plan_mut.items.get(span.start) {
+                        if let Some(batch) = crate::text_draw::repaint_text(scene, &span.node_id, old) {
+                            let old = std::mem::replace(&mut plan_mut.items[span.start], crate::seams::DrawItem::Text(batch));
+                            if let Some(written) = written.as_deref_mut() {
+                                written.replaced.push((span.start as u32, old));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if translation_only && content_current && paint_current {
                     if let (Some(recipe), Some(items)) = (span.placement.as_mut(),
                         plan_mut.items.get_mut(span.start..span.start + span.len)) {
                         let _placement = crate::prof::span("canvas.plan.placement");
@@ -5846,13 +6567,24 @@ fn apply_incremental_patch(
                 )
                 .with_vector_text_masks(true)
                 .in_working_color(opts.working.is_some());
+                if !content_current {
+                    let nodes = [span.node_id.clone()];
+                    let primary = moda_scene::display_list::display_list_items_for(
+                        scene, &nodes, span.primary.z_index, &index.mask_source_ids);
+                    // A change in display-list membership needs a structural rebuild.
+                    if primary.len() != 1 || !primary[0].is_primary_node_item {
+                        return IncrementalOutcome::Fallback;
+                    }
+                    span.primary = primary.into_iter().next().unwrap();
+                }
                 let (mut new_items, z_consumed, w) = crate::frame::rebuild_node_items(
                     scene,
                     &span.primary,
                     opts,
                     transparent,
                     page_clip,
-                    None,
+                    backdrop_ctx.as_ref(),
+                    layer_blur_ctx.as_ref(),
                     &mut scratch,
                     Some((caches, hashes)),
                     span.z,
@@ -5990,6 +6722,10 @@ fn try_incremental_fast_path(
         current_bytes,
         &[],
         None,
+        None,
+        None,
+        None,
+        None,
     );
     match outcome {
         IncrementalOutcome::Served { bytes } => {
@@ -6041,15 +6777,34 @@ fn items_shape_match(new: &[crate::seams::DrawItem], old: &[crate::seams::DrawIt
     })
 }
 
+/// Slot identity excludes derived mask placement values; every changed input's consumers are prepared again.
+fn items_slots_match(new: &[crate::seams::DrawItem], old: &[crate::seams::DrawItem]) -> bool {
+    new.len() == old.len() && new.iter().zip(old).all(|(n, o)| {
+        std::mem::discriminant(n) == std::mem::discriminant(o)
+            && drawitem_node_id(n) == drawitem_node_id(o)
+            && crate::camera_slot::item_mask_id(n) == crate::camera_slot::item_mask_id(o)
+    })
+}
+
 /// Re-point a patched node's items from the scratch mask table its rebuild filled onto the plan's table.
 /// Every scratch mask must equal the plan's mask for the same owner, field for field, with its ancestor
 /// chain mapped the same way (an edited clip owner changes its mask, so the patch falls back and the full
 /// rebuild re-plans the mask). False → fall back. `owners` caches the plan's owner → index map.
-fn remap_scratch_masks(
+pub(crate) fn remap_scratch_masks(
     items: &mut [crate::seams::DrawItem],
     scratch: &[crate::seams::MaskPlan],
     plan: &[crate::seams::MaskPlan],
     owners: &mut Option<HashMap<String, usize>>,
+) -> bool {
+    remap_scratch_masks_record(items, scratch, plan, owners, None)
+}
+
+fn remap_scratch_masks_record(
+    items: &mut [crate::seams::DrawItem],
+    scratch: &[crate::seams::MaskPlan],
+    plan: &[crate::seams::MaskPlan],
+    owners: &mut Option<HashMap<String, usize>>,
+    mut writes: Option<&mut Vec<(usize, crate::seams::MaskPlan)>>,
 ) -> bool {
     if scratch.is_empty() {
         return true;
@@ -6076,8 +6831,14 @@ fn remap_scratch_masks(
         };
         let mut mapped = m.clone();
         mapped.ancestor = ancestor;
-        if mapped != plan[j] {
+        if mapped.ancestor != plan[j].ancestor || mapped.source_node_id != plan[j].source_node_id {
             return false;
+        }
+        let source_key = |mask: &crate::seams::MaskPlan| mask.image.as_ref()
+            .and_then(|image| image.rendered.as_ref()).and_then(|rendered| rendered.cache_key);
+        if mapped != plan[j] || mask_reads_whole_scene(&mapped) || source_key(&mapped) != source_key(&plan[j]) {
+            let Some(writes) = writes.as_deref_mut() else { return false };
+            writes.push((j, mapped));
         }
         map.push(j);
     }
@@ -6094,7 +6855,7 @@ fn remap_scratch_masks(
 pub(crate) fn drawitem_node_id(item: &crate::seams::DrawItem) -> Option<&str> {
     use crate::seams::DrawItem;
     match item {
-        DrawItem::PageFill { .. } => None,
+        DrawItem::Vacant | DrawItem::PageFill { .. } => None,
         DrawItem::Body { node_id, .. } => Some(node_id),
         DrawItem::Shadow { node_id, .. } => Some(node_id),
         DrawItem::Text(b) => Some(&b.node_id),
@@ -6153,14 +6914,12 @@ fn debug_verify_incremental(
     let gi = plan_items_fingerprint(got);
     let fi = plan_items_fingerprint(&full);
     if gi != fi {
-        let n = got.items.len().min(full.items.len());
-        let first_div = (0..n)
-            .find(|&i| drawitem_fingerprint(&got.items[i]) != drawitem_fingerprint(&full.items[i]));
+        let first_div = got.ordered_items().zip(full.ordered_items()).position(|(a, b)| drawitem_fingerprint(a) != drawitem_fingerprint(b));
         panic!(
             "MODA_INCREMENTAL_VERIFY: incremental plan diverged from full rebuild \
              (page {page_index}): incr {} items / full {} items; first divergent item index {:?}",
-            got.items.len(),
-            full.items.len(),
+            got.ordered_items().len(),
+            full.ordered_items().len(),
             first_div
         );
     }
@@ -6185,10 +6944,11 @@ pub fn first_item_divergence(
         Some((&mut fresh, hashes)),
     )
     .ok()?;
-    let n = got.items.len().max(full.items.len());
+    let n = got.ordered_items().len().max(full.ordered_items().len());
+    let (mut got_items, mut full_items) = (got.ordered_items(), full.ordered_items());
     for i in 0..n {
-        let a = got.items.get(i).map(|x| format!("{x:?}"));
-        let b = full.items.get(i).map(|x| format!("{x:?}"));
+        let a = got_items.next().map(|x| format!("{x:?}"));
+        let b = full_items.next().map(|x| format!("{x:?}"));
         if a != b {
             return Some((
                 i,
@@ -6230,10 +6990,11 @@ pub fn first_camera_item_divergence(
     )
     .ok()??;
     let full = full.0;
-    let n = got.items.len().max(full.items.len());
+    let n = got.ordered_items().len().max(full.ordered_items().len());
+    let (mut got_items, mut full_items) = (got.ordered_items(), full.ordered_items());
     for i in 0..n {
-        let ga = got.items.get(i);
-        let fb = full.items.get(i);
+        let ga = got_items.next();
+        let fb = full_items.next();
         // Decide divergence on the CLOCK-NORMALIZED per-item fingerprint
         // (same as the camera verify oracle), so a re-threadable shader's
         // seed-clock vs current-clock `shader_params` slot difference is NOT
@@ -6262,8 +7023,8 @@ pub fn first_camera_item_divergence(
 /// (item-by-item, including f32 bits), for the verifier + tests.
 fn plan_items_fingerprint(plan: &CoveragePlan) -> u64 {
     let mut h = FxHasher::default();
-    h.write_usize(plan.items.len());
-    for it in &plan.items {
+    h.write_usize(plan.ordered_items().len());
+    for it in plan.ordered_items() {
         h.write_u64(drawitem_fingerprint(it));
     }
     h.write_usize(plan.masks.len());
@@ -6327,8 +7088,8 @@ pub(crate) fn drawitem_fingerprint_verify(item: &crate::seams::DrawItem) -> u64 
 #[cfg(test)]
 fn plan_items_fingerprint_verify(plan: &CoveragePlan) -> u64 {
     let mut h = FxHasher::default();
-    h.write_usize(plan.items.len());
-    for it in &plan.items {
+    h.write_usize(plan.ordered_items().len());
+    for it in plan.ordered_items() {
         h.write_u64(drawitem_fingerprint_verify(it));
     }
     h.write_usize(plan.masks.len());
@@ -7454,6 +8215,7 @@ mod tests {
             sample_count: 1,
             camera: [0.0, 0.0],
             items,
+            item_order: None,
             masks: Vec::new(),
             camera_frame: None,
             clear_rgba: None,
@@ -7474,7 +8236,7 @@ mod tests {
             degraded: None,
             vector: None,
             distort: None,
-            content_key: None,
+            content_key: None, paint_geometry_key: None,
         }))
     }
 
@@ -7497,7 +8259,7 @@ mod tests {
             blur_px: 0.0,
             stroke_px: 0.0,
             additive: false,
-            tris: vec![0.0_f32; tris_floats],
+            tris: vec![0.0_f32; tris_floats].into(),
             records: vec![
                 VectorAnalyticRecord {
                     pen_x: 0.0,
@@ -7512,7 +8274,7 @@ mod tests {
                     glyph_opacity: 1.0,
                 };
                 glyphs
-            ],
+            ].into(),
             gradient: None,
             paint: None,
         };
@@ -7531,7 +8293,7 @@ mod tests {
                 emojis: Vec::new(),
             }),
             distort: None,
-            content_key: None,
+            content_key: None, paint_geometry_key: None,
         }
     }
 
@@ -7609,8 +8371,8 @@ mod tests {
                 blur_px: 0.0,
                 stroke_px: 0.0,
                 additive: false,
-                tris: Vec::new(),
-                records: vec![rec; n],
+                tris: Default::default(),
+                records: vec![rec; n].into(),
                 gradient: None,
                 paint: None,
             })
@@ -8761,7 +9523,7 @@ mod tests {
         let mut index = FramePlanIndex::default();
         index.entry = Some(FrameIndexEntry {
             plan: shader_plan(Some(vec![0])), warnings: warn.clone(), key: fp, shader_time_s: 0.0,
-            uses_shader_time: true, bytes: 0, patchable: None,
+            built_at: 0, uses_shader_time: true, body_uses_shader_time: true, bytes: 0, patchable: None,
         });
         assert!(index.held(fp, 0.5).is_none());
         assert!(index.held(fp, 0.0).is_some());
@@ -13478,6 +14240,33 @@ mod tests {
         let before = key(&group);
         assert!(before.0.is_some());
         assert_eq!(key(&group), before, "the same items, the same key");
+        assert!(crate::layer_blur::translation::eligible(&group));
+        let mut moved = (*group).clone();
+        moved.region_canvas[0] += 40.;
+        moved.extent_canvas[0] += 40.;
+        for item in &mut moved.items {
+            if let crate::seams::DrawItem::Body { instance, .. } = item {
+                instance.model_matrix[12] += 40.;
+            }
+        }
+        assert_eq!(key(&moved), before, "integer translation retains capture pixels");
+        for item in &mut moved.items {
+            if let crate::seams::DrawItem::Body { instance, .. } = item {
+                instance.model_matrix[12] += 0.25;
+            }
+        }
+        assert_ne!(key(&moved), before, "fractional phase remains in the key");
+        for change in 0..3 {
+            let mut edited = (*group).clone();
+            if let crate::seams::DrawItem::Body { instance, .. } = &mut edited.items[0] {
+                match change {
+                    0 => instance.fill_color[0] += 0.1,
+                    1 => instance.fill_color[3] *= 0.5,
+                    _ => instance.page_clip_bounds[0] = group.region_canvas[0] as f32 + 10.,
+                }
+            }
+            assert_ne!(key(&edited), before, "paint, opacity and clip invalidate");
+        }
         // The same path drawn from another tessellation (a coarser band's stand-in, then its refinement).
         let mut refined = (*group).clone();
         let mut swapped = false;
@@ -13509,6 +14298,12 @@ mod tests {
         let moved = wrap(wrap(moved));
         assert_ne!(key(&nested).0, key(&moved).0, "deep capture regions affect the key");
         assert_eq!(key(&nested).1, key(&moved).1, "content identity stays");
+        let mut cached = (*group).clone();
+        cached.cache_key = before.0;
+        let parent = wrap(cached.clone());
+        cached.region_canvas[0] += 1.;
+        assert_ne!(key(&parent).0, key(&wrap(cached)).0,
+            "a reused child's placement remains part of the parent key");
     }
 
     /// The same document at the same zoom settles to a from-scratch build's plan however much each frame had time to
@@ -14507,6 +15302,1038 @@ mod unit_placement_tests {
     }
 
     #[test]
+    fn page_body_mode_changes_patch_the_recorded_readers() {
+        let mut host = Host::new(vec![
+            json!({"id":"fade","type":"group","opacity":0.6,"children":["child"]}),
+            path("child", 0., 0., "#ff3060"), path("path_only", 220., 130., "#eecc30"),
+            json!({"id":"plain","type":"rectangle","x":100,"y":20,"width":70,"height":60,
+                "fills":[{"id":"fill","paint":{"type":"solid","color":"#30ee80"}}]}),
+            json!({"id":"clip","type":"group","clipMaskNodeId":"mask","children":["steady"]}),
+            path("mask", 20., 120., "#ffffff"), path("steady", 25., 125., "#2040ee"),
+        ], &["fade","plain","clip","mask","path_only"]);
+        host.step(None);
+        for (step, opacity) in [1., 0.7, 1., 0.4].into_iter().enumerate() {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            scene.write_row(scene.row_of("fade").unwrap(), |fields| fields.set("opacity", json!(opacity))).unwrap();
+            scene.write_row(scene.row_of("plain").unwrap(), |fields| fields.set("x", json!(101 + step))).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+            let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["fade".into(), "plain".into()], &mut host.caches).expect("derived page input reaches its recorded body readers");
+            let written = host.index.take_written();
+            assert!(!written.replaced.iter().any(|(_, item)| drawitem_node_id(item) == Some("steady")),
+                "the masked body does not read page body mode");
+            assert!(!written.replaced.iter().any(|(_, item)| drawitem_node_id(item) == Some("path_only")),
+                "an ordinary path does not reach the analytic-body mode read");
+            let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+        }
+    }
+
+    #[test]
+    fn plain_page_visibility_has_recorded_source_writers() {
+        for group in [false, true] {
+            let mut source = path("source", 20., 30., "#2030ff");
+            source["opacity"] = json!(0.);
+            let mut nodes = vec![source, path("after", 50., 60., "#40ff30")];
+            let roots = if group {
+                nodes.push(json!({"id":"group","type":"group","opacity":1.,"children":["source"]}));
+                vec!["group","after"]
+            } else { vec!["source","after"] };
+            let mut host = Host::new(nodes, &roots);
+            host.step(None);
+            for (id, opacity) in [("source",0.5),("source",0.),("source",1.),
+                (if group { "group" } else { "source" },0.6), ("source",0.8)] {
+                let scene = &mut host.resident.state.as_mut().unwrap().scene;
+                scene.write_row(scene.row_of(id).unwrap(), |fields| fields.set("opacity", json!(opacity))).unwrap();
+                scene.refresh_worlds();
+                let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+                let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                    vec![id.into()], &mut host.caches)
+                    .unwrap_or_else(|| panic!("plain page source writer: group={group} {id} opacity={opacity}"));
+                host.index.take_written();
+                let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                    Some((&mut PlanCaches::default(), &hashes))).unwrap();
+                assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn visibility_writes_retain_source_membership_and_depth() {
+        for inside in [false, true] {
+        for initial in [0., 0.6] {
+        let mut hidden = path("hidden", 20., 30., "#2030ff");
+        hidden["opacity"] = json!(initial);
+        let children = if inside { json!(["child", "hidden", "sibling"]) } else { json!(["child", "sibling"]) };
+        let roots = if inside { vec!["fade", "after"] } else { vec!["fade", "hidden", "after"] };
+        let mut host = Host::new(vec![
+            json!({"id":"fade","type":"group","opacity":0.6,"children":children}),
+            path("child", 0., 0., "#ff3060"), hidden,
+            path("sibling", 45., 25., "#f0ee33"),
+            path("after", 50., 60., "#40ff30"),
+        ], &roots);
+        host.step(None);
+        for opacity in [0.5, 0.8, 0., 0.7, 0.] {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            scene.write_row(scene.row_of("hidden").unwrap(), |fields| fields.set("opacity", json!(opacity))).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+            let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["hidden".into()], &mut host.caches).unwrap_or_else(|| panic!("visibility is a retained value: inside={inside} initial={initial} opacity={opacity}"));
+            host.index.take_written();
+            let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+        }
+            }
+        }
+    }
+
+    #[test]
+    fn group_visibility_retains_descendant_sources() {
+        for inside in [false, true] {
+        let children = if inside { json!(["child", "hidden_group", "sibling"]) } else { json!(["child", "sibling"]) };
+        let roots = if inside { vec!["fade", "after"] } else { vec!["fade", "hidden_group", "after"] };
+        let mut host = Host::new(vec![
+            json!({"id":"fade","type":"group","opacity":0.6,"children":children}),
+            json!({"id":"hidden_group","type":"group","opacity":0.,"children":["a","b"]}),
+            path("child", 0., 0., "#ff3060"), path("a", 30., 20., "#2030ff"), path("b", 40., 50., "#2030ff"),
+            path("sibling", 45., 25., "#f0ee33"), path("after", 50., 60., "#40ff30"),
+        ], &roots);
+        host.step(None);
+        for opacity in [0.5, 0., 1., 0.7, 0.] {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            scene.write_row(scene.row_of("hidden_group").unwrap(), |fields| fields.set("opacity", json!(opacity))).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+            let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["hidden_group".into()], &mut host.caches)
+                .unwrap_or_else(|| panic!("group visibility: inside={inside} opacity={opacity}"));
+            host.index.take_written();
+            let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+        }
+        }
+    }
+
+    #[test]
+    fn empty_recorded_leaf_output_keeps_its_writer() {
+        let mut host = Host::new(vec![
+            json!({"id":"fade","type":"group","opacity":0.6,"children":["child"]}),
+            path("child", 0., 0., "#ff3060"),
+            json!({"id":"text","type":"richtext","x":1000,"y":20,"width":70,"height":60,
+                "clipTextToBounds":true,"text":"outside"}),
+        ], &["fade","text"]);
+        host.step(None);
+        for x in [1010., 1020., 1030.] {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            scene.write_row(scene.row_of("text").unwrap(), |fields| fields.set("x", json!(x))).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+            let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["text".into()], &mut host.caches).expect("empty recorded output has a writer too");
+            assert!(host.index.take_written().replaced.is_empty(), "empty output does not rewrite the standing capture");
+            let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+        }
+    }
+
+    #[test]
+    fn plain_content_uses_the_standing_page_composition_context() {
+        let mut host = Host::new(vec![
+            json!({"id":"fade","type":"group","opacity":0.6,"children":["child"]}),
+            path("child", 0., 0., "#ff3060"),
+            json!({"id":"plain","type":"rectangle","x":100,"y":20,"width":70,"height":60,
+                "fills":[{"id":"fill","paint":{"type":"solid","color":"#30ee80"}}]}),
+        ], &["fade","plain"]);
+        host.step(None);
+        for step in 0..8 {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            scene.write_row(scene.row_of("plain").unwrap(), |fields| fields.set("width", json!(71 + step))).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+            let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["plain".into()], &mut host.caches).expect("plain content uses its cold emission context");
+            host.index.take_written();
+            let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+        }
+    }
+
+    #[test]
+    fn a_revealed_source_and_capture_content_patch_together() {
+        let mut hidden = path("plain", 150., 20., "#30ee80"); hidden["opacity"] = json!(0);
+        let mut host = Host::new(vec![
+            json!({"id":"capture","type":"group","children":["child"],
+                "effects":[{"id":"blur","type":"layer-blur","radius":3}]}),
+            path("child", 0., 0., "#ff3060"), hidden,
+        ], &["capture","plain"]);
+        host.step(None);
+        let scene = &mut host.resident.state.as_mut().unwrap().scene;
+        scene.write_row(scene.row_of("child").unwrap(), |fields| fields.set("points", json!([
+            {"type":"move","x":0,"y":0},{"type":"line","x":63,"y":0},
+            {"type":"line","x":48,"y":57},{"type":"line","x":0,"y":60}]))).unwrap();
+        scene.write_row(scene.row_of("plain").unwrap(), |fields| fields.set("opacity", json!(1))).unwrap();
+        scene.refresh_worlds();
+        let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+        let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+            vec!["child".into(),"plain".into()], &mut host.caches).expect("recorded source membership survives visibility");
+        let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+            Some((&mut PlanCaches::default(), &hashes))).unwrap();
+        assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+    }
+
+    #[test]
+    fn mask_updates_do_not_retain_plain_source_preparation_without_an_owner() {
+        let mut host = Host::new(vec![
+            json!({"id":"clip","type":"group","clipMaskNodeId":"mask","children":["body"]}),
+            path("mask", 0., 0., "#ffffff"), path("body", 5., 10., "#ff3060"),
+        ], &["clip","mask"]);
+        host.step(None);
+        let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+        assert!(!units.owners.contains("mask"), "mask-only source belongs to its consumers, not an empty body writer");
+        for step in 0..8 {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            scene.write_row(scene.row_of("mask").unwrap(), |fields| fields.set("x", json!(step + 1))).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+            let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["mask".into()], &mut host.caches).expect("mask source range remains patchable");
+            host.index.take_written();
+            let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+            assert_eq!(plan.masks, fresh.masks);
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            let rows = units.segment.as_ref().unwrap().prepared.as_ref().unwrap();
+            assert!(rows.output(scene.row_of("body").unwrap()).is_none(),
+                "the plain span's existing writer does not consume a retained preparation row");
+        }
+    }
+
+    #[test]
+    fn plain_spans_do_not_allocate_unreachable_output_graphs() {
+        let mut nodes = vec![json!({"id":"capture","type":"group","children":["child"],
+            "effects":[{"id":"blur","type":"layer-blur","radius":3}]}), path("child", 0., 0., "#ffcc20")];
+        let mut roots = vec!["capture".to_string()];
+        for i in 0..128 { let id = format!("plain-{i}"); nodes.push(path(&id, 10., 20., "#ff3060")); roots.push(id); }
+        let mut host = Host::new(nodes, &roots.iter().map(String::as_str).collect::<Vec<_>>());
+        host.step(None);
+        let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+        let ui = units.by_node["capture"];
+        assert!(units.outputs[ui].is_some());
+        assert_eq!(units.outputs.iter().filter(|record| record.is_some()).count(), 1,
+            "ordinary spans use their existing index, not duplicate output graphs");
+    }
+
+    #[test]
+    fn hidden_sources_keep_empty_output_and_reveal_never_reuses_absence() {
+        for capture in [false, true] {
+            for hidden_parent in [false, true] {
+                let mut moving = path("moving", 25., 25., "#ee3080");
+                if !hidden_parent { moving["opacity"] = json!(0); }
+                let mut root = json!({"id":"root","type":"group","children":["left","hidden","right"]});
+                if capture { root["effects"] = json!([{"id":"b","type":"layer-blur","radius":3}]); }
+                let hidden = json!({"id":"hidden","type":"group","children":["moving"],
+                    "opacity":if hidden_parent {0.} else {1.}});
+                let mut host = Host::new(vec![root, hidden, moving,
+                    path("left", 0., 0., "#2080cc"), path("right", 100., 100., "#80cc20")], &["root"]);
+                host.step(None);
+                for step in 0..12 {
+                    let id = if hidden_parent && step % 2 == 0 { "hidden" } else { "moving" };
+                    let scene = &mut host.resident.state.as_mut().unwrap().scene;
+                    let row = scene.row_of(id).unwrap();
+                    scene.write_row(row, |fields| { fields.set("x", json!(25 + step)); }).unwrap();
+                    scene.refresh_worlds();
+                    let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+                    let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                        vec![id.into()], &mut host.caches).expect("an unread hidden source retains empty output");
+                    let written = host.index.take_written();
+                    assert!(written.replaced.is_empty() && written.placed.is_empty(), "hidden moves must not rewrite visible output");
+                    let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                        Some((&mut PlanCaches::default(), &hashes))).unwrap();
+                    assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "capture={capture}, hidden_parent={hidden_parent}, step={step}");
+                    assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+                }
+                let scene = &mut host.resident.state.as_mut().unwrap().scene;
+                let id = if hidden_parent {"hidden"} else {"moving"};
+                scene.write_row(scene.row_of(id).unwrap(), |fields| { fields.set("opacity", json!(1)); }).unwrap();
+                scene.refresh_worlds();
+                let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+                if let Some((plan, _)) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                    vec![id.into()], &mut host.caches) {
+                    let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                        Some((&mut PlanCaches::default(), &hashes))).unwrap();
+                    assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "revealed output cannot retain an empty proof");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn content_stamps_rebuild_only_changed_spans_in_a_moving_frame() {
+        let mut host = Host::new(vec![path("moving", 10., 10., "#255fe8"),
+            path("edited", 100., 10., "#ff7700"),
+            json!({"id":"capture","type":"group","children":["child"],
+                "effects":[{"id":"blur","type":"layer-blur","radius":3}]}),
+            path("child", 200., 20., "#30ee80")], &["moving", "edited", "capture"]);
+        host.step(None);
+        for step in 1..12 {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let moving = scene.row_of("moving").unwrap();
+            let edited = scene.row_of("edited").unwrap();
+            scene.write_row(moving, |fields| { fields.set("x", json!(10 + step)); }).unwrap();
+            scene.write_row(edited, |fields| {
+                fields.set("points", json!([
+                    {"type":"move","x":0,"y":0}, {"type":"line","x":70 + step,"y":0},
+                    {"type":"line","x":70,"y":60}, {"type":"line","x":0,"y":60}
+                ]));
+                fields.set("fills", json!([{"id":"fill","paint":{"type":"solid",
+                    "color":if step % 2 == 0 { "#ff7700" } else { "#00aa77" }}}]));
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let clock = scene.stamps().clock();
+            let (patched, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["moving".into(), "edited".into()], &mut host.caches).expect("node-local edits patch");
+            let written = host.index.take_written();
+            assert!(!written.placed.is_empty(), "unaffected geometry follows placement");
+            assert!(!written.replaced.is_empty(), "changed content is prepared again");
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            assert!(!units.by_node.contains_key("edited"),
+                "a plain content write retains its existing span ownership");
+            assert_eq!(units.outputs.iter().filter(|output| output.is_some()).count(), 1);
+            let (fresh, _) = crate::frame::build_coverage_plan(scene, 0, &host.opts).unwrap();
+            assert_eq!(format!("{patched:?}"), format!("{fresh:?}"), "step {step}");
+        }
+    }
+
+    #[test]
+    fn changed_capture_units_match_a_fresh_page() {
+        for (effect, initial_x) in ["layer-blur", "background-blur", "fade"].into_iter()
+            .flat_map(|effect| [0., 10_000.].map(move |x| (effect, x))) {
+            let mut unit = json!({"id":"unit","type":"group","x":initial_x,"children":["inside"]});
+            if effect == "fade" { unit["opacity"] = json!(0.6); }
+            else { unit["effects"] = json!([{"id":"e","type":effect,"radius":5}]); }
+            for mover in ["unit", "inside", "above"] {
+                let mut host = Host::new(vec![path("free", 10., 10., "#255fe8"),
+                    json!({"id":"above","type":"group","children":["unit"]}), unit.clone(),
+                    path("inside", 80., 80., "#ff7700")], &["free", "above"]);
+                host.step(None);
+                for step in 1..8 {
+                    let scene = &mut host.resident.state.as_mut().unwrap().scene;
+                    let row = scene.row_of(mover).unwrap();
+                    scene.write_row(row, |fields| {
+                        fields.set("x", json!(step));
+                        if mover == "unit" && effect == "fade" {
+                            fields.set("opacity", json!(0.2 + step as f64 * 0.05));
+                        }
+                        if mover == "inside" {
+                            fields.set("fills", json!([{"id":"fill","paint":{"type":"solid",
+                                "color":if step % 2 == 0 { "#ff7700" } else { "#00aa77" }}}]));
+                        }
+                    }).unwrap();
+                    scene.refresh_worlds();
+                    let hashes = node_hashes_for_scene(scene);
+                    let clock = scene.stamps().clock();
+                    let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                        vec![mover.into()], &mut host.caches).expect("affected unit patches");
+                    host.index.take_written();
+                    let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                        Some((&mut PlanCaches::default(), &hashes))).unwrap();
+                    assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "{effect}/{mover}/{step}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_nested_unit_writes_replay_like_cold_planning() {
+        let mut host = Host::new(vec![
+            path("free", 10., 10., "#255fe8"),
+            json!({"id":"outer","type":"group","opacity":0.7,"children":["inner","sibling"]}),
+            json!({"id":"inner","type":"group","children":["body"],
+                "effects":[{"id":"blur","type":"layer-blur","radius":3}]}),
+            path("body", 50., 60., "#ff7700"), path("sibling", 140., 50., "#00aa77"),
+            json!({"id":"stationary","type":"group","children":["still"],
+                "effects":[{"id":"blur","type":"layer-blur","radius":2}]}),
+            path("still", 200., 150., "#a070ff"),
+        ], &["free", "outer", "stationary"]);
+        let (first, _) = host.step(None);
+        let stationary = |plan: &CoveragePlan| plan.items.iter().find_map(|item| match item {
+            crate::seams::DrawItem::LayerBlurComposite { node_id, group, .. } if node_id == "stationary" => Some(group.clone()),
+            _ => None,
+        }).expect("stationary capture");
+        let kept = stationary(&first);
+        drop(first);
+        let mut random = 0x312d_ab87_u32;
+        for step in 0..48 {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            let id = ["outer", "inner", "body", "sibling"][((random >> 24) % 4) as usize];
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| {
+                fields.set("x", json!((random % 31) as f64));
+                fields.set("y", json!(((random >> 8) % 17) as f64));
+                if id == "outer" { fields.set("opacity", json!(0.2 + (random % 60) as f64 / 100.)); }
+                if id == "body" || id == "sibling" {
+                    fields.set("fills", json!([{"id":"fill","paint":{"type":"solid",
+                        "color":if random & 1 == 0 {"#e02060"} else {"#3070d0"}}}]));
+                }
+            }).unwrap();
+            let free = scene.row_of("free").unwrap();
+            scene.write_row(free, |fields| { fields.set("x", json!(10 + step)); }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let clock = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec![id.into(), "free".into()], &mut host.caches).expect("nested value writes patch");
+            host.index.take_written();
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}, {id}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+            assert!(Arc::ptr_eq(&kept, &stationary(&plan)), "unreached units keep their prepared contents");
+        }
+    }
+
+    #[test]
+    fn nested_output_records_patch_leaf_and_composition_inputs_without_range_replay() {
+        let mut host = Host::new(vec![
+            json!({"id":"outer","type":"group","opacity":0.7,"children":["left","blur"],
+                "effects":[{"id":"o","type":"layer-blur","radius":2}]}),
+            json!({"id":"blur","type":"group","children":["inner","right"],
+                "effects":[{"id":"b","type":"layer-blur","radius":3}]}),
+            json!({"id":"inner","type":"group","opacity":0.5,"children":["moving","sibling"]}),
+            path("left", 0., 0., "#2080cc"), path("moving", 25., 25., "#ee3080"),
+            path("sibling", 40., 40., "#cc8020"), path("right", 100., 100., "#80cc20"),
+            path("free", 150., 0., "#ffff00"),
+        ], &["outer", "free"]);
+        host.step(None);
+        for step in 0..24 {
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            assert!(units.outputs.iter().any(Option::is_some), "nested ordinary output certifies its graph");
+            let reused = units.segment.as_ref().unwrap().prepared.as_ref().unwrap().reused;
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let id = match step % 4 { 0 => "inner", 1 => "moving", 2 => "right", _ => "outer" };
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| {
+                if id == "inner" || id == "outer" { fields.set("opacity", json!(0.3 + step as f64 / 100.)); }
+                else {
+                    fields.set("x", json!(if id == "right" { 100. + step as f64 } else { 25. + step as f64 / 4. }));
+                    fields.set("fills", json!([{"id":"fill","paint":{"type":"solid",
+                        "color":if step % 2 == 0 {"#e02060"} else {"#3070d0"}}}]));
+                }
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec![id.into()], &mut host.caches).expect("nested value writes patch");
+            host.index.take_written();
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            assert_eq!(units.segment.as_ref().unwrap().prepared.as_ref().unwrap().reused, reused,
+                "step {step}: the range executor must not revisit unchanged children");
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}, {id}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+        }
+    }
+
+    #[test]
+    fn filtered_child_records_patch_without_reassembling_the_capture() {
+        let mut host = Host::new(vec![
+            json!({"id":"blur","type":"group","children":["left","moving","right"],
+                "effects":[{"id":"b","type":"layer-blur","radius":3}]}),
+            path("left", 0., 0., "#2080cc"), path("moving", 25., 25., "#ee3080"),
+            path("right", 100., 100., "#80cc20"), path("free", 150., 0., "#ffff00"),
+        ], &["blur", "free"]);
+        host.step(None);
+        for step in 0..16 {
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            assert!(units.outputs.iter().any(Option::is_some), "ordinary output must certify its child partition");
+            let reused = units.segment.as_ref().unwrap().prepared.as_ref().unwrap().reused;
+            let child_storage = host.index.entry.as_ref().unwrap().plan.items.iter().find_map(|item| match item {
+                crate::seams::DrawItem::LayerBlurComposite { group, .. } => Some(group.items.as_ptr()), _ => None,
+            }).unwrap();
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let id = if step % 3 == 0 { "right" } else { "moving" };
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| {
+                fields.set("x", json!(if id == "right" { 100. + step as f64 } else { 25. + step as f64 / 4. }));
+                fields.set("fills", json!([{"id":"fill","paint":{"type":"solid",
+                    "color":if step % 2 == 0 {"#e02060"} else {"#3070d0"}}}]));
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let clock = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec![id.into()], &mut host.caches).expect("filtered child writes patch");
+            let written = host.index.take_written();
+            assert_eq!(written.replaced.len(), 1);
+            assert!(matches!(written.replaced[0].1, crate::seams::DrawItem::Vacant), "nested updates retain their child storage");
+            assert_eq!(plan.items.iter().find_map(|item| match item {
+                crate::seams::DrawItem::LayerBlurComposite { group, .. } => Some(group.items.as_ptr()), _ => None,
+            }), Some(child_storage), "a sparse update must not clone the capture's child vector");
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            assert_eq!(units.segment.as_ref().unwrap().prepared.as_ref().unwrap().reused, reused,
+                "the range executor must not revisit unchanged children");
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+        }
+    }
+
+    #[test]
+    fn nested_composition_outputs_follow_only_their_source_paint() {
+        let mut host = Host::new(vec![
+            json!({"id":"outer","type":"group","opacity":0.7,"children":["inner","a"]}),
+            json!({"id":"inner","type":"group","opacity":0.5,"children":["b","c"]}),
+            path("a", 0., 0., "#2080cc"), path("b", 10., 10., "#ee3080"),
+            path("c", 5., 5., "#80cc20"), path("free", 50., 0., "#ffff00"),
+        ], &["outer", "free"]);
+        host.step(None);
+        for step in 0..16 {
+            let prior_reused = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref()
+                .unwrap().segment.as_ref().unwrap().prepared.as_ref().unwrap().reused;
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let id = if step % 2 == 0 { "inner" } else { "outer" };
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| fields.set("opacity", json!(0.2 + step as f64 / 40.))).unwrap();
+            let free = scene.row_of("free").unwrap();
+            scene.write_row(free, |fields| fields.set("x", json!(50 + step))).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let clock = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec![id.into(), "free".into()], &mut host.caches).expect("recorded paint outputs patch");
+            let written = host.index.take_written();
+            assert!(written.replaced.len() <= 3, "only the reached composition and free row write");
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            assert!(units.outputs.iter().any(Option::is_some));
+            assert_eq!(units.segment.as_ref().unwrap().prepared.as_ref().unwrap().reused, prior_reused,
+                "neither ancestor nor child composition paint visits prepared children");
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+        }
+    }
+
+    #[test]
+    fn moved_child_updates_only_its_outputs_and_enclosing_bounds() {
+        let mut nodes = vec![json!({"id":"outer","type":"group","opacity":0.7,"children":["inner"]}),
+            json!({"id":"inner","type":"group","opacity":0.5,"children":(0..64).map(|i| format!("p{i}")).collect::<Vec<_>>()})];
+        nodes.extend((0..64).map(|i| path(&format!("p{i}"), i as f64 * 2., 10., "#4080cc")));
+        let mut host = Host::new(nodes, &["outer"]);
+        host.step(None);
+        for step in 0..24 {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let id = if step % 2 == 0 { "p0" } else { "p63" };
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| {
+                fields.set("x", json!(20. + (step * 7 % 150) as f64 / 3.));
+                fields.set("y", json!(5. + (step * 11 % 90) as f64 / 7.));
+                fields.set("rotation", json!(step as f64 * 0.013));
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let at = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, at, at,
+                vec![id.into()], &mut host.caches).expect("recorded child placement patches");
+            let written = host.index.take_written();
+            assert!(written.replaced.len() <= 5, "one child and two enclosing compositions");
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            assert!(units.outputs.iter().flatten().any(|records| records.has_leaves()));
+            assert_eq!(units.segment.as_ref().unwrap().prepared.as_ref().unwrap().reused, 0,
+                "no sibling record is visited");
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+        }
+    }
+
+    #[test]
+    fn a_changed_page_lowering_input_reprepares_its_recorded_outputs() {
+        let mut host = Host::new(vec![
+            json!({"id":"fade","type":"group","opacity":0.5,"children":["a"]}),
+            path("a", 10., 10., "#ff3040"), path("outside", 120., 20., "#3080ff"),
+        ], &["fade", "outside"]);
+        host.step(None);
+        let scene = &mut host.resident.state.as_mut().unwrap().scene;
+        let row = scene.row_of("fade").unwrap();
+        scene.write_row(row, |fields| fields.set("opacity", json!(1.0))).unwrap();
+        scene.refresh_worlds();
+        let hashes = node_hashes_for_scene(scene);
+        let at = scene.stamps().clock();
+        let (plan, _) = host.index.patch(scene, &hashes, &host.opts, at, at,
+            vec!["fade".into()], &mut host.caches).expect("the derived input reaches recorded outputs");
+        let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+            Some((&mut PlanCaches::default(), &hashes))).unwrap();
+        assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+    }
+
+    #[test]
+    fn changing_unit_output_count_keeps_unrelated_output_addresses() {
+        let mut host = Host::new(vec![
+            path("before", 0., 0., "#3020ff"),
+            json!({"id":"fade","type":"group","opacity":0.5,"children":["nested"]}),
+            json!({"id":"nested","type":"group","children":["a","b"]}),
+            path("a", 10., 10., "#ff3040"), path("b", 20., 20., "#20ff80"),
+            path("after", 100., 0., "#3050ff"),
+            json!({"id":"standing","type":"group","opacity":0.7,"children":["last"]}),
+            path("last", 150., 20., "#ff7030"),
+        ], &["before", "fade", "after", "standing"]);
+        host.step(None);
+        let address = |plan: &CoveragePlan, id: &str| plan.items.iter().position(|item| drawitem_node_id(item) == Some(id)).unwrap();
+        let initial = &host.index.entry.as_ref().unwrap().plan;
+        let before = address(initial, "before");
+        let after = address(initial, "after");
+        let mut storage = None;
+        for step in 0..25 {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let id = match step % 5 { 0 | 2 => "fade", 1 | 3 => "nested", _ => "a" };
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| {
+                if id == "a" { fields.set("x", json!(step * 2)); }
+                else { fields.set("opacity", json!(if step % 5 == 0 || step % 5 == 3 { 1.0 } else { 0.4 })); }
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let at = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, at, at,
+                vec![id.into()], &mut host.caches).expect("output shape follows its retained source unit");
+            assert_eq!(address(&plan, "before"), before);
+            assert_eq!(address(&plan, "after"), after);
+            if step == 4 { storage = Some(plan.items.len()); }
+            if step > 4 { assert_eq!(Some(plan.items.len()), storage, "bounded storage reuses its slots"); }
+            let written = host.index.take_written();
+            assert!(!written.replaced.iter().any(|(slot, _)| *slot as usize == before || *slot as usize == after));
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+        }
+    }
+
+    #[test]
+    fn new_composition_owns_its_existing_source_interval() {
+        let mut host = Host::new(vec![
+            path("before", 0., 0., "#3020ff"),
+            json!({"id":"fade","type":"group","opacity":1.0,"children":["nested"]}),
+            json!({"id":"nested","type":"group","children":["a","b"]}),
+            path("a", 10., 10., "#ff3040"), path("b", 20., 20., "#20ff80"),
+            path("after", 100., 0., "#3050ff"),
+            json!({"id":"standing","type":"group","opacity":0.7,"children":["last"]}),
+            path("last", 150., 20., "#ff7030"),
+        ], &["before", "fade", "after", "standing"]);
+        host.step(None);
+        let address = |plan: &CoveragePlan, id: &str| plan.items.iter().position(|item| drawitem_node_id(item) == Some(id)).unwrap();
+        let initial = &host.index.entry.as_ref().unwrap().plan;
+        let before = address(initial, "before");
+        let after = address(initial, "after");
+        let mut storage = None;
+        for step in 0..25 {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let id = match step % 5 { 0 | 2 => "fade", 1 | 3 => "nested", _ => "a" };
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| {
+                if id == "a" { fields.set("x", json!(step * 2)); }
+                else { fields.set("opacity", json!(if step % 5 == 2 || step % 5 == 3 { 1.0 } else { 0.4 })); }
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let at = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, at, at,
+                vec![id.into()], &mut host.caches).expect("output shape follows its retained source unit");
+            assert_eq!(address(&plan, "before"), before);
+            assert_eq!(address(&plan, "after"), after);
+            if step == 4 { storage = Some(plan.items.len()); }
+            if step > 4 { assert_eq!(Some(plan.items.len()), storage, "bounded storage reuses its slots"); }
+            let written = host.index.take_written();
+            if step % 5 == 4 { assert_eq!(written.replaced.len(), 1,
+                "after the compositions end, one child still owns one output write"); }
+            assert!(!written.replaced.iter().any(|(slot, _)| *slot as usize == before || *slot as usize == after));
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+        }
+    }
+
+    #[test]
+    fn child_content_and_paint_reenter_only_their_emission_rows() {
+        let mut nodes = vec![json!({"id":"outer","type":"group","opacity":0.7,"children":["inner"]}),
+            json!({"id":"inner","type":"group","opacity":0.5,"children":(0..64).map(|i| format!("p{i}")).collect::<Vec<_>>()})];
+        nodes.extend((0..64).map(|i| path(&format!("p{i}"), i as f64 * 2., 10., "#4080cc")));
+        let mut host = Host::new(nodes, &["outer"]);
+        host.step(None);
+        for step in 0..24 {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let id = if step % 2 == 0 { "p0" } else { "p63" };
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| {
+                fields.set("x", json!(20. + (step * 7 % 150) as f64 / 3.));
+                fields.set("y", json!(5. + (step * 11 % 90) as f64 / 7.));
+                fields.set("rotation", json!(step as f64 * 0.013));
+                fields.set("opacity", json!(if step % 4 == 0 { 1.0 } else { 0.45 }));
+                if step % 3 == 0 {
+                    fields.set("fills", json!([{"id":"fill","paint":{"type":"solid","color":if step % 2 == 0 {"#ef3070"} else {"#20b0e0"}}}]));
+                } else if step % 3 == 1 {
+                    fields.set("points", json!([{"type":"move","x":0,"y":0},
+                        {"type":"line","x":30+step,"y":0},{"type":"line","x":70,"y":60},
+                        {"type":"line","x":0,"y":40+step}]));
+                }
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let at = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, at, at,
+                vec![id.into()], &mut host.caches).expect("recorded child content patches");
+            let written = host.index.take_written();
+            assert!(written.replaced.len() <= 5, "one child and two enclosing compositions");
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            assert!(units.outputs.iter().flatten().any(|records| records.has_leaves()));
+            assert_eq!(units.segment.as_ref().unwrap().prepared.as_ref().unwrap().reused, 0,
+                "no sibling record is visited");
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+        }
+    }
+
+    #[test]
+    fn captured_rows_reuse_output_and_follow_ordinary_placement_recipes() {
+        let mut nodes = vec![json!({"id":"fade","type":"group","opacity":0.6,"children":["wrapper"]}),
+            json!({"id":"wrapper","type":"group","children":(0..40).map(|i| format!("p{i}")).collect::<Vec<_>>()})];
+        nodes.extend((0..40).map(|i| path(&format!("p{i}"), i as f64, 0., "#4080cc")));
+        let mut host = Host::new(nodes, &["fade"]);
+        host.step(None);
+        let mut reused = 0;
+        for step in 0..12 {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let id = if step % 3 == 2 { "p7" } else { "fade" };
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| match step % 3 {
+                0 => fields.set("opacity", json!(0.3 + step as f64 / 50.)),
+                1 => { fields.set("scaleX", json!(1. + step as f64 / 100.)); fields.set("x", json!(step)); },
+                _ => fields.set("fills", json!([{"id":"f","paint":{"type":"solid","color":"#e03070"}}])),
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let clock = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec![id.into()], &mut host.caches).expect("captured row writes patch");
+            let written = host.index.take_written();
+            if step % 3 == 0 { assert!(written.replaced.len() < 10, "fade must retain child GPU records"); }
+            let prepared = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref()
+                .unwrap().segment.as_ref().unwrap().prepared.as_ref().unwrap();
+            if step % 3 != 1 { assert_eq!(prepared.reused, reused, "composition and child paint update outputs without visiting siblings"); }
+            reused = prepared.reused;
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+        }
+    }
+
+    #[test]
+    fn changing_outputs_patch_their_actual_mask_read_edges() {
+        let mut host = Host::new(vec![
+            json!({"id":"clip","type":"container","width":200,"height":160,"clipContent":true,
+                "children":["standing","body"]}),
+            path("standing", -5., 0., "#3050ff"),
+            json!({"id":"body","type":"container","x":20,"y":20,"width":70,"height":60}),
+        ], &["clip"]);
+        host.step(None);
+        let mut read_sets = std::collections::HashSet::new();
+        for step in 0..16 {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let id = if step % 4 < 2 { "body" } else { "clip" };
+            let row = scene.row_of(id).unwrap();
+            scene.write_row(row, |fields| {
+                fields.set("x", json!(match step % 4 { 0 => 150., 1 => 20., 2 => 5., _ => 0. }));
+                if id == "body" {
+                    fields.set("fills", if step % 4 == 0 {
+                        json!([{"id":"fill","paint":{"type":"solid","color":"#ff3040"}}])
+                    } else { json!([]) });
+                }
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let at = scene.stamps().clock();
+            let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, at, at,
+                vec![id.into()], &mut host.caches).expect("changed query reads patch their dependency edges");
+            let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+            let ui = units.by_node["body"];
+            read_sets.insert(units.segment.as_ref().unwrap().units[ui].mask_reads.clone());
+            let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}");
+            assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+        }
+        assert!(read_sets.len() > 1, "the oracle exercises a changed query read set");
+    }
+
+    #[test]
+    fn mask_source_writes_reprepare_recorded_consumers() {
+        for captured in [false, true] {
+            let mut owner = json!({"id":"owner","type":"group","children":["a","b","source-parent"]});
+            if captured { owner["opacity"] = json!(0.6); }
+            let mut host = Host::new(vec![owner,
+                json!({"id":"a","type":"group","clipMaskNodeId":"source","children":["pa"]}),
+                json!({"id":"b","type":"group","clipMaskNodeId":"source","children":["pb"]}),
+                json!({"id":"source-parent","type":"group","children":["source"]}),
+                path("pa", 0., 0., "#ff3060"), path("pb", 5., 5., "#3080ff"),
+                path("source", 0., 0., "#ffffff"),
+            ], &["owner"]);
+            host.step(None);
+            for step in 0..12 {
+                let id = if step % 3 == 0 { "source-parent" } else { "source" };
+                let scene = &mut host.resident.state.as_mut().unwrap().scene;
+                let row = scene.row_of(id).unwrap();
+                scene.write_row(row, |fields| { fields.set("x", json!(step + 1)); }).unwrap();
+                scene.refresh_worlds();
+                let hashes = node_hashes_for_scene(scene);
+                let clock = scene.stamps().clock();
+                assert!(host.index.place(scene, &host.opts, clock, clock, &[row], &mut host.caches).is_none(),
+                    "a source or its ancestor must reach the mask worklist instead of only placing body spans");
+                let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                    vec![id.into()], &mut host.caches).expect("mask source follows its recorded consumers");
+                let written = host.index.take_written();
+                assert!(written.masks_changed);
+                let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                    Some((&mut PlanCaches::default(), &hashes))).unwrap();
+                assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "captured={captured}, step={step}");
+                assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_mask_clock_admission_waits_for_the_prepared_capture() {
+        for uses_clock in [false, true] {
+            let mut host = Host::new(vec![
+                json!({"id":"clip","type":"group","clipMaskNodeId":"source","children":["body"]}),
+                json!({"id":"source","type":"group","children":["ink"]}),
+                path("body", 0., 0., "#ff3060"), path("ink", 0., 0., "#ffffff"),
+            ], &["clip", "source"]);
+            let (plan, _) = host.step(None);
+            assert!(plan_uses_shader_time(&plan), "an unprepared capture is conservative");
+            assert!(host.index.held(1, 1.0).is_none());
+            for mask in &plan.masks {
+                if let Some(rendered) = mask.image.as_ref().and_then(|image| image.rendered.as_ref()) {
+                    rendered.shader_clock.set(uses_clock).unwrap();
+                }
+            }
+            assert_eq!(plan_uses_shader_time(&plan), uses_clock);
+            assert_eq!(host.index.held(1, 1.0).is_some(), !uses_clock);
+        }
+    }
+
+    #[test]
+    fn source_subtree_paint_and_placement_match_fresh_masks() {
+        let mut host = Host::new(vec![
+            json!({"id":"clip","type":"group","clipMaskNodeId":"source","children":["body"]}),
+            json!({"id":"source","type":"group","children":["ink"]}),
+            path("body", 0., 0., "#ff3060"), path("ink", 0., 0., "#ffffff"),
+        ], &["clip", "source"]);
+        host.step(None);
+        for step in 0..12 {
+            // This CPU fixture has only solid paths; GPU integration establishes the same fact
+            // from the actual capture executor before admitting the next frame.
+            for mask in &host.index.entry.as_ref().unwrap().plan.masks {
+                if let Some(rendered) = mask.image.as_ref().and_then(|image| image.rendered.as_ref()) {
+                    let _ = rendered.shader_clock.set(false);
+                }
+            }
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let row = scene.row_of("ink").unwrap();
+            scene.write_row(row, |fields| {
+                fields.set("x", json!(step + 1));
+                fields.set("fills", json!([{"id":"fill","paint":{"type":"solid","color":if step % 2 == 0 {"#ffffff80"} else {"#ffffffc0"}}}]));
+            }).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let clock = scene.stamps().clock();
+            let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["ink".into()], &mut host.caches).expect("source subtree input patches");
+            host.index.take_written();
+            let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "step {step}");
+            assert_eq!(plan.masks, fresh.masks);
+        }
+    }
+
+    #[test]
+    fn changing_a_mask_source_binding_reseeds_dependencies_even_when_coverage_is_equal() {
+        let mut host = Host::new(vec![
+            json!({"id":"fade","type":"group","opacity":0.6,"children":["a","b","c","m1","m2"]}),
+            json!({"id":"a","type":"group","clipMaskNodeId":"m1","children":["pa"]}),
+            json!({"id":"b","type":"group","clipMaskNodeId":"m2","children":["pb"]}),
+            json!({"id":"c","type":"group","clipMaskNodeId":"m1","children":["pc"]}),
+            path("pa", 0., 0., "#ff3060"), path("pb", 5., 5., "#3080ff"), path("pc", 10., 10., "#30dd60"),
+            path("m1", 0., 0., "#ffffff"), path("m2", 0., 0., "#ffffff"),
+        ], &["fade"]);
+        host.step(None);
+        let scene = &mut host.resident.state.as_mut().unwrap().scene;
+        let row = scene.row_of("a").unwrap();
+        scene.write_row(row, |fields| fields.set("clipMaskNodeId", json!("m2"))).unwrap();
+        scene.refresh_worlds();
+        let hashes = node_hashes_for_scene(scene);
+        let clock = scene.stamps().clock();
+        assert!(host.index.patch(scene, &hashes, &host.opts, clock, clock,
+            vec!["a".into()], &mut host.caches).is_none(), "changed source membership requires a fresh index");
+    }
+
+    #[test]
+    fn masked_capture_sources_patch_without_replaying_stationary_children() {
+        for (outer_mask, nested) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut root = json!({"id":"capture","type":"group","children":["clip"],
+                "effects":[{"id":"blur","type":"layer-blur","radius":3}]});
+            let mut clip = json!({"id":"clip","type":"group","children":["left","body","right"]});
+            if nested { clip["effects"] = json!([{"id":"inner-blur","type":"layer-blur","radius":2}]); }
+            if outer_mask { root["clipMaskNodeId"] = json!("mask"); }
+            else { clip["clipMaskNodeId"] = json!("mask"); }
+            let prefix = json!({"id":"prefix","type":"container","width":100,"height":100,
+                "clipContent":true,"cornerRadius":10,"children":["prefix-body"]});
+            let mut host = Host::new(vec![prefix, path("prefix-body", 0., 0., "#cccccc"), root, clip, path("mask", 0., 0., "#ffffff"),
+                path("left", 0., 0., "#3090ff"), path("body", 5., 10., "#ff3060"),
+                path("right", 120., 100., "#30ee80")], &["prefix","capture","mask"]);
+            host.step(None);
+            for step in 0..12 {
+                let id = if step == 5 { "mask" } else { "body" };
+                let (before, storage) = {
+                    let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+                    let ui = units.by_node["capture"];
+                    assert!(units.outputs[ui].is_some(), "masked capture records its output graph: outer={outer_mask}, nested={nested}, step={step}");
+                    (units.segment.as_ref().unwrap().prepared.as_ref().unwrap().reused,
+                        units.outputs[ui].as_ref().unwrap().leaf_storage())
+                };
+                let scene = &mut host.resident.state.as_mut().unwrap().scene;
+                scene.write_row(scene.row_of(id).unwrap(), |fields| {
+                    fields.set("x", json!(5 + step));
+                    if id == "mask" {
+                        fields.set("points", json!([{"type":"move","x":0,"y":0},{"type":"line","x":65,"y":0},
+                            {"type":"line","x":65,"y":60},{"type":"line","x":0,"y":60}]));
+                    }
+                    if step % 3 == 0 || id == "mask" { fields.set("fills", json!([{"id":"fill","paint":{"type":"solid","color":"#60bbf0"}}])); }
+                }).unwrap();
+                scene.refresh_worlds();
+                let hashes = node_hashes_for_scene(scene); let clock = scene.stamps().clock();
+                let (plan, warnings) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                    vec![id.into()], &mut host.caches).expect("masked source patch");
+                host.index.take_written();
+                let (fresh, fresh_warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                    Some((&mut PlanCaches::default(), &hashes))).unwrap();
+                assert_eq!(format!("{plan:?}"), format!("{fresh:?}"), "outer_mask={outer_mask}, nested={nested}, step={step}");
+                assert_eq!(plan.masks, fresh.masks);
+                assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
+                if id == "mask" {
+                    let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+                    assert_eq!(storage, units.outputs[units.by_node["capture"]].as_ref().unwrap().leaf_storage(),
+                        "new mask content with unchanged child reads must retain the reverse index");
+                }
+                if id == "body" {
+                    let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+                    assert_eq!(before, units.segment.as_ref().unwrap().prepared.as_ref().unwrap().reused,
+                        "a changed child must not replay stationary rows");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unit_mask_inputs_include_reads_inside_captures() {
+        let mut host = Host::new(vec![
+            json!({"id":"capture","type":"group","children":["clip"],
+                "effects":[{"id":"blur","type":"layer-blur","radius":3}]}),
+            json!({"id":"clip","type":"container","width":180,"height":140,
+                "clipContent":true,"cornerRadius":18,"children":["body"]}),
+            path("body", 5., 10., "#ff3060"),
+        ], &["capture"]);
+        let (plan, _) = host.step(None);
+        assert!(!plan.masks.is_empty());
+        let units = host.index.entry.as_ref().unwrap().patchable.as_ref().unwrap().units.as_ref().unwrap();
+        let seg = units.segment.as_ref().unwrap();
+        let ui = units.by_node["capture"];
+        let unit = &seg.units[ui];
+        assert!(!unit.mask_reads.is_empty(), "capture records the mask reads of its contents");
+        for &mi in &unit.mask_reads {
+            assert!(units.mask_users[mi].contains(&ui));
+        }
+        assert!(plan.items[seg.prefix + unit.item_start..seg.prefix + unit.item_start + unit.item_len]
+            .iter().all(|item| crate::camera_slot::item_mask_id(item).is_none()),
+            "the nested mask is invisible to a top-level draw-item scan");
+    }
+
+    #[test]
+    fn moving_clip_updates_mask_values_and_all_recorded_consumers() {
+        let mut host = Host::new(vec![
+            json!({"id":"moving","type":"group","children":["clip"]}),
+            json!({"id":"clip","type":"container","width":210,"height":160,"clipContent":true,
+                "cornerRadius":18,"children":["fade","plain","nested"]}),
+            json!({"id":"fade","type":"group","opacity":0.6,"children":["body"]}),
+            path("body", 5., 10., "#ff3060"), path("plain", 150., 60., "#3080ff"),
+            json!({"id":"nested","type":"container","x":30,"y":40,"width":130,"height":100,
+                "clipContent":true,"cornerRadius":12,"children":["fade2"]}),
+            json!({"id":"fade2","type":"group","opacity":0.7,"children":["body2"]}),
+            path("body2", 60., 15., "#30dd60"),
+        ], &["moving"]);
+        let (initial, _) = host.step(None);
+        assert!(!initial.masks.is_empty());
+        drop(initial);
+        for x in [5., 17., -10., 0., 8.5] {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let row = scene.row_of("moving").unwrap();
+            scene.write_row(row, |fields| fields.set("x", json!(x))).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let clock = scene.stamps().clock();
+            let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["moving".into()], &mut host.caches).expect("clip move patches its consumers");
+            assert!(host.index.take_written().masks_changed);
+            let (fresh, warnings) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+        }
+    }
+
+    #[test]
+    fn composition_paint_does_not_invalidate_unchanged_mask_sources() {
+        let mut host = Host::new(vec![
+            json!({"id":"fade","type":"group","opacity":0.6,"children":["clip"]}),
+            json!({"id":"clip","type":"group","children":["mask","body"],"clipMaskNodeId":"mask"}),
+            path("mask", 10., 15., "#ffffff"), path("body", 0., 0., "#3070e0"),
+        ], &["fade"]);
+        host.step(None);
+        for opacity in [0.3, 0.7, 0.4] {
+            let scene = &mut host.resident.state.as_mut().unwrap().scene;
+            let row = scene.row_of("fade").unwrap();
+            scene.write_row(row, |fields| fields.set("opacity", json!(opacity))).unwrap();
+            scene.refresh_worlds();
+            let hashes = node_hashes_for_scene(scene);
+            let clock = scene.stamps().clock();
+            let (plan, _) = host.index.patch(scene, &hashes, &host.opts, clock, clock,
+                vec!["fade".into()], &mut host.caches).expect("composition paint does not dirty mask contents");
+            host.index.take_written();
+            let (fresh, _) = crate::frame::build_coverage_plan_cached(scene, 0, &host.opts,
+                Some((&mut PlanCaches::default(), &hashes))).unwrap();
+            assert_eq!(format!("{plan:?}"), format!("{fresh:?}"));
+        }
+    }
+
+    #[test]
     fn shifted_span_cannot_write_another_nodes_items() {
         for scale in [1., 4.] {
             let mut host = Host::new(vec![path("free", 10., 10., "#255fe8"),
@@ -14551,8 +16378,9 @@ mod unit_placement_tests {
                             assert!(!written.replaced.is_empty(), "scale must exercise node preparation");
                             assert_eq!(format!("{plan:?}"), host.fresh());
                         } else {
-                            assert!(patched.is_none(), "{mover} feeds a unit and must plan whole");
-                            break;
+                            if let Some((plan, _)) = patched {
+                                assert_eq!(format!("{plan:?}"), host.fresh());
+                            } else { break; }
                         }
                     }
                 }

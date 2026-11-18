@@ -17,9 +17,6 @@ serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 png = "0.18"
-# The striped zlib IDAT (encode.rs `zlib_png_rows`): raw deflate per stripe, and the stripes' Adler-32s.
-flate2 = { version = "1", features = ["zlib-rs"] }
-simd-adler32 = "0.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
 rustc-hash = "2"
@@ -42,7 +39,3 @@ unicode-segmentation = "1"
 [features]
 default = ["native-io"]
 native-io = ["moda-assets/native-io"]
-
-[lints.rust]
-# Moda's `jpeg-parity` feature (mozjpeg's C build) is not ported; its cfg stays declared.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("jpeg-parity"))'] }

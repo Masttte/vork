@@ -25,7 +25,14 @@ pub(crate) struct Native {
     pub sampled_error: Option<String>,
     pub modules: Vec<(String, String)>,
     pub includes: Vec<PathBuf>,
+    /// Every installed view, including render images, has opaque film.
+    pub opaque_views: bool,
     pub homogeneous: bool,
+    /// Analytic height-world attenuation may factor only constant finite media.
+    pub finite_homogeneous: bool,
+    /// The scene has dense grids and no sparse one, so no program in its
+    /// kernel can reach the sparse accessor and std/grid compiles without it.
+    pub dense_grids_only: bool,
     pub time_dependent: bool,
     /// All installed medium instances prove zero scattering for every input pose.
     pub scattering_free: bool,

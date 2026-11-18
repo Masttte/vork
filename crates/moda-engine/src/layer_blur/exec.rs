@@ -83,12 +83,21 @@ pub fn build_capture_plan(node_id: &str, group: &LayerBlurGroup) -> CoveragePlan
     // Nested filtered descendants are rendered by the same executor before this
     // group's filter. The owned capture tree follows the scene hierarchy.
     let [rx, ry, rw, rh] = group.region_canvas;
+    let local = super::translation::eligible(group);
+    let mut items = group.items.clone();
+    if local {
+        for item in &mut items {
+            if let crate::seams::DrawItem::Body { instance, .. } = item {
+                **instance = super::translation::instance(instance, group.region_canvas);
+            }
+        }
+    }
     CoveragePlan {
         page_id: format!("layer-blur:{node_id}"),
         page_index: 0,
         width_px: group.width_px,
         height_px: group.height_px,
-        page_size: [rw, rh],
+        page_size: if local { [group.width_px as f64, group.height_px as f64] } else { [rw, rh] },
         // The capture's canvas→px scale (informational; the projection derives
         // solely from page_size × target dims).
         scale: group.width_px as f64 / rw.max(1e-6),
@@ -108,8 +117,9 @@ pub fn build_capture_plan(node_id: &str, group: &LayerBlurGroup) -> CoveragePlan
         } else {
             1
         },
-        camera: [rx, ry],
-        items: group.items.clone(),
+        camera: if local { [0.0, 0.0] } else { [rx, ry] },
+        items,
+        item_order: None,
         masks: group.masks.clone(),
         camera_frame: None,
         clear_rgba: Some([0.0, 0.0, 0.0, 0.0]),

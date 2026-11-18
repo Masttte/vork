@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Run Cargo with a temporary build-only Slang proxy; ship the original toolchain."""
+import argparse
+import contextlib
+import hashlib
+import importlib.util
+import re
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+from shader_compiler import toolchain, toolchain_stamp
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument('--cache', type=Path, required=True)
+p.add_argument('command', nargs=argparse.REMAINDER)
+a = p.parse_args()
+command = a.command[1:] if a.command[:1] == ['--'] else a.command
+if not command:
+    p.error('supply a build command after --')
+selected = os.environ.get('VORK_SLANGC') or shutil.which('slangc')
+if not selected:
+    p.error('set VORK_SLANGC to the pinned compiler (docs/BUILD.md)')
+compiler = Path(shutil.which(selected) or selected).resolve(strict=True)
+if not compiler.is_file():
+    p.error('VORK_SLANGC must name an executable file')
+root = compiler.parent.parent
+scripts = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('slang_cache', scripts/'slang-cache.py')
+cache = importlib.util.module_from_spec(spec); spec.loader.exec_module(cache)
+a.cache = a.cache.resolve()
+a.cache.mkdir(parents=True, exist_ok=True)
+before = toolchain_stamp(compiler)
+identity = toolchain(compiler)
+if before != toolchain_stamp(compiler):
+    p.error('compiler changed while fingerprinting')
+proxy_key = hashlib.sha256((identity + (scripts/'slang_cache_launcher.rs').read_text()).encode()).hexdigest()
+
+@contextlib.contextmanager
+def compiler_proxy():
+    # Cargo tracks VORK_SLANGC. A random path would invalidate every no-op build.
+    # Serialize users of this short-lived layout; only portable entries persist.
+    with cache.locked(a.cache/'proxy.lock'):
+        proxy = a.cache/'.proxy'/proxy_key
+        if proxy.parent.exists():
+            shutil.rmtree(proxy.parent)
+        proxy.mkdir(parents=True)
+        try:
+            yield proxy
+        finally:
+            shutil.rmtree(proxy.parent)
+
+with compiler_proxy() as proxy:
+    # Compiler discovery and the filesystem companion need the complete layout.
+    # Copy it so even link-count/ctime changes cannot disturb another build's
+    # compiler admission memo. The installed toolchain stays untouched.
+    for tree in ('bin', 'lib', 'include'):
+        if (root / tree).exists():
+            shutil.copytree(root / tree, proxy / tree, symlinks=True)
+    wrapped = proxy / 'bin' / compiler.name
+    wrapped.unlink()
+    subprocess.run(['rustc', '--edition=2024', '-O', str(scripts/'slang_cache_launcher.rs'), '-o', str(wrapped)], check=True)
+    if before != toolchain_stamp(compiler):
+        p.error('compiler changed while fingerprinting')
+    memo = proxy / 'compiler-identity.json'
+    memo.write_text(json.dumps(dict(digest=identity, stamp=before)))
+    env = dict(os.environ, VORK_SLANGC=str(wrapped), VORK_BUILD_REAL_SLANGC=str(compiler),
+               VORK_BUILD_PYTHON=sys.executable, VORK_BUILD_CACHE_SCRIPT=str(scripts/'slang-cache.py'),
+               VORK_SLANG_BUILD_CACHE=str(a.cache.resolve()),
+               VORK_BUILD_COMPILER_IDENTITY_FILE=str(memo))
+    events = a.cache.resolve() / 'events.jsonl'
+    offset = events.stat().st_size if events.exists() else 0
+    started = time.monotonic()
+    result = subprocess.run(command, env=env)
+    counts = {'hit': 0, 'miss': 0}
+    if events.exists():
+        with events.open() as log:
+            log.seek(offset)
+            for line in log:
+                row = json.loads(line)
+                counts[row['event']] += 1
+    print(f'fixed shader cache: {counts}, build {time.monotonic() - started:.3f}s', flush=True)
+# Bound build-only cache inventories; per-key locks also protect concurrent
+# producers. Never remove lock files (waiters must keep the same inode).
+if result.returncode == 0 and a.cache.exists():
+    entries = []
+    for manifest in a.cache.glob('*/manifest.json'):
+        if re.fullmatch('[0-9a-f]{64}', manifest.parent.name):
+            try:
+                receipt = json.loads(manifest.read_text())
+                if not isinstance(receipt, dict) or receipt.get('key') != manifest.parent.name or not isinstance(receipt.get('files'), list):
+                    continue
+                entries.append((manifest.stat().st_mtime_ns, manifest.parent,
+                                sum(p.stat().st_size for p in manifest.parent.iterdir() if p.is_file())))
+            except (OSError, ValueError):
+                continue
+    total = sum(size for _, _, size in entries)
+    for age, entry, size in sorted(entries):
+        if total <= 2 * 1024**3:
+            break
+        with cache.locked(a.cache/(entry.name+'.lock')):
+            manifest = entry/'manifest.json'
+            if manifest.exists() and manifest.stat().st_mtime_ns == age:
+                shutil.rmtree(entry); total -= size
+raise SystemExit(result.returncode)

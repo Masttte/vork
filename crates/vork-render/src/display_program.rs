@@ -1,6 +1,7 @@
 //! Display programs execute once per output pixel. Scene-linear outputs bypass this stage.
 use super::*;
 use std::fmt::Write;
+use std::sync::{Arc, LazyLock, OnceLock};
 use vork_scene::v2;
 use vork_slang::{Compiler, DisplayProgram};
 
@@ -32,12 +33,44 @@ pub(crate) struct Prepared {
     animation: Option<programs::InputAnimation>,
     sources: Vec<ImageSource>,
 }
-/// One `Image` input as linear RGBA32F texels.
+/// One image input: bundled half-float samples or full-precision authored pixels.
 struct ImageData {
     width: u32,
     height: u32,
-    texels: Vec<f32>,
+    texels: Texels,
 }
+enum Texels {
+    Half(Vec<u16>),
+    Float(Vec<f32>),
+    Cached { payload: disk_cache::ReadOnlyPayload, half: bool },
+}
+enum Upload<'a> {
+    Resident(&'a [u8]),
+    Mapped(disk_cache::MappedPayload),
+}
+impl std::ops::Deref for Upload<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self { Self::Resident(bytes) => bytes, Self::Mapped(bytes) => bytes }
+    }
+}
+impl Texels {
+    fn bytes(&self) -> Result<Upload<'_>> {
+        Ok(match self {
+            Self::Half(values) => Upload::Resident(bytemuck::cast_slice(values)),
+            Self::Float(values) => Upload::Resident(bytemuck::cast_slice(values)),
+            Self::Cached { payload, .. } => Upload::Mapped(payload.map()?),
+        })
+    }
+    fn format(&self) -> wgpu::TextureFormat {
+        match self { Self::Half(_) | Self::Cached { half: true, .. } => wgpu::TextureFormat::Rgba16Float,
+            _ => wgpu::TextureFormat::Rgba32Float }
+    }
+    fn bytes_per_pixel(&self) -> u32 {
+        if self.format() == wgpu::TextureFormat::Rgba16Float { 8 } else { 16 }
+    }
+}
+
 enum ImageSource {
     /// A bundled program's library data (OpenEXR bytes).
     Library(&'static [u8]),
@@ -280,6 +313,57 @@ mod tests {
     }
 
     #[test]
+    fn embedded_images_validate_without_pixels_and_share_exact_decodes() -> Result<()> {
+        for table in EMBEDDED_IMAGES.iter() {
+            let source = ImageSource::Library(table.bytes);
+            let validated = source.install_data(16384, true)?;
+            assert!(validated.texels.bytes()?.is_empty(), "no-op installs must not materialize library pixels");
+            // Concurrent installs, and later installs after all callers drop their
+            // handles, must use the very same allocation.
+            let images = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| source.decode(16384))).collect();
+                handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Result<Vec<_>>>()
+            })?;
+            assert!(images.iter().all(|image| Arc::ptr_eq(image, &images[0])));
+            assert_eq!((validated.width, validated.height), (images[0].width, images[0].height));
+            let original = texture_source::decode_format(image::ImageFormat::OpenExr, table.bytes, 16384)?.to_rgba32f();
+            let pixels = images[0].texels.bytes()?;
+            if images[0].texels.format() == wgpu::TextureFormat::Rgba16Float {
+                let texels: &[u16] = bytemuck::cast_slice(&pixels);
+                assert_eq!(texels.len(), original.as_raw().len());
+                for (half, original) in texels.iter().zip(original.as_raw()) {
+                    assert_eq!(half::f16::from_bits(*half).to_f32().to_bits(), original.to_bits());
+                }
+            } else {
+                assert_eq!(&*pixels, bytemuck::cast_slice::<f32, u8>(original.as_raw()));
+            }
+            drop(pixels);
+            let held = Arc::clone(&images[0]);
+            drop(images);
+            assert!(Arc::ptr_eq(&source.decode(16384)?, &held));
+            // A cache hit still checks the current device limit, as does check.
+            assert!(source.decode(1).is_err());
+            assert!(source.install_data(1, true).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn no_op_display_install_still_rejects_corrupt_file_pixels() -> Result<()> {
+        let bytes = EMBEDDED_IMAGES[0].bytes;
+        // Retain the header and chunk offsets, truncate the compressed payload.
+        let bytes = bytes[..bytes.len() / 2].to_vec();
+        texture_source::header(image::ImageFormat::OpenExr, &bytes, 16384)?;
+        let source = ImageSource::File { image: Some("authored_lut".into()), path: "authored.exr".into(),
+            bytes, srgb: false, color_space: Some(v2::ColorSpace::NonColor) };
+        for no_pixels in [true, false] {
+            let error = source.install_data(16384, no_pixels).err().context("corrupt pixels must fail")?;
+            assert!(format!("{error:#}").contains("authored.exr"), "{error:#}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn filmic_uses_companion_file_and_reports_expected_path() -> Result<()> {
         let root = std::env::temp_dir().join(format!("vork-filmic-data-{}", std::process::id()));
         let executable = root.join("vork");
@@ -324,14 +408,98 @@ mod tests {
     }
 }
 
+// Only immutable embedded library data is shared. Authored and companion files still
+// decode on every installation so corrupt pixels retain their diagnostics.
+struct EmbeddedImage {
+    bytes: &'static [u8],
+    decoded: OnceLock<std::result::Result<Arc<ImageData>, String>>,
+}
+static EMBEDDED_IMAGES: LazyLock<Vec<EmbeddedImage>> = LazyLock::new(|| {
+    vork_scene::libraries::LIBRARIES.iter().flat_map(|library| library.images).filter_map(|data| {
+        match data.image {
+            vork_scene::libraries::ProgramImage::Embedded(bytes) => Some(EmbeddedImage { bytes, decoded: OnceLock::new() }),
+            _ => None,
+        }
+    }).collect()
+});
+
+/// The bundled tables have coincident data/display windows at the origin. Decode
+/// directly into the shared upload allocation at the source's precision. Half-float
+/// textures promote the sRGB table's unchanged samples to f32 at load, halving
+/// retained texels and staging. The P3/HDR tables and authored images stay f32.
+fn decode_embedded(bytes: &[u8]) -> Result<ImageData> {
+    crate::failure::contain("the image decoder", || {
+        use exr::prelude::*;
+        let metadata = exr::meta::MetaData::read_from_buffered(bytes, false)?;
+        let header = metadata.headers.first().context("embedded display image header")?;
+        ensure!(metadata.headers.len() == 1 && header.shared_attributes.display_window.position == Vec2(0, 0)
+            && header.own_attributes.layer_position == Vec2(0, 0)
+            && header.shared_attributes.display_window.size == header.layer_size,
+            "embedded display image must have one layer with coincident windows at the origin");
+        let half = header.channels.list.iter().all(|channel| channel.sample_type == SampleType::F16);
+        let width = header.layer_size.width() as u32;
+        let height = header.layer_size.height() as u32;
+        let expected = width as usize * height as usize * if half { 8 } else { 16 };
+        let path = disk_cache::Store::host().path("decoded-display-table", 1, blake3::hash(bytes));
+        if let Some(payload) = disk_cache::open_payload(&path, expected) {
+            return Ok(ImageData { width, height, texels: Texels::Cached { payload, half } });
+        }
+        let image = read().no_deep_data().largest_resolution_level().rgba_channels(
+            |size, _| ImageData { width: size.width() as u32, height: size.height() as u32,
+                texels: if half { Texels::Half(vec![0; size.area() * 4]) } else { Texels::Float(vec![0.; size.area() * 4]) } },
+            |image: &mut ImageData, position, (r, g, b, a): (Sample, Sample, Sample, Sample)| {
+                let index = position.flat_index_for_size(Vec2(image.width as usize, image.height as usize)) * 4;
+                match &mut image.texels {
+                    Texels::Half(texels) => texels[index..index + 4].copy_from_slice(&[r.to_f16().to_bits(), g.to_f16().to_bits(), b.to_f16().to_bits(), a.to_f16().to_bits()]),
+                    Texels::Float(texels) => texels[index..index + 4].copy_from_slice(&[r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]),
+                    Texels::Cached { .. } => unreachable!("decoding writes resident texels"),
+                }
+            },
+        ).first_valid_layer().all_attributes().from_buffered(std::io::Cursor::new(bytes))?;
+        ensure!(image.attributes.display_window.position == Vec2(0, 0)
+            && image.layer_data.attributes.layer_position == Vec2(0, 0)
+            && image.attributes.display_window.size == image.layer_data.size,
+            "embedded display image must have coincident windows at the origin");
+        let mut decoded = image.layer_data.channel_data.pixels;
+        let saved = disk_cache::write_entry(&path, &decoded.texels.bytes()?).unwrap_or(false);
+        if saved && let Some(payload) = disk_cache::open_payload(&path, expected) {
+            // Verification used bounded scratch; replacing the Vec drops it before
+            // the first upload maps any file pages. No second pixel copy remains.
+            decoded.texels = Texels::Cached { payload, half };
+        }
+        Ok(decoded)
+    })
+}
+
 impl ImageSource {
-    /// Decode once at installation; images remain resident for per-pixel evaluation.
-    fn decode(&self, max_side: u32) -> Result<ImageData> {
+    /// Validate embedded dimensions without materializing trusted library pixels on
+    /// the no-op backend (check, check --shaders and release shader preparation).
+    /// File images still decode fully, including their compressed pixel payloads.
+    fn install_data(&self, max_side: u32, no_pixels: bool) -> Result<Arc<ImageData>> {
+        if no_pixels && let Self::Library(bytes) = self {
+            let (width, height, _) = texture_source::header(image::ImageFormat::OpenExr, bytes, max_side)?;
+            return Ok(Arc::new(ImageData { width, height, texels: Texels::Float(Vec::new()) }));
+        }
+        self.decode(max_side)
+    }
+
+    /// Each embedded table decodes at most once per process, including concurrent
+    /// installations. Callers borrow its texels through Arc; there is no pixel clone.
+    fn decode(&self, max_side: u32) -> Result<Arc<ImageData>> {
+        if let Self::Library(bytes) = self {
+            // Enforce this device's bounds even when a larger device filled the cell.
+            texture_source::header(image::ImageFormat::OpenExr, bytes, max_side)?;
+            let table = EMBEDDED_IMAGES.iter().find(|table| std::ptr::eq(table.bytes.as_ptr(), bytes.as_ptr()))
+                .context("unknown embedded display image")?;
+            return table.decoded.get_or_init(|| self.decode_pixels(max_side).map(Arc::new).map_err(|error| format!("{error:#}")))
+                .as_ref().map(Arc::clone).map_err(|error| anyhow::anyhow!("{error}"));
+        }
+        self.decode_pixels(max_side).map(Arc::new)
+    }
+
+    fn decode_pixels(&self, max_side: u32) -> Result<ImageData> {
         let (decoded, srgb) = match self {
-            Self::Library(bytes) => (
-                crate::texture_source::decode_format(image::ImageFormat::OpenExr, bytes, max_side)?,
-                false,
-            ),
+            Self::Library(bytes) => return decode_embedded(bytes),
             Self::File { image, path, bytes, srgb, color_space } => (
                 crate::texture_source::decode_color(path, bytes, max_side, *color_space, crate::texture_source::upload(*srgb))
                     .map_err(|error| crate::texture_source::for_image(error, image.as_deref().unwrap_or_default()))
@@ -339,7 +507,7 @@ impl ImageSource {
                 *srgb,
             ),
         };
-        let rgba = decoded.to_rgba32f();
+        let rgba = decoded.into_rgba32f();
         let (width, height) = rgba.dimensions();
         let mut texels = rgba.into_raw();
         if srgb {
@@ -352,7 +520,7 @@ impl ImageSource {
         Ok(ImageData {
             width,
             height,
-            texels,
+            texels: Texels::Float(texels),
         })
     }
 }
@@ -370,7 +538,7 @@ impl Prepared {
         let decoded = self
             .sources
             .iter()
-            .map(|source| source.decode(d.limits().max_texture_dimension_2d))
+            .map(|source| source.install_data(d.limits().max_texture_dimension_2d, r.release_preparation))
             .collect::<Result<Vec<_>>>()
             .context("composition.view: display program image")?;
         let mut shader = self.program.as_ref().map(|program| program.wgsl.clone()).unwrap_or_default();
@@ -608,37 +776,40 @@ fn encode_view(result:vec4<f32>,pixel:vec2<u32>,depth:f32,dither:f32)->vec3<f32>
         );
         let images = decoded
             .iter()
-            .map(|image| {
+            .map(|image| -> Result<_> {
                 let texture = crate::gpu_memory::texture(
                     d,
                     &wgpu::TextureDescriptor {
                         label: Some("display program image"),
                         size: wgpu::Extent3d {
-                            width: image.width,
-                            height: image.height,
+                            width: if r.release_preparation { 1 } else { image.width },
+                            height: if r.release_preparation { 1 } else { image.height },
                             depth_or_array_layers: 1,
                         },
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba32Float,
+                        format: image.texels.format(),
                         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                         view_formats: &[],
                     },
                 );
-                r.queue.write_texture(
-                    texture.as_image_copy(),
-                    bytemuck::cast_slice(&image.texels),
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(image.width * 16),
-                        rows_per_image: Some(image.height),
-                    },
-                    texture.size(),
-                );
-                texture.create_view(&Default::default())
+                if !r.release_preparation {
+                    let pixels = image.texels.bytes()?;
+                    r.queue.write_texture(
+                        texture.as_image_copy(),
+                        &pixels,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(image.width * image.texels.bytes_per_pixel()),
+                            rows_per_image: Some(image.height),
+                        },
+                        texture.size(),
+                    );
+                }
+                Ok(texture.create_view(&Default::default()))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Stage {
             pipeline,
             words,

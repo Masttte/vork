@@ -630,13 +630,12 @@ textures and buffers beside them; keep those files together.
 
 Setup builds the prebuilt path engine (the same few pipelines for every scene) and warms the
 `vork init` starter at the default `std/final` profile on your GPU, with a ten-minute limit.
-Without setup, a cold path render compiles its scene kernel before the picture, then exits;
-it does not build the shared engine afterward. On an NVIDIA L4, path-glass and path-many-lights
-at `std/path` took about 50–60 s to picture and exit, and about 1 s on immediate repeat at authored
-resolution. Repeats reuse the saved scene kernel.
-With a warm engine, supported scenes draw with it while their own kernel compiles in a detached
+Without setup, nothing breaks. On an NVIDIA L4, a first path render takes about 8 s when vork
+ships that scene's shaders and about 40 s when it has to compile them; repeats take 1 to 3 s.
+It does not build the shared engine afterward.
+With a warm engine, supported scenes draw with it while any needed scene kernel compiles in a detached
 background process; delivery and exit do not wait for it. Scenes the engine cannot draw
-(authored programs or a participating medium, say) compile their own kernel before the first frame.
+(authored programs or a participating medium, say) use their own scene kernel.
 Use `vork setup --skip-warmup` to check tools only; add `--verbose` for raw encoder probe diagnostics. You can
 interrupt setup safely: completed cache entries survive and remaining pipelines
 compile when needed. Run setup again to continue, or use `vork setup --all` for

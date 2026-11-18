@@ -9,15 +9,17 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY vendor ./vendor
 COPY dist ./dist
-COPY scripts/install-slang ./scripts/install-slang
+COPY scripts/install-slang scripts/slang-cache.py scripts/shader_compiler.py scripts/build-with-shader-cache scripts/slang_cache_launcher.rs ./scripts/
 RUN python3 scripts/install-slang /opt/slang
 ENV VORK_SLANGC=/opt/slang/bin/slangc
 COPY docs ./docs
 COPY examples ./examples
 COPY libraries ./libraries
 COPY skills ./skills
+ARG VORK_SHADER_CACHE=dist/empty-shader-cache
+COPY ${VORK_SHADER_CACHE} /shader-cache
 ARG VORK_BUILD_COMMIT
-RUN test -n "$VORK_BUILD_COMMIT" && VORK_BUILD_COMMIT="$VORK_BUILD_COMMIT" cargo build --locked --release -p vork-cli
+RUN test -n "$VORK_BUILD_COMMIT" && VORK_BUILD_COMMIT="$VORK_BUILD_COMMIT" python3 scripts/build-with-shader-cache --cache /shader-cache -- cargo build --locked --release -p vork-cli
 RUN objcopy --only-keep-debug /target/release/vork /target/release/vork.debug && strip --strip-unneeded /target/release/vork
 RUN /target/release/vork --version && objdump -T /target/release/vork | sed -n 's/.*(GLIBC_\([0-9.]*\)).*/\1/p' | sort -Vu | tail -1
 FROM ubuntu:22.04 AS smoke
@@ -25,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 libg
 COPY --from=build /target/release/vork /usr/local/bin/vork
 RUN vork --version
 FROM scratch AS artifact
+COPY --from=build /shader-cache /shader-cache
 COPY --from=smoke /usr/local/bin/vork /vork
 COPY --from=build /target/release/vork-slang-filesystem /vork-slang-filesystem
 COPY --from=build /src/crates/vork-render/src/ltc/LICENSE.ltc /licenses/LICENSE.ltc

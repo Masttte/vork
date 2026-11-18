@@ -282,7 +282,7 @@ pub struct Material {
     #[schemars(with = "NameOr<Program>")]
     pub program: String,
     #[serde(default)]
-    #[schemars(extend("x-source" = "OpenPBR Surface 1.1.1 defaults (spec table)", "x-help-path" = "material.inputs", "x-help" = "{name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{step}|{channel}|{geometry}}", "x-help-extra" = "material.inputs (transmission): transmission_depth 0 = sqrt(tint) per solid interface; thin sheets = full tint; positive-depth solids = Beer absorption\nmaterial.inputs (animation): numeric scalar/vector/colour inputs on surface/environment/compute/compositor/display programs use ordinary tracks; geometry_thin_walled is structural; an omitted animated program input has a zero blend baseline (author inputs for another baseline)\nmaterial.inputs.subsurface: thick: radius × radius_scale; thin: diffuse reflection/transmission split by scatter_anisotropy"))]
+    #[schemars(extend("x-source" = "OpenPBR Surface 1.1.1 defaults (spec table)", "x-help-path" = "material.inputs", "x-help" = "{name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{step}|{channel}|{geometry}}", "x-help-extra" = "material.inputs (transmission): transmission_depth 0 = sqrt(tint) per solid interface; thin sheets = full tint; positive-depth solids = Beer absorption\nmaterial.inputs (animation): numeric scalar/vector/colour inputs on surface/environment/compute/compositor/display programs use ordinary tracks; geometry_thin_walled is structural; an omitted animated program input has a zero blend baseline (author inputs for another baseline)\nmaterial.inputs (coat): coat_color tints the base and emission; coat_darkening reduces reflected base light\nmaterial.inputs (approximations): base_diffuse_roughness uses Lambert diffuse; transmission_scatter and transmission_scatter_anisotropy use Beer-only transmission; zero is neutral, other values warn per material\nmaterial.inputs.subsurface: thick: radius × radius_scale; thin: diffuse reflection/transmission split by scatter_anisotropy"))]
     pub inputs: Table<Input>,
     #[serde(default = "material_double_sided")]
     #[schemars(extend("x-source" = "Blender renders both sides; imported glTF retains doubleSided", "x-help-path" = "material.double_sided", "x-help" = "bool; false culls back faces"))]
@@ -429,6 +429,8 @@ pub struct OpenPbrParam {
     pub supported: bool,
     /// Present in the evaluated Closure; false for std evaluation inputs.
     pub closure: bool,
+    /// Accepted with a warning; retained transport ignores this input.
+    pub approximated: bool,
     pub min: f32,
     pub max: f32,
     pub open_min: bool,

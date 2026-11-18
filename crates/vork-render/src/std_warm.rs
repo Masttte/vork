@@ -243,7 +243,7 @@ fn prepare(mut value: serde_json::Value, mut settings: v2::Settings) -> Result<v
     // Previs has a small shipped budget; retain it so setup reaches the merged
     // visibility path as well as the transmitting camera variants it will draw.
     if settings.integrator.is_path() { settings.samples=1; }
-    vork_std::expand_scene(&mut value, Path::new("."))?;
+    crate::expand_standard_geometry(&mut value, Path::new("."))?;
     let mut scene = v2::Scene::from_json(&serde_json::to_vec(&value)?)?;
     scene.render.settings=settings;
     scene.validate()?;
@@ -454,7 +454,7 @@ fn warm_canvas_drawing(r: &Renderer) -> Result<()> {
 /// color delivery and the same foreground choices as a one-frame render.
 fn starter_scene() -> Result<v2::Scene> {
     let mut value: serde_json::Value = serde_json::from_str(vork_scene::STARTER_SCENE)?;
-    vork_std::expand_scene(&mut value, Path::new("."))?;
+    crate::expand_standard_geometry(&mut value, Path::new("."))?;
     let mut scene = v2::Scene::from_json(&serde_json::to_vec(&value)?)?;
     scene.render.settings = v2::Profile::load(v2::DEFAULT_PROFILE)?.resolve(&Default::default())?;
     scene.validate()?;

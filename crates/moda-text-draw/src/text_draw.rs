@@ -16,6 +16,7 @@
 //! Fonts come from a `moda_text::TextHost` — vendored bytes under `fixtures/oracle/fonts` natively (env
 //! `MODA_FONTS_DIR` overrides), the installed VFS on wasm.
 
+use crate::records::{Column, PendingRecords};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -196,7 +197,7 @@ pub fn build_vector_batch(
         degraded: None,
         vector: Some(ops),
         distort: spec.distort,
-        content_key: None,
+        content_key: None, paint_geometry_key: None,
     }))))
 }
 
@@ -269,7 +270,7 @@ pub fn build_degraded_batch(
         // The Degraded raster quad stays unwarped (only the
         // vector lane consumes the rows — the accepted fallback gap).
         distort: None,
-        content_key: None,
+        content_key: None, paint_geometry_key: None,
     })))
 }
 
@@ -1164,7 +1165,7 @@ impl TextDraw {
                             // (28 B) → 64 B/instance, matching the analytic vertex
                             // buffer layout (@location 5/6/7) in the shader manifest.
                             let mut bytes: Vec<u8> = Vec::with_capacity(op.records.len() * 64);
-                            for r in &op.records {
+                            for r in op.records.iter() {
                                 bytes.extend_from_slice(&r.pen_x.to_le_bytes());
                                 bytes.extend_from_slice(&r.baseline_y.to_le_bytes());
                                 bytes.extend_from_slice(&r.font_size_px.to_le_bytes());
@@ -1421,6 +1422,7 @@ impl TextDraw {
                 + verts_uploaded
                 + indices_uploaded
                 + curve_uploaded_bytes,
+            uniforms: std::cell::RefCell::new(Column::of(uniforms.chunks_exact(4).map(|b| b.try_into().unwrap()).collect())),
         })
     }
 
@@ -1571,6 +1573,7 @@ pub struct PreparedText {
     pipes: Vec<(String, wgpu::RenderPipeline)>,
     /// Kept for ownership clarity; the bind groups hold their own refs.
     _uniform_buf: Option<wgpu::Buffer>,
+    uniforms: std::cell::RefCell<Column<[u8; 4]>>,
     /// T9: `Arc` so a content-cache hit shares the already-uploaded buffer with
     /// the cache (an `Arc` pointer-bump, not a re-upload) while this
     /// `PreparedText` still keeps it alive for the frame.
@@ -1597,6 +1600,37 @@ pub struct PreparedText {
 }
 
 impl PreparedText {
+    /// The host's content identity certifies the immutable geometry; only paint values differ.
+    pub fn can_repaint(&self, at: usize, old: &TextQuadBatch, new: &TextQuadBatch) -> bool {
+        old.paint_geometry_key.is_some() && old.paint_geometry_key == new.paint_geometry_key
+            && old.node_id == new.node_id && old.model_matrix == new.model_matrix && old.z == new.z
+            && old.page_clip_bounds == new.page_clip_bounds && old.distort == new.distort
+            && old.ops.is_empty() && new.ops.is_empty() && old.degraded.is_none() && new.degraded.is_none()
+            && self.batches.get(at).is_some_and(|b| new.vector.as_ref().is_some_and(|v|
+                v.ops.len() == b.vector_draws.len()))
+    }
+
+    /// Stage values by batch address; commit once for this retained uniform column.
+    pub fn stage_paint(&self, at: usize, batch: &TextQuadBatch) {
+        let mut column = self.uniforms.borrow_mut();
+        for (draw, op) in self.batches[at].vector_draws.iter().zip(&batch.vector.as_ref().unwrap().ops) {
+            let start = draw.dynamic_offsets[0] / 4 + 16;
+            for (i, color) in op.color.iter().enumerate() {
+                column.put(start + i as u32, &color.to_ne_bytes()).expect("prepared text uniform");
+            }
+            column.put(start + 5, &op.opacity.to_ne_bytes()).expect("prepared text uniform");
+        }
+    }
+
+    pub fn commit_paint(&self, mut write: impl FnMut(&wgpu::Buffer, u64, &[u8])) -> u64 {
+        let mut written = 0;
+        self.uniforms.borrow_mut().commit(&mut |offset, bytes| {
+            write(self._uniform_buf.as_ref().unwrap(), offset, bytes);
+            written += bytes.len() as u64;
+        });
+        written
+    }
+
     fn pipe(&self, module: &str) -> Option<&wgpu::RenderPipeline> {
         self.pipes.iter().find(|(m, _)| m == module).map(|(_, p)| p)
     }

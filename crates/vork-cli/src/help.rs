@@ -342,7 +342,7 @@ mod tests {
             }
         }
         let root = field_lines("material.inputs (std/openpbr)");
-        let names = root[0].split("shaded inputs: ").nth(1).unwrap().split_whitespace().collect::<Vec<_>>();
+        let names = root[0].split("accepted inputs: ").nth(1).unwrap().split_whitespace().collect::<Vec<_>>();
         assert_eq!(names, OpenPbrParam::supported().map(|p| p.name).collect::<Vec<_>>());
     }
     #[test]

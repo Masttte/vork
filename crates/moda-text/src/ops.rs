@@ -93,7 +93,7 @@ pub struct GradientSpec {
 /// coercions applied by the caller per `renderWithMsdf`):
 /// `width ?? 400`, `height ?? 200`, `opacity ?? 1`,
 /// `paragraphSpacing || 0` max 0, `verticalAlign || 'top'`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TextNodeSpec {
     pub node_id: String,
     /// htmlContent with CSS variables already resolved.
@@ -174,6 +174,37 @@ pub struct TextNodeSpec {
 }
 
 impl TextNodeSpec {
+    /// Whether changing the supplied solid colours leaves the vector op stream and geometry intact.
+    /// Effects and non-vector drawing are admitted separately by the caller.
+    pub fn same_paint_geometry(&self, other: &Self) -> bool {
+        if self.run_colors.len() != other.run_colors.len()
+            || self.stroke_color.as_ref().is_some_and(|s| !s.is_empty()) != other.stroke_color.as_ref().is_some_and(|s| !s.is_empty())
+            || self.fill_override.as_ref().is_some_and(|s| !s.is_empty()) != other.fill_override.as_ref().is_some_and(|s| !s.is_empty()) {
+            return false;
+        }
+        self.node_id == other.node_id
+            && self.html == other.html
+            && self.width == other.width
+            && self.height == other.height
+            && self.paragraph_spacing == other.paragraph_spacing
+            && self.line_height_policy == other.line_height_policy
+            && self.vertical_align == other.vertical_align
+            && self.truncation == other.truncation
+            && self.opacity == other.opacity
+            && self.stroke_width == other.stroke_width
+            && self.gradient == other.gradient
+            && self.shader_fill == other.shader_fill
+            && self.effects == other.effects
+            && self.unit_transforms == other.unit_transforms
+            && self.unit_groups == other.unit_groups
+            && self.unit_fill == other.unit_fill
+            && self.unit_range == other.unit_range
+            && self.distort == other.distort
+            && self.text_path == other.text_path
+            && self.auto_width == other.auto_width
+            && self.area == other.area
+    }
+
     /// The width lines wrap at: the box width (`width ?? 400`), or unbounded for
     /// auto-width text.
     pub fn wrap_width(&self) -> f64 {

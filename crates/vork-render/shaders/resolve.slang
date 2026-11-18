@@ -126,20 +126,22 @@ float3 linear_color(int2 p) {
     }
     return compose_indirect(color.Load(int3(p,0)).rgb,fill,visibility,screen_reflection(p),response,estimate.rgb);
 }
-float4 scene_rgba(int2 p) {
-    let alpha=select(frame.flags.z>0.,clamp(color.Load(int3(p,0)).a,0.,1.),1.);
-    return float4(linear_color(p),alpha);
+// One exposure sample as associated colour, the authority through
+// accumulation, denoising and composition. Forward colour is premultiplied
+// over transparent black, so a sample may carry radiance with no coverage (a
+// glow in front of a transparent background). Its coverage is an estimate
+// whose samples may lie outside [0,1]; it is clamped once, on the mean. An
+// opaque film is fully covered.
+float4 sample_associated(int2 p) {
+    return float4(linear_color(p),select(frame.flags.z>0.,color.Load(int3(p,0)).a,1.));
 }
-float4 shutter_color(int2 p,float z) {
-    let rgba=scene_rgba(p);
-    var linear=rgba.rgb;
-    // Forward colour is premultiplied over transparent black. Export straight RGBA.
-    var alpha=1.;
-    if (frame.flags.z>0.) {
-        alpha=clamp(rgba.a,0.,1.);
-        linear=select(alpha>0.,linear/max(alpha,REG_POSITIVE_EPSILON),float3(0.));
-    }
-    return float4(linear,alpha);
+// Display colour, derived once from the completed mean: straight colour under
+// coverage. Without coverage there is no straight colour and the display takes
+// the associated colour as it is, which alpha hides in a format that has it.
+float3 display_color(float4 associated) {
+    var color=associated.rgb;
+    if (associated.a>0.) {color/=associated.a;}
+    return color;
 }
 [[vk::binding(45,0)]] StructuredBuffer<float4> post_color;
 uint2 output_size() {uint w,h;output.GetDimensions(w,h);return uint2(w,h);}
@@ -175,21 +177,17 @@ void resolve_pixel(uint3 gid) {
             associated=post_color[full_i];
             if (frame.post.x==2.) {associated/=frame.temporal.y;}
             alpha=associated.a;
-            linear=associated.rgb;
-            if (alpha>0.) {linear/=alpha;}
+            linear=display_color(associated);
         } else {
-        let z=control_depth(p).x;float4 rgba;
-        rgba=shutter_color(p,z);
-        linear=rgba.rgb;alpha=rgba.a;
-        associated=float4(linear*alpha,alpha);
+        associated=sample_associated(p);
         if (frame.temporal.y>1.) {
             var total=associated;
             if (frame.temporal.x>0.) {total+=accumulation[full_i];}
             accumulation[full_i]=total;
             associated=total/(frame.temporal.x+1.);
-            linear=total.rgb/max(total.a,REG_POSITIVE_EPSILON);
-            alpha=associated.a;
         }
+        associated.a=clamp(associated.a,0.,1.);
+        alpha=associated.a;linear=display_color(associated);
         }
         if (!final_sample) {return;}
         store_color(associated,linear,alpha,gid.xy,i,count,flags);
@@ -231,10 +229,11 @@ void post_source(uint3 gid : SV_DispatchThreadID) {
     let size=dimensions(color);
     if (any(gid.xy>=size)) {return;}
     let p=int2(gid.xy);let i=gid.y*size.x+gid.x;
-    let z=control_depth(p).x;float4 rgba;
-    rgba=shutter_color(p,z);
-    var associated=float4(rgba.rgb*rgba.a,rgba.a);
+    var associated=sample_associated(p);
     if (frame.temporal.x>0.) {associated+=accumulation[i];}
+    // The completed sum is what the denoiser, the reconstruction and every
+    // compositor read: its coverage is finalised here, once, on the mean.
+    if (frame.temporal.x+1.>=frame.temporal.y) {associated.a=clamp(associated.a,0.,frame.temporal.y);}
     if (!all(isfinite(associated))) {InterlockedMax(output_errors[0],REG_RADIANCE_NONFINITE);}
     accumulation[i]=associated;
 }

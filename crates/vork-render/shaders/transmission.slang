@@ -193,7 +193,7 @@ float3 transmission_radiance<V:IVariant,O:ITransmission,P:IProgram>(Varying v,Su
         // interior sources are integrated before that boundary.
         var behind=transmitted_scene*attenuation*exit_transmission;
         // Light from behind passes the base substrate, so the coat and fuzz attenuate it too.
-        if (V.layered && (c.coat_weight>0. || c.fuzz_weight>0.)) { let l=layers<V>(interface_closure,view);behind*=l.throughput*l.scale; }
+        if (V.layered && (c.coat_weight>0. || c.fuzz_weight>0.)) { let l=layers<V>(interface_closure,view);behind*=l.throughput*l.crossing; }
         let transmission=c.transmission_weight*(1.-interface_fresnel);
         color=behind*transmission;
     }

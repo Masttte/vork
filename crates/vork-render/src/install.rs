@@ -109,8 +109,8 @@ fn bound_effects(scene:&Scene,base:&Path,stages:&std::collections::BTreeMap<Stri
                         else {geometry.material_ranges.iter().filter(|range|range.count>0).map(|range|range.material_index as usize).collect()};
                     for slot in slots {if let Some(name)=bindings.select(Some(slot)) {medium(format!("materials[{slot}]"),name);}}
                     facts.media |= matches!(geometry.topology,vork_scene::v2::Topology::Volume);
-                    if (!allow_media || scene.delivery) && matches!(geometry.topology,vork_scene::v2::Topology::Volume) {
-                        refused.insert(format!("{label}: stage 1 fog does not support grid volume topology; use a homogeneous closed convex triangle carrier, or render the volume externally and composite an image plate"));
+                    if !allow_media && matches!(geometry.topology,vork_scene::v2::Topology::Volume) {
+                        refused.insert(format!("{label}: participating media are unavailable in delivery (grid volume); render the volume externally and composite an image plate"));
                     }
                 }
                 NodeKind::Asset {file,materials,..} if crate::splats::is_file(file) => {
@@ -606,16 +606,30 @@ impl InstalledScene {
                 }
             }
         }
-        let display_program = crate::display_program::prepare(r, &scene, base, options.display, opened, options.view_picture)?.install(r)?;
         let mut render = scene.main_render();
-        let environment_start = Instant::now();
         let scene_inputs=allocation_dependencies.beauty || allocation_dependencies.controls()
             || allocation_dependencies.aovs || allocation_dependencies.catcher;
         if !scene_inputs {effects.implicit=false;}
-        let mut environment = if scene_inputs {environment::Environment::new_in(
-            r, environment_node::Settings::from_scene(&scene)?, &scene, base, opened,
-        )?} else {environment::Environment::unused(r)};
-        let environment_install_ms = environment_start.elapsed().as_secs_f64() * 1000.;
+        // Display preparation and environment installation are independent.
+        // In particular, cold BRDF qualification must not hold up host shader
+        // preparation while it waits for its bounded GPU probes. Scope both
+        // jobs so every error path joins before scene/device resources go away.
+        let warnings = crate::warnings::Collector::current();
+        let (display_program, mut environment, environment_install_ms) = std::thread::scope(|scope| -> Result<_> {
+            let environment = scope.spawn(|| -> Result<_> {
+                let _warning_scope = warnings.as_ref().map(|collector| collector.enter());
+                let start = Instant::now();
+                let environment = if scene_inputs {environment::Environment::new_in(
+                    r, environment_node::Settings::from_scene(&scene)?, &scene, base, opened,
+                )?} else {environment::Environment::unused(r)};
+                Ok((environment, start.elapsed().as_secs_f64() * 1000.))
+            });
+            let display = crate::display_program::prepare(r, &scene, base, options.display, opened, options.view_picture)
+                .and_then(|program| program.install(r));
+            let environment = environment.join().map_err(|_| anyhow::anyhow!("environment installation worker panicked"))?;
+            let (environment, elapsed) = environment?;
+            Ok((display?, environment, elapsed))
+        })?;
         // Preorder: an authored node's index is its position in the scene tree walk.
         let mut nodes = Vec::new();
         fn flatten(input: &[Node], parent: Option<usize>, nodes: &mut Vec<EvalNode>) {
@@ -862,7 +876,6 @@ impl InstalledScene {
             admit_stage_effects(input,base,&stages)?;
             ensure!(!stages.values().any(|stage| stage.medium && stage.surface), "stage 1 fog does not support combined surface/medium programs; overlap an independent fog carrier with std/openpbr glass");
             if let Some(medium) = medium.as_mut() {
-                ensure!(medium.native.homogeneous || environment.settings.medium.as_deref().is_some_and(|world|medium.certified_world_exponential(world)), "stage 1 fog does not support varying finite media or arbitrary world density; use homogeneous coefficient programs for carriers and homogeneous or certified exponential-height world fog");
                 // Select a boundary representation after geometry is available; neither
                 // representation imposes shape/count admission.
                 medium.native.convex = false;
@@ -880,9 +893,12 @@ impl InstalledScene {
         let mut light_shadow_rays=crate::rt::installed_shadow_rays(&scene,&nodes);
         let mut rays = crate::rt::uses_rays(&scene) || light_shadow_rays || promoted_transport || program_trace || compute_trace;
         // Decoded mesh emitters can request volume rays after geometry upload.
-        // Reserve the native input usage while scattering is possible; the
+        // Reserve native ray input usage for possible previs emitter lighting,
+        // and while medium scattering is possible. Proven non-emissive previs
+        // scenes keep their original geometry usage and allocation path. The
         // decoded source decision still owns actual ray/topology installation.
-        let geometry_rays=rays || (medium.as_ref().is_some_and(|m|!m.native.scattering_free)
+        let previs_geometry_rays=render.settings.previs && crate::rt::possible_transport_queries(&scene);
+        let geometry_rays=rays || ((previs_geometry_rays || medium.as_ref().is_some_and(|m|!m.native.scattering_free))
             && r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY));
         // Device preflight treats every unknown program/asset as transmissive.
         // Installation already knows authored surface capabilities; a medium,
@@ -906,7 +922,7 @@ impl InstalledScene {
                 textures: 1, samplers: 1,
                 ray_refraction,
                 connection_transmission, surface_coverage:false, attribute_coverage:false, shadow_capacity:0,
-                no_shadow_containment: false, no_boundary_transactions: false, no_points: false, gaussians: false, unit_ior: false, unit_boundary_ior: false, no_gltf_tint: false, no_film: false,
+                no_shadow_containment: false, no_boundary_transactions: false, no_points: false, gaussians: false, unit_ior: false, unit_boundary_ior: false, constant_mesh_emission: false, no_gltf_tint: false, no_film: false,
                 probes: effects.probes,
                 fibre: effects.fibre,
                 denoise: effects.denoise,
@@ -1031,7 +1047,7 @@ impl InstalledScene {
                         Some(&r.disk_cache),
                     )?;
                     let geometry = crate::subdivision::prepare(r, &buffer_data, &input.geometry[name.as_str()], geometry)?;
-                    ((None, std::sync::Arc::new(vec![]), vec![]), Some(geometry), Vec::new())
+                    ((None, std::sync::Arc::new(vec![]), vec![]), Some(std::sync::Arc::new(geometry)), Vec::new())
                 };
                 if let Some(hash)=&mut query_identity {
                     if let Some(doc)=&loaded.0 {hash.update(&serde_json::to_vec(doc.as_json())?);}
@@ -1242,7 +1258,8 @@ impl InstalledScene {
                         material.hair=programs.is_hair(program);
                         material.physical_hair=programs.is_physical_hair(program);
                         let capabilities = programs.capabilities(program);
-                        material.response_program = if capabilities.anisotropy {crate::forward_variant::FEATURE_ANISOTROPY} else {0}
+                        material.response_program = if capabilities.scattering {crate::forward_variant::FEATURE_SCATTERING} else {0}
+                            | if capabilities.anisotropy {crate::forward_variant::FEATURE_ANISOTROPY} else {0}
                             | if capabilities.coat_anisotropy {crate::forward_variant::FEATURE_COAT_ANISOTROPY} else {0}
                             | if capabilities.film {crate::forward_variant::FEATURE_FILM} else {0}
                             | if capabilities.coat {materials::FEATURE_COAT} else {0}
@@ -1666,7 +1683,7 @@ impl InstalledScene {
                         slot,
                         parameter,
                         storage: None, enum_tokens: None,
-                        default: animation::Sample::Numeric(value),
+                        default: animation::Sample::numeric(value),
                         offset: offsets[&slot],
                     })
                     .collect();
@@ -1755,6 +1772,77 @@ impl InstalledScene {
                 }
             }
         }
+        // Resolve material-emitter reachability from installed sources and responses,
+        // including off-camera geometry and animation. Only these previs views
+        // need the existing low-budget raster ray-lighting providers.
+        let mut previs_emission = false;
+        if views.iter().any(|view| view.settings.previs) {
+            let emission_receivers: Vec<_> = materials.iter().map(materials::PendingMaterial::emission_receiver_mask).collect();
+            for view in views.iter().filter(|view|view.settings.previs && view.settings.integrator.raster()
+                .is_some_and(|raster|raster.fast_gi.is_none() && raster.probes.is_none())) {
+                let included=crate::render_images::included_nodes(&nodes,view.root.as_deref())?;
+                let visibility_possible=|object:u32,mask:u32| {
+                    let root=&roots[object as usize];
+                    if objects[object as usize].metadata[1]&mask!=0 || nodes[root.node].dynamic {return true;}
+                    let relevant=|ray:&vork_scene::Ray|match ray {
+                        vork_scene::Ray::All=>true,
+                        vork_scene::Ray::Camera=>mask&constants::RAY_CAMERA!=0,
+                        vork_scene::Ray::Diffuse=>mask&constants::RAY_DIFFUSE!=0,
+                        vork_scene::Ray::Glossy=>mask&constants::RAY_SPECULAR!=0,
+                        vork_scene::Ray::Transmission=>mask&constants::RAY_TRANSMISSION!=0,
+                        _=>false,
+                    };
+                    animation.targets().any(|target|match target {
+                        vork_scene::TrackTarget::Node {node,property:vork_scene::NodeProperty::Visibility(ray)}=>relevant(ray)
+                            && std::iter::successors(Some(root.node),|&id|nodes[id].parent).any(|id|nodes[id].node.name==*node),
+                        vork_scene::TrackTarget::Imported {asset,property:vork_scene::NodeProperty::Visibility(ray),..}=>
+                            relevant(ray) && *asset==nodes[root.node].node.name,
+                        _=>false,
+                    })
+                };
+                let mut source_channels=0u32;
+                for channel in [constants::RAY_DIFFUSE,constants::RAY_SPECULAR,constants::RAY_TRANSMISSION] {
+                    if draws.iter().any(|draw|draw.count>0 && materials[draw.material].emits()
+                        && !materials[draw.material].zero_opacity()
+                        && draw.instances.clone().any(|object|visibility_possible(object,channel))) {source_channels|=channel;}
+                }
+                // A camera-visible mirror or window can expose an otherwise
+                // camera-hidden surface receiver. Pure unlit camera views cannot.
+                let camera_visible=|object:u32|included[roots[object as usize].node]
+                    && visibility_possible(object,constants::RAY_CAMERA);
+                let secondary_view=draws.iter().any(|draw|draw.count>0 && materials[draw.material].scattering()
+                    && !materials[draw.material].zero_opacity()
+                    && draw.instances.clone().any(camera_visible));
+                let receiver=draws.iter().any(|draw|draw.count>0 && emission_receivers[draw.material]&source_channels!=0
+                    && !materials[draw.material].zero_opacity()
+                    && draw.instances.clone().any(|object|camera_visible(object) || (secondary_view
+                        && visibility_possible(object,constants::RAY_SPECULAR | constants::RAY_TRANSMISSION))));
+                previs_emission |= receiver;
+            }
+        }
+        if previs_emission {
+            // Reuse draft's cheap GPU reconstruction for this noisy low-budget
+            // transport. An explicit denoise choice wins; never open a CPU
+            // denoiser as an implicit previs fallback.
+            let denoise_emission = allocation_dependencies.beauty && render.settings.promotion_denoise.is_none()
+                && crate::denoise::open_fast(r).is_ok();
+            for view in std::iter::once(&mut render).chain(views.iter_mut()) {
+                if view.settings.previs && let Some(raster) = view.settings.integrator.raster_mut() {
+                    view.settings.bounded_secondary_compilation = true;
+                    raster.fast_gi = Some(vork_scene::FastGi { method: vork_scene::FastGiMethod::Ray });
+                    raster.reflections = vork_scene::Reflections::Ray;
+                    if denoise_emission {raster.denoiser = Some(Default::default());}
+                }
+            }
+            slang.bounded_secondary_compilation = true;
+            effects.denoise |= denoise_emission;
+            slang.denoise = effects.denoise;
+            effects.indirect = true;
+            effects.ray_indirect = true;
+            effects.reflections = true;
+            crate::warnings::approximated("previs_material_emission", serde_json::json!({"profile":"std/previs","effect":"material-emitter lighting"}),
+                "std/previs approximates material-emitter lighting with low-sample raster ray lighting; indirect light, reflections and transmission may be noisy or incomplete. Use std/final or std/path for exact lighting.".into());
+        }
         let limits = r.device.limits();
         // Captures share this installed light_plan. Media also consumes map transport.
         // The profile resolution is a quality floor. Large authored views and
@@ -1795,7 +1883,7 @@ impl InstalledScene {
                     && (objects[object as usize].metadata[1]&constants::RAY_VOLUME!=0
                         || visible_track || imported_track || nodes[node].dynamic)
             }));
-        rays |= medium_sources;
+        rays |= medium_sources || previs_emission;
         ray_shadows |= medium_sources;
         let transport_needed=allocation_dependencies.beauty || allocation_dependencies.aovs
             || allocation_dependencies.catcher || effects.implicit;
@@ -1808,6 +1896,7 @@ impl InstalledScene {
         // Resolve it before choosing the shared opaque pipeline registry.
         slang.unit_ior = materials.iter().all(|material|!material.weighted_ior());
         slang.unit_boundary_ior = materials.iter().filter(|material|material.transmissive).all(|material|!material.weighted_ior());
+        slang.constant_mesh_emission = materials.iter().all(|material|material.constant_source_emission());
         slang.no_gltf_tint = materials.iter().all(|material|!material.gltf_tint());
         slang.gaussians = draws.iter().any(|draw|draw.splats.is_some());
         for draw in draws.iter().filter(|draw|draw.splats.is_some()) {
@@ -2866,7 +2955,7 @@ impl InstalledScene {
             })
             .collect();
         let rays = rays
-            .then(|| crate::rt::Rays::new(r, &draws, &instances, &objects, &plan.casters.instances[0], ray_refraction || crate::rt::other_hit_surfaces(&scene) || program_coverage || program_trace, &materials, &render.settings.integrator, &solids.boundaries, &solids.owners, &subsurface_ids, &occupancy_solids, medium_sources))
+            .then(|| crate::rt::Rays::new(r, &draws, &instances, &objects, &plan.casters.instances[0], ray_refraction || effects.ray_indirect || effects.reflections || crate::rt::other_hit_surfaces(&scene) || program_coverage || program_trace, &materials, &render.settings.integrator, &solids.boundaries, &solids.owners, &subsurface_ids, &occupancy_solids, medium_sources))
             .transpose()?;
         // Point shape construction and immutable compute-query snapshots need
         // the retained source topology. Only computed publications keep it after

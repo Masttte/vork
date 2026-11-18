@@ -102,15 +102,15 @@ trait Stage: Send + Sync {
     }
     fn append_inputs(&self, _: &values::ChangeTracker, _: &mut Vec<u8>) {}
     /// The legacy graph records the builtin prefix in its deformation pass.
-    /// Stages that evaluate before visibility terminate that prefix.
+    /// Stages that evaluate before visibility terminate that prefix. Membership
+    /// is a scheduling property, independent of per-draw predecessor bindings.
+    fn can_encode_prefix(&self) -> bool { false }
     fn encode_prefix(
         &self,
         _: &mut wgpu::CommandEncoder,
         _: &InstalledScene,
         _: Option<&wgpu::QuerySet>,
-    ) -> bool {
-        false
-    }
+    ) {}
     fn evaluate(
         &self,
         _: &[Box<dyn Stage>],
@@ -121,6 +121,7 @@ trait Stage: Send + Sync {
 }
 
 struct Evaluation<'a> {
+    in_prefix: bool,
     predecessor_inputs: Option<Vec<Vec<u8>>>,
     r: &'a Renderer,
     s: &'a InstalledScene,
@@ -196,18 +197,17 @@ impl Stage for Deform {
             changes.append_buffer_inputs(buffer, inputs);
         }
     }
+    fn can_encode_prefix(&self) -> bool { !self.chained }
     fn encode_prefix(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         s: &InstalledScene,
         queries: Option<&wgpu::QuerySet>,
-    ) -> bool {
-        if self.chained { return false; }
+    ) {
         passes::deform::dispatch(encoder, s, &self.skin, queries);
-        true
     }
     fn evaluate(&self, _: &[Box<dyn Stage>], e: &mut Evaluation<'_>) -> Result<Vec<Option<(Vec3,Vec3)>>> {
-        if !self.chained { return Ok(Vec::new()); }
+        if e.in_prefix { return Ok(Vec::new()); }
         let mut encoder=e.r.device.create_command_encoder(&Default::default());
         if !e.changes.bytes.is_empty() {
             let upload=init(&e.r.device,"geometry stage pose uploads",&e.changes.bytes,wgpu::BufferUsages::COPY_SRC);
@@ -215,7 +215,7 @@ impl Stage for Deform {
                 encoder.copy_buffer_to_buffer(&upload,*source,destination,*offset,*size);
             }
         }
-        passes::deform::dispatch_chained(&mut encoder,e.s,&self.skin);
+        passes::deform::dispatch_chained(&mut encoder,e.s,&self.skin,Some(e.queries));
         let jobs:Vec<_>=self.skin.iter().enumerate().filter_map(|(index,frame)|frame.as_ref()
             .filter(|frame|frame.leader==index).and_then(|frame|frame.chained.as_ref()).map(|chained|(index,chained))).collect();
         for (_,job) in &jobs {job.bounds.encode(&mut encoder);}
@@ -223,7 +223,8 @@ impl Stage for Deform {
         e.r.errors.check()?;
         let (tx,rx)=std::sync::mpsc::channel();
         for (_,job) in &jobs {let tx=tx.clone();job.bounds.map(move |result|{let _=tx.send(result);});}
-        drop(tx);e.r.wait(Some(submission))?;
+        drop(tx);
+        if !jobs.is_empty() {e.r.wait(Some(submission))?;}
         for result in rx {result?;}
         let mut output=vec![None;e.s.draws.len()];
         for (index,job) in jobs {output[index]=Some(job.bounds.collect()?);}
@@ -614,6 +615,7 @@ impl Frame {
     ) -> Result<Vec<Option<(Vec3, Vec3)>>> {
         let mut bounds = vec![None; s.draws.len()];
         let mut evaluation = Evaluation {
+            in_prefix: true,
             predecessor_inputs:self.general.then(||vec![Vec::new();s.draws.len()]),
             r,
             s,
@@ -631,6 +633,7 @@ impl Frame {
             next_time,
         };
         for (index, stage) in self.stages.iter().enumerate() {
+            evaluation.in_prefix &= stage.can_encode_prefix();
             let next = stage.evaluate(&self.stages[..index], &mut evaluation)?;
             if let Some(inputs)=&mut evaluation.predecessor_inputs {
                 for (draw,inputs) in inputs.iter_mut().enumerate() {stage.append_draw_inputs(draw,evaluation.changes,inputs);}
@@ -661,8 +664,7 @@ fn encode_prefix(
     queries: Option<&wgpu::QuerySet>,
 ) {
     for stage in stages {
-        if !stage.encode_prefix(encoder, s, queries) {
-            break;
-        }
+        if !stage.can_encode_prefix() { break; }
+        stage.encode_prefix(encoder, s, queries);
     }
 }

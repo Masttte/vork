@@ -475,7 +475,16 @@ impl Pipeline {
     /// render compiles its own kernel behind the engine and draws the engine
     /// until the frame slot promotes its variants.
     pub(crate) fn draws_engine(&self,specialized:bool)->bool {
-        self.selected!=self.kernel && (!self.pipeline.deferred() || !specialized)
+        self.drawn_route(specialized)=="prebuilt engine"
+    }
+    /// Which compilation draws an exposure encoded with this `specialized` choice:
+    /// the scene's own kernel, the prebuilt engine, or the scene key's covering
+    /// kernel (ProgramKernel::covering). A report states it, since two compilations
+    /// of one scene differ by compiler reordering.
+    pub(crate) fn drawn_route(&self,specialized:bool)->&'static str {
+        if self.selected==self.kernel || self.pipeline.deferred() && specialized {"scene kernel"}
+        else if self.kernel.covering()==Some(self.selected) {"covering kernel"}
+        else {"prebuilt engine"}
     }
     pub(crate) fn new(r: &Renderer, adaptive: bool, catchers: bool, random_walk: bool, features: FeatureMask, boundary_capacity: u32, emitter_profiles: bool, media: Option<u32>, environment: bool, options: &crate::InstallOptions, pipelines: &std::sync::Arc<crate::pipelines::CachedPipelines>) -> Result<Self> {
         #[cfg(any(test, feature = "test-support"))]
@@ -486,8 +495,9 @@ impl Pipeline {
         let engine = pipelines.shader.path_engine(kernel).map(drop);
         let (pipeline, selected) = pipelines.install_hit_selected(r, kernel, &options.variants, layout.clone(), "unidirectional path")?;
         // Release preparation: the bundle holds this scene's kernel at every covered
-        // light and camera case, so a scene that differs only in those starts
-        // without compiling. Code generation only; no pipeline is created for them.
+        // light and camera case and its covering kernel, so a scene that differs
+        // only in refinement facts starts without compiling. Code generation only;
+        // no pipeline is created for them.
         if r.release_path_cases {
             for case in kernel.release_cases() {
                 pipelines.program_kernel(case)?;
@@ -774,6 +784,18 @@ mod tests {
         r.compiler.remember(pipelines.kernel_content_key(engine));
         assert_eq!(pipelines.drawn_kernel(kernel, &VariantCompile::Fallback, &r.compiler), engine);
         assert_eq!(pipelines.drawn_kernel(kernel, &VariantCompile::Background, &r.compiler), engine);
+        // A scene key's covering kernel never draws ahead of a warm engine, behind
+        // which the scene's own kernel is finished; it draws when nothing exact is
+        // warm or stored and no engine is warm.
+        let scene_key = ProgramKernel::Path { adaptive: true, catchers: false, random_walk: false,
+            features: features | crate::forward_variant::FEATURE_INSTALLED | crate::forward_variant::FEATURE_HAIR,
+            boundaries: 0, emitter_profiles: false, media: None };
+        let covering = scene_key.covering().expect("a scene key has a covering key");
+        r.compiler.remember(pipelines.kernel_content_key(covering));
+        assert_eq!(pipelines.drawn_kernel(scene_key, &VariantCompile::Fallback, &r.compiler), engine);
+        assert_eq!(pipelines.drawn_kernel(scene_key, &VariantCompile::Background, &r.compiler), engine);
+        assert_eq!(pipelines.drawn_kernel(scene_key, &VariantCompile::Inline, &r.compiler), scene_key);
+        assert_eq!(pipelines.drawn_kernel(scene_key, &VariantCompile::Setup, &r.compiler), engine);
         let layout = r.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None, bind_group_layouts: &[Some(&r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: None, entries: &layout_entries(true) })), Some(&pipelines.mat_layout), None, Some(&crate::rt::hits_layout(&r.device))],

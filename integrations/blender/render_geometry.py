@@ -66,6 +66,8 @@ def gltf_render_settings(scene):
                     set_value(modifier, 'levels', modifier.render_levels)
         for particles in bpy.data.particles:
             set_value(particles, 'display_percentage', 100)
+            if particles.type == 'HAIR' and particles.render_type == 'PATH':
+                set_value(particles, 'display_step', particles.render_step)
             set_value(particles, 'child_percent', particles.rendered_child_count)
         # glTF already converts evaluated curves to meshes; its depsgraph is viewport mode.
         for curve in bpy.data.curves:

@@ -43,9 +43,9 @@ vork setup                             GPU report; builds the path engine, warms
 vork setup --all                       Warm bundled program/profile catalog and built-in descriptors (no shader time limit)
 vork setup --skip-warmup               GPU/tools report without shader warmup
 vork setup --skip-warmup --verbose     Include raw encoder probe diagnostics
-Without setup, a cold path render compiles its scene kernel before the picture, then exits
-(about 50–60 s for path-glass and path-many-lights at std/path on an NVIDIA L4); vork help limits.
-Other scene kinds also compile once on first use.
+Without setup, on an NVIDIA L4: first path render about 8 s with shipped shaders, about 40 s
+when compilation is needed; repeats 1 to 3 s. See vork help limits.
+Other scene kinds compile once on first use unless their shaders ship with vork.
 vork help [TOPIC [--all] | field PATH]  topic details or exact field/object lookup
 Animation recipes: vork help springs, vork help sequences, vork help captions.
 2D canvas (text, paths, CSS paint): vork help nodes, then vork help composition, vork help text, vork help path.
@@ -158,7 +158,7 @@ Material {
   priority: integer = 0; highest owns overlapping solid media; equal priorities: last entered wins, simultaneous entries: later solid order wins; lower-priority boundaries change membership only
   program: program-name|inline program|<library>/<module> = std/openpbr
 }
-std/openpbr inputs: base_weight base_color base_metalness specular_weight specular_color specular_roughness specular_roughness_anisotropy specular_ior transmission_weight transmission_color transmission_depth subsurface_weight subsurface_color subsurface_radius subsurface_radius_scale subsurface_scatter_anisotropy coat_weight coat_color coat_roughness coat_roughness_anisotropy coat_ior coat_darkening fuzz_weight fuzz_color fuzz_roughness emission_luminance emission_color thin_film_weight thin_film_thickness thin_film_ior geometry_opacity geometry_thin_walled geometry_normal geometry_tangent geometry_coat_normal geometry_coat_tangent transmission_dispersion_scale transmission_dispersion_abbe_number alpha_cutoff
+std/openpbr inputs: base_weight base_color base_metalness specular_weight specular_color specular_roughness specular_roughness_anisotropy specular_ior transmission_weight transmission_color transmission_depth subsurface_weight subsurface_color subsurface_radius subsurface_radius_scale subsurface_scatter_anisotropy coat_weight coat_color coat_roughness coat_roughness_anisotropy coat_ior coat_darkening fuzz_weight fuzz_color fuzz_roughness emission_luminance emission_color thin_film_weight thin_film_thickness thin_film_ior geometry_opacity geometry_thin_walled geometry_normal geometry_tangent geometry_coat_normal geometry_coat_tangent transmission_dispersion_scale transmission_dispersion_abbe_number alpha_cutoff base_diffuse_roughness transmission_scatter transmission_scatter_anisotropy
 
 Texture binding {
   image: image-name|inline image; the program owns sampling and UV transforms
@@ -218,13 +218,14 @@ camera-json: OpenCV sidecars
 sdk: TypeScript and Python
 std: builders and Slang modules
 fluid: liquid simulation
+smoke: bounded dense-grid smoke/fire simulation and editable example looks
 cloth: XPBD fabric, native animated collider references and private geometry state
 errors: exit codes
 diagnostics: timings and environment variables
 limits: hardware and rendering limits
 build: source build prerequisites
 
-Scene JSON supports `"$schema": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.0/packages/ts/scene.schema.json"` for editor
+Scene JSON supports `"$schema": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.1/packages/ts/scene.schema.json"` for editor
 completion and validation. `vork init` includes it; SDK writers preserve an explicit
 $schema but do not insert one. vork never fetches it or changes the render.
 

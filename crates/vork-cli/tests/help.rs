@@ -68,7 +68,8 @@ fn help_routes_concepts_fields_and_diagnostics_without_losing_the_schema() {
     for removed in ["absorption_color", "blender.volume", "blender/principled_volume"] {
         assert!(!blender_all.contains(removed), "blender --all advertises removed media: {removed}");
     }
-    assert!(!std_all.contains("scatter:"));
+    // The removed scatter builder must not return; OpenPBR inputs such as transmission_scatter may appear.
+    assert!(!std_all.lines().any(|line| line.trim_start().starts_with("scatter:")), "std --all advertises the removed scatter builder");
     // Root keeps the fragment contract; retained signatures remain on demand.
     assert!(root.contains("Std builders return {buffers,geometry}"));
     let std_page = help("std");
@@ -174,7 +175,7 @@ fn every_field_remains_addressable_without_duplicate_topic_listings() {
             let variant = path.strip_prefix("node [type=\"").unwrap().strip_suffix("\"]").unwrap();
             assert!(root.contains(&format!("type: {variant}")) || variant == "node" && root.contains("type: node"));
         } else if path == "material.inputs (std/openpbr)" {
-            assert!(root.contains(&fact.replace("OpenPBR Surface; shaded inputs:", "std/openpbr inputs:")));
+            assert!(root.contains(&fact.replace("OpenPBR Surface; accepted inputs:", "std/openpbr inputs:")));
         } else if !path.contains('.') {
             let spelling = match path {
                 "coordinates" => "right-handed Y-up; camera local -Z",

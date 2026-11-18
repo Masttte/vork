@@ -6,6 +6,7 @@ pub const HELP_TOPICS: &[&str] = &[
     "std",
     "blender",
     "fluid",
+    "smoke",
     "cloth",
     "profiles",
     "sdk",

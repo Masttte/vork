@@ -189,7 +189,7 @@ pub(crate) fn upload(import: &mut import::GeometryUpload<'_>, cloud: &Cloud) -> 
         import.draws.push(install::Draw {
             splats:Some(Arc::new(Geometry {blas,stride,capture_count:cloud.metadata.count,attribute_offsets:offsets.clone()})),
             implicit:None,sort_order:0,vertices:vertices.clone(),attributes:vertices,
-            layout:geometry::VertexLayout {points:false,deform:false,tangent:false,uv:[constants::VERTEX_DEFAULT_UV;2],color:false,custom:import.attribute_names.len() as u8},
+            layout:geometry::VertexLayout {points:false,deform:false,tangent:false,uv:[constants::VERTEX_DEFAULT_UV;2],color:false,custom:import.attribute_names.len() as u8,stored_custom:import.attribute_names.len() as u8},
             uv_sets:0,exit_geometry:None,exit_bvh:None,open_edges:None,indices:import.placeholder.clone(),refit_indices:None,geometry_page:None,
             vertex_offset:0,index_offset:0,count:0,vertex_count:(end-first) as u32,ray_corners:None,
             material:import.default,material_slot:Some(0),object:import.object,instances:import.object..import.object+1,sort_stride:1,

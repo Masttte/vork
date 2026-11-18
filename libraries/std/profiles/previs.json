@@ -4,5 +4,5 @@
   "settings": {
     "seed": 0
   },
-  "description": "Fast blocking look: direct light, ray shadows and environment reflections; no indirect light or probes."
+  "description": "Fast blocking look: direct light, ray shadows and environment reflections; low-sample ray lighting and optional fast GPU denoising for emissive receivers, no general indirect light or probes."
 }

@@ -1150,15 +1150,39 @@ impl crate::DynCommandBuffer for CommandBuffer {}
 unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
-/// A persistent Metal binary archive. Apple's shared per-user function cache has a
-/// fixed size and evicts large pipeline binaries, so callers that persist this
-/// archive get a warm path that does not depend on what else ran on the machine.
+/// A persistent set of Metal binary archives. Apple's shared per-user function cache
+/// has a fixed size and evicts large pipeline binaries, so callers that persist this
+/// cache get a warm path that does not depend on what else ran on the machine.
+///
+/// The archives opened from the supplied data are only read. Metal cannot serialize
+/// an archive opened from a file once it gains a render pipeline that shares a stage
+/// function with a stored one ("expecting 'fragment' stage in pipeline no. N"), and
+/// a failed serialization empties the archive: the next one writes only what was
+/// added after the failure. This process's pipelines therefore go to an archive of
+/// their own, and the cache data is every loaded archive's file, byte for byte,
+/// followed by that archive (`archive_segments`).
 #[derive(Debug)]
 pub struct PipelineCache {
+    /// The staged files of the archives opened from the supplied data, in order. Those
+    /// archives are never added to or serialized, so each file stays its archive's data.
+    loaded_files: Vec<std::path::PathBuf>,
+    /// The archive of the pipelines this process compiled.
     archive: Retained<ProtocolObject<dyn objc2_metal::MTLBinaryArchive>>,
-    /// Files backing the archive: the staged input and every serialization.
-    /// Metal reads entries lazily from its current backing file and moves
-    /// them on the next serialization, so these live as long as the archive.
+    /// Every loaded archive, then `archive`: what pipeline creation looks up.
+    lookup: Retained<objc2_foundation::NSArray<ProtocolObject<dyn objc2_metal::MTLBinaryArchive>>>,
+    /// Set when `archive` gains a pipeline, cleared by the serialization that writes it.
+    /// Metal serializes an archive that gained nothing by moving its backing file
+    /// away, so the one after that fails; such a request reuses `saved` instead.
+    gained: Arc<core::sync::atomic::AtomicBool>,
+    /// The last serialization of `archive`; `None` until it has gained a pipeline.
+    /// Read and written under `files`.
+    saved: Mutex<Option<std::path::PathBuf>>,
+    /// A serialization of `archive` failed. It no longer holds what it was given, so
+    /// nothing it writes afterwards may replace data that held more.
+    failed: core::sync::atomic::AtomicBool,
+    /// Files backing the archives: the staged input and every serialization.
+    /// Metal reads entries lazily from an archive's current backing file and moves
+    /// them on the next serialization, so these live as long as the cache.
     /// The lock also serializes additions and serialization. Shared with the
     /// process registry so an exit that skips destructors can still remove them.
     files: Arc<Mutex<Vec<std::path::PathBuf>>>,
@@ -1166,6 +1190,37 @@ pub struct PipelineCache {
     /// waits for one (it holds `files` for 0.02 to 0.1 s per megabyte): whoever
     /// next holds `files`, the next serialization included, records these first.
     deferred: Mutex<Vec<DeferredAddition>>,
+}
+
+/// Cache data: the number of archives (u32), each archive's byte length (u64), then
+/// the archives' bytes in that order, all little-endian.
+fn archive_segments(data: &[u8]) -> Option<Vec<&[u8]>> {
+    let (count, mut rest) = data.split_first_chunk::<4>()?;
+    let mut lengths = Vec::new();
+    for _ in 0..u32::from_le_bytes(*count) {
+        let (length, tail) = rest.split_first_chunk::<8>()?;
+        lengths.push(usize::try_from(u64::from_le_bytes(*length)).ok()?);
+        rest = tail;
+    }
+    let mut segments = Vec::with_capacity(lengths.len());
+    for length in lengths {
+        let (segment, tail) = rest.split_at_checked(length)?;
+        segments.push(segment);
+        rest = tail;
+    }
+    rest.is_empty().then_some(segments)
+}
+
+fn join_archive_segments(segments: &[Vec<u8>]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + segments.iter().map(|segment| 8 + segment.len()).sum::<usize>());
+    data.extend_from_slice(&(segments.len() as u32).to_le_bytes());
+    for segment in segments {
+        data.extend_from_slice(&(segment.len() as u64).to_le_bytes());
+    }
+    for segment in segments {
+        data.extend_from_slice(segment);
+    }
+    data
 }
 
 /// Records one compiled pipeline in a binary archive. Recording is a compiler

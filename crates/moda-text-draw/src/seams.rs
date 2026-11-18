@@ -53,6 +53,8 @@ pub struct TextQuadBatch {
     /// It is a name for the fields above, not one more of them: two batches are equal, and print alike, whether
     /// or not either carries it (a plan built through a cache equals the same plan built without one).
     pub content_key: Option<u64>,
+    /// Host-certified identity of unchanged vector geometry, for uniform-only paint writes.
+    pub paint_geometry_key: Option<[u64; 4]>,
 }
 
 impl PartialEq for TextQuadBatch {
@@ -111,7 +113,7 @@ impl TextQuadBatch {
         if let Some(vector) = &self.vector {
             for op in &vector.ops {
                 for xy in op.tris.chunks_exact(2) { point(xy[0].into(), xy[1].into()); }
-                for glyph in &op.records {
+                for glyph in op.records.iter() {
                     if glyph.glyph_opacity <= 0. { continue; }
                     let [x0, y0, x1, y1] = glyph.em_box.map(f64::from);
                     let size = f64::from(glyph.font_size_px);

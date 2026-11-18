@@ -52,7 +52,16 @@ impl BuildMemo {
 
 /// Build the display list for one page (displayList.ts:99-122).
 pub fn build_display_list(scene: &Scene, page_id: &str) -> DisplayList {
-    let node_order = scene.flattened_z_order_for_page(page_id);
+    build_page_list(scene, page_id, true)
+}
+
+/// Structural source membership for retained offscreen emission. Visibility remains a row value.
+pub fn build_retained_display_list(scene: &Scene, page_id: &str) -> DisplayList {
+    build_page_list(scene, page_id, false)
+}
+
+fn build_page_list(scene: &Scene, page_id: &str, visible_only: bool) -> DisplayList {
+    let node_order = scene.flattened_z_order_for_page_opts(page_id, visible_only, true);
     let clip_mask_source_ids = collect_clip_mask_source_ids(scene);
     let mut memo = BuildMemo::default();
     let mut items = Vec::new();

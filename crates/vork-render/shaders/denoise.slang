@@ -24,7 +24,9 @@ void pack(uint3 id : SV_DispatchThreadID) {
     if(id.x>=params.width) return;
     uint i=id.y*params.width+id.x; if(i>=params.count) return;
     float4 p=accumulation[i]/float(params.samples);
-    shared[i]=float4(p.a>0. ? p.rgb/p.a : float3(0.),0.);
+    // The denoiser takes associated colour, as Cycles gives OIDN: radiance with
+    // no coverage is denoised like any other, and coverage is not filtered.
+    shared[i]=float4(p.rgb,0.);
     float coverage=params.guide_alpha!=0 ? guides[2*i].a : float(params.samples);
     shared[params.count+i]=float4(coverage>0. ? guides[2*i].rgb/coverage : float3(0.),0.);
     if(params.spectral!=0u) {
@@ -48,8 +50,8 @@ void unpack(uint3 id : SV_DispatchThreadID) {
     if(params.spectral!=0u) {
         output[i][params.channel]=(shared[i].r+shared[i].g+shared[i].b)/(3.*params.input_scale);
         if(params.channel<2u) return;
-        if(guides[2*i].a>0.) p.rgb=spectral_color(output[i].rgb,true)*p.a;
-    } else if(guides[2*i].a>0.) p.rgb=(shared[i].rgb/params.input_scale)*p.a;
+        if(guides[2*i].a>0.) p.rgb=spectral_color(output[i].rgb,true);
+    } else if(guides[2*i].a>0.) p.rgb=shared[i].rgb/params.input_scale;
     output[i]=p;
     accumulation[i]=p*float(params.samples);
 }

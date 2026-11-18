@@ -111,8 +111,12 @@ impl Convert {
             label: Some("picture crossing"), layout: &pipeline.get_bind_group_layout(0),
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }],
         });
+        #[cfg(feature = "frame-profile")]
+        let _profile = moda_engine::prof::span("canvas.world_crossing");
+        let timestamps = moda_engine::gpu_profile::pass_timestamps();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("picture crossing"),
+            timestamp_writes: moda_engine::gpu_profile::render_writes(&timestamps),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target, resolve_target: None, depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
@@ -165,9 +169,16 @@ impl World {
     /// The world's viewed picture at `request`, its node's local time: straight alpha, the view's code values
     /// for sRGB with the world's output dither, unquantized and unclamped (RGBA16F), left on the GPU.
     pub(crate) fn draw(&mut self, renderer: &crate::Renderer, request: &vork_time::Request) -> Result<&wgpu::Texture> {
+        self.slot.profile = moda_engine::prof::capturing();
+        let paused = moda_engine::prof::capturing().then(moda_engine::gpu_profile::pause);
         loop {
             let drawn = self.slot.submit_outputs(&self.scene, renderer, request.clone(), crate::ReadbackOutputs::default())
-                .and_then(|()| self.slot.collect(renderer).map(|_| ())).map_err(crate::failure::device);
+                .and_then(|()| {
+                    let _wait = moda_engine::prof::span("canvas.output.wait_readback");
+                    self.slot.collect(renderer).map(|output| {
+                        if moda_engine::prof::capturing() { moda_engine::prof::capture_add("canvas.world_gpu", output.timing.gpu_ms); }
+                    })
+                }).map_err(crate::failure::device);
             match drawn {
                 Ok(()) => break,
                 Err(error) => {
@@ -177,6 +188,7 @@ impl World {
                 }
             }
         }
+        drop(paused);
         let params = crate::init(&renderer.device,"world picture planes",bytemuck::cast_slice(&[
             self.slot.view.post.display_base.expect("world view staging"),self.size[0],self.size[1],0u32]),wgpu::BufferUsages::UNIFORM);
         let target=self.picture.create_view(&Default::default());
@@ -184,7 +196,20 @@ impl World {
             crate::entry(0,self.slot.view.post.pixels.as_entire_binding()),crate::entry(1,wgpu::BindingResource::TextureView(&target)),crate::entry(2,params.as_entire_binding()),
         ]});
         let mut encoder=renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {label:Some("world picture")});
-        {let mut pass=encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());pass.set_pipeline(&self.copy);pass.set_bind_group(0,&group,&[]);pass.dispatch_workgroups(self.size[0].div_ceil(8),self.size[1].div_ceil(8),1);}
+        {
+            #[cfg(feature = "frame-profile")]
+            let _profile = moda_engine::prof::span("canvas.world_picture_copy");
+            let timestamps = moda_engine::gpu_profile::pass_timestamps();
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: moda_engine::gpu_profile::compute_writes(&timestamps),
+            });
+            pass.set_pipeline(&self.copy);
+            pass.set_bind_group(0,&group,&[]);
+            pass.dispatch_workgroups(self.size[0].div_ceil(8),self.size[1].div_ceil(8),1);
+        }
+        #[cfg(feature = "frame-profile")]
+        crate::frame_profile::count("queue_submissions", 1);
         renderer.queue.submit([encoder.finish()]);
         Ok(&self.picture)
     }

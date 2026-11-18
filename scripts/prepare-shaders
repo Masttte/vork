@@ -5,8 +5,11 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import shutil
+import time
 
-from shader_bundle import export
+from shader_bundle import export, ENTRY
+from shader_compiler import preparation_identity
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--binary', type=Path, required=True)
@@ -36,8 +39,76 @@ if (root / 'scenes').is_dir():
 if a.output.exists():
     p.error('output already exists')
 with tempfile.TemporaryDirectory(prefix='vork-release-shaders-') as temporary:
-    cache = a.cache.resolve() if a.cache else Path(temporary)
-    subprocess.run([str(binary), 'prepare-release-shaders', *map(str, scenes)], env=dict(os.environ, VORK_CACHE_DIR=str(cache)), check=True)
-    # A previously packaged binary can read its immutable assets instead of
-    # writing duplicates into the mutable store. Retain those entries too.
-    export(binary, [binary.parent / 'shaders', cache], a.output)
+    temporary = Path(temporary)
+    cache = temporary / 'run'
+    cache.mkdir()
+    env = dict(os.environ, VORK_CACHE_DIR=str(cache))
+    executable = binary
+    if a.cache:
+        # The renderer already verifies and materializes requested installed
+        # assets into its mutable store. Give this run a temporary installed
+        # layout backed by the persistent portable store, never a driver cache.
+        a.cache = a.cache.resolve() / preparation_identity(binary)
+        a.cache.mkdir(parents=True, exist_ok=True)
+        staged = temporary / 'bin'
+        staged.mkdir()
+        def link(source, target):
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+        executable = staged / binary.name
+        link(binary, executable)
+        for name in ('vork-slang-filesystem', 'vork-slang-filesystem.exe'):
+            if (binary.parent / name).is_file():
+                link(binary.parent / name, staged / name)
+        for name in ('libraries', 'slang', 'oidn'):
+            if (binary.parent / name).is_dir():
+                shutil.copytree(binary.parent / name, staged / name, copy_function=link)
+        for library in binary.parent.glob('*.dll'):
+            link(library, staged / library.name)
+        assets = staged / 'shaders'
+        assets.mkdir()
+        for source in (a.cache, binary.parent / 'shaders'):
+            for entry in source.glob('*.entry.xz'):
+                if ENTRY.fullmatch(entry.name.removesuffix('.xz')):
+                    target = assets / entry.name
+                    if target.exists():
+                        target.unlink()
+                    try:
+                        link(entry, target)
+                    except FileNotFoundError:
+                        pass  # Concurrent eviction is an ordinary cache miss.
+    started = time.monotonic()
+    subprocess.run([str(executable), 'prepare-release-shaders', *map(str, scenes)], env=env, check=True)
+    # Every used installed asset is expanded into this fresh store. Obsolete
+    # artifacts stay in the persistent store and cannot leak into the bundle.
+    export(binary, [cache], a.output)
+    if a.cache:
+        for entry in a.output.glob('*.entry.xz'):
+            with tempfile.NamedTemporaryFile(dir=a.cache, delete=False) as file:
+                staged = Path(file.name)
+                with entry.open('rb') as source:
+                    shutil.copyfileobj(source, file)
+            os.replace(staged, a.cache / entry.name)
+        # Old compiler namespaces share a bounded build-only inventory. Staged
+        # readers own hardlinks/copies, so removing an old name cannot hurt them.
+        entries = []
+        for entry in a.cache.parent.glob('*/*.entry.xz'):
+            if ENTRY.fullmatch(entry.name.removesuffix('.xz')):
+                try:
+                    stat = entry.stat()
+                    entries.append((stat.st_mtime_ns, entry, stat.st_size))
+                except FileNotFoundError:
+                    pass
+        total = sum(size for _, _, size in entries)
+        for age, entry, size in sorted(entries):
+            if total <= 2 * 1024**3:
+                break
+            try:
+                if entry.stat().st_mtime_ns == age:
+                    entry.unlink(); total -= size
+            except FileNotFoundError:
+                pass
+    print(f'shader preparation: {time.monotonic() - started:.3f}s, '
+          f'{len(list(a.output.glob("*.xz")))} portable entries', flush=True)

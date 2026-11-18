@@ -41,6 +41,10 @@ class Evaluator:
         if n.type == 'REROUTE': return v(0)
         if n.type in ('VALUE', 'RGB'): return output.default_value
         if n.type == 'BLACKBODY': return blackbody(float(v('Temperature')))
+        if n.type == 'LIGHT_FALLOFF':
+            if output.name == 'Quadratic' and float(v('Smooth')) == 0.:
+                return float(v('Strength'))
+            raise UnsupportedLight(f'{n.name}.{output.name}: nonquadratic or smoothed falloff depends on receiver distance')
         if n.type == 'MATH':
             a = float(v(0)); op = n.operation
             unary = {'ABSOLUTE': abs, 'SQRT': lambda a: math.sqrt(max(a, 0)),

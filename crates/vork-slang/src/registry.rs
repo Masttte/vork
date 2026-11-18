@@ -55,6 +55,8 @@ registry! {
     // Compiler effect-output slots for per-closure dispersion and wavelength
     // dependency proofs, independent of selected-lobe storage.
     // Surface emission alone defines sampled source support. Lit is authored response.
+    // Nonzero scattering weights, independent of opacity and emission.
+    EFFECT_SURFACE_SCATTERING: u32 => u32, "REG_EFFECT_SURFACE_SCATTERING" = 28u32;
     EFFECT_SURFACE_WEIGHTED_IOR: u32 => u32, "REG_EFFECT_SURFACE_WEIGHTED_IOR" = 26u32;
     EFFECT_LIT_WEIGHTED_IOR: u32 => u32, "REG_EFFECT_LIT_WEIGHTED_IOR" = 27u32;
     EFFECT_SURFACE_EMISSION: u32 => u32, "REG_EFFECT_SURFACE_EMISSION" = 23u32;

@@ -13,6 +13,8 @@ use crate::{api::DeferredCommandBufferActions, *};
 #[derive(Debug, Clone)]
 pub struct Queue {
     pub(crate) inner: dispatch::DispatchQueue,
+    #[cfg(std)]
+    pub(crate) pending_reservations: alloc::sync::Arc<std::sync::Mutex<alloc::vec::Vec<alloc::sync::Arc<crate::optional_allocations::Lease>>>>,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(Queue: Send, Sync);
@@ -31,6 +33,8 @@ impl Queue {
     pub fn from_custom<T: custom::QueueInterface>(queue: T) -> Self {
         Self {
             inner: dispatch::DispatchQueue::custom(queue),
+            #[cfg(std)]
+            pending_reservations: Default::default(),
         }
     }
 }
@@ -61,6 +65,8 @@ pub struct QueueWriteBufferView {
     buffer: Buffer,
     offset: BufferAddress,
     inner: dispatch::DispatchQueueWriteBuffer,
+    #[cfg(std)]
+    reservation: Option<alloc::sync::Arc<crate::optional_allocations::Lease>>,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(QueueWriteBufferView: Send, Sync);
@@ -78,6 +84,8 @@ impl Drop for QueueWriteBufferView {
         self.queue
             .inner
             .write_staging_buffer(&self.buffer.inner, self.offset, &self.inner);
+        #[cfg(std)]
+        self.queue.retain_upload(self.reservation.take());
     }
 }
 
@@ -155,7 +163,11 @@ impl Queue {
     ///   be able to use [`StagingBelt`](crate::util::StagingBelt),
     ///   or buffers you explicitly create, map, and unmap yourself.
     pub fn write_buffer(&self, buffer: &Buffer, offset: BufferAddress, data: &[u8]) {
+        #[cfg(std)]
+        let admission = crate::optional_allocations::admit(data.len() as u64);
         self.inner.write_buffer(&buffer.inner, offset, data);
+        #[cfg(std)]
+        self.retain_upload(admission.lease);
     }
 
     /// Prepares to write data to a buffer via a mapped staging buffer.
@@ -201,12 +213,16 @@ impl Queue {
         profiling::scope!("Queue::write_buffer_with");
         self.inner
             .validate_write_buffer(&buffer.inner, offset, size)?;
+        #[cfg(std)]
+        let admission = crate::optional_allocations::admit(size.get());
         let staging_buffer = self.inner.create_staging_buffer(size)?;
         Some(QueueWriteBufferView {
             queue: self.clone(),
             buffer: buffer.clone(),
             offset,
             inner: staging_buffer,
+            #[cfg(std)]
+            reservation: admission.lease,
         })
     }
 
@@ -238,7 +254,11 @@ impl Queue {
         data_layout: TexelCopyBufferLayout,
         size: Extent3d,
     ) {
+        #[cfg(std)]
+        let admission = crate::optional_allocations::admit(data.len() as u64);
         self.inner.write_texture(texture, data, data_layout, size);
+        #[cfg(std)]
+        self.retain_upload(admission.lease);
     }
 
     /// Schedule a copy of data from `image` into `texture`.
@@ -266,12 +286,23 @@ impl Queue {
             actions.append(&mut comb.actions.lock());
             comb.buffer
         });
+        // Detach reservations before submit. Concurrent writes that arrive later
+        // keep their credits through a later submit, never an earlier one.
+        #[cfg(std)]
+        let reservations = core::mem::take(&mut *self.pending_reservations.lock().unwrap());
         let index = self.inner.submit(&mut command_buffers);
+        #[cfg(std)]
+        if !reservations.is_empty() { self.on_submitted_work_done(move || drop(reservations)); }
 
         // Execute all deferred actions after submit.
         actions.execute(&self.inner);
 
         SubmissionIndex { index }
+    }
+
+    #[cfg(std)]
+    fn retain_upload(&self, reservation: Option<alloc::sync::Arc<crate::optional_allocations::Lease>>) {
+        if let Some(reservation) = reservation { self.pending_reservations.lock().unwrap().push(reservation); }
     }
 
     /// Gets the amount of nanoseconds each tick of a timestamp query represents.

@@ -690,8 +690,8 @@ impl Export {
         let material_keys = plan.material_inputs();
         for (slot, (material, input)) in material_keys.iter().enumerate() {
             let default = match scene.materials[material].inputs.get(input) {
-                Some(Input::Number(v)) => animation::Sample::Numeric(vec![*v]),
-                Some(Input::Vector(v)) => animation::Sample::Numeric(v.clone()),
+                Some(Input::Number(v)) => animation::Sample::numeric(vec![*v]),
+                Some(Input::Vector(v)) => animation::Sample::numeric(v.clone()),
                 Some(Input::Bool(v)) => animation::Sample::Bool(*v),
                 None => {
                     let p = v2::OpenPbrParam::find(input).with_context(|| {
@@ -699,7 +699,7 @@ impl Export {
                             "material {material}.{input}: author a numeric base value before export"
                         )
                     })?;
-                    animation::Sample::Numeric(vec![0.; p.default.len().max(1)])
+                    animation::Sample::numeric(vec![0.; p.default.len().max(1)])
                 }
                 _ => bail!(
                     "material {material}.{input}: freeze resource/enum animation to a numeric value before exporting"
@@ -728,7 +728,7 @@ impl Export {
             let (material, input) = &material_keys[binding.parameter];
             let value = match value {
                 animation::Sample::Numeric(v) if v.len() == 1 => Input::Number(v[0]),
-                animation::Sample::Numeric(v) => Input::Vector(v.clone()),
+                animation::Sample::Numeric(v) => Input::Vector(v.to_vec()),
                 animation::Sample::Bool(v) => Input::Bool(*v),
                 animation::Sample::Style(_) => unreachable!("CSS/SVG channels do not bind material inputs"),
                 animation::Sample::String(_) => bail!("export does not admit animated enum inputs"),

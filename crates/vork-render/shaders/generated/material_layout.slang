@@ -5,3 +5,5 @@ static const uint MATERIAL_OPACITY=30u;static const uint MATERIAL_OPACITY_WORD=4
 static const uint MATERIAL_CUTOFF=38u;static const uint MATERIAL_CUTOFF_WORD=62u;
 static const uint MATERIAL_THIN=31u;static const uint MATERIAL_THIN_WORD=47u;static const uint MATERIAL_TRANSMISSION=8u;static const uint MATERIAL_TRANSMISSION_WORD=12u;
 static const uint MATERIAL_COAT_NORMAL=34u;static const uint MATERIAL_COAT_NORMAL_WORD=54u;static const uint MATERIAL_NORMAL=32u;static const uint MATERIAL_NORMAL_WORD=48u;static const uint MATERIAL_TANGENT=33u;static const uint MATERIAL_TANGENT_WORD=51u;static const uint MATERIAL_COAT_TANGENT=35u;static const uint MATERIAL_COAT_TANGENT_WORD=57u;static const uint MATERIAL_OCCLUSION=39u;
+static const uint MATERIAL_EMISSION_COLOR_WORD=40u;
+static const uint MATERIAL_EMISSION_LUMINANCE_WORD=39u;

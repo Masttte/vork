@@ -321,9 +321,9 @@ pub struct VectorOp {
     /// (vectorTextShaders.ts:886-906, TEXT_ADDITIVE_BLEND :92-95).
     pub additive: bool,
     /// Tess: flat `[x0,y0, x1,y1, ...]` triangle list.
-    pub tris: Vec<f32>,
+    pub tris: std::sync::Arc<Vec<f32>>,
     /// Analytic*: per-glyph instance records.
-    pub records: Vec<VectorAnalyticRecord>,
+    pub records: std::sync::Arc<Vec<VectorAnalyticRecord>>,
     /// `AnalyticGradient` only: this op's own gradient — a text range's
     /// `--nf-text-fill` (`crate::run_fill`). `None` = the node's
     /// [`VectorNodeOps::gradient`].
@@ -2577,8 +2577,8 @@ pub fn ops(
                         blur_px: 0.0,
                         stroke_px: 0.0,
                         additive: false,
-                        tris: wall_tris,
-                        records: Vec::new(),
+                        tris: wall_tris.into(),
+                        records: Default::default(),
                         gradient: None,
                         paint: None,
                     });
@@ -2601,8 +2601,8 @@ pub fn ops(
                     &all_primitive_tris,
                     pass.pen_offset_x as f32,
                     pass.pen_offset_y as f32,
-                ),
-                records: Vec::new(),
+                ).into(),
+                records: Default::default(),
                 gradient: None,
                 paint: None,
             });
@@ -2677,8 +2677,8 @@ pub fn ops(
                 blur_px: pass.blur_px as f32,
                 stroke_px: pass.stroke_px as f32,
                 additive: pass.additive,
-                tris: Vec::new(),
-                records,
+                tris: Default::default(),
+                records: records.into(),
                 gradient: None,
                 paint: None,
             });
@@ -2703,8 +2703,8 @@ pub fn ops(
             blur_px: 0.0,
             stroke_px: 0.0,
             additive: false,
-            tris: tris.clone(),
-            records: Vec::new(),
+            tris: tris.clone().into(),
+            records: Default::default(),
             gradient: None,
             paint: supplied(paint),
         });
@@ -2732,8 +2732,8 @@ pub fn ops(
                 blur_px: 0.0,
                 stroke_px: 0.0,
                 additive: false,
-                tris: Vec::new(),
-                records: records.clone(),
+                tris: Default::default(),
+                records: records.clone().into(),
                 gradient: None,
                 paint: *paint,
             });
@@ -2750,8 +2750,8 @@ pub fn ops(
                 blur_px: 0.0,
                 stroke_px: 0.0,
                 additive: false,
-                tris: Vec::new(),
-                records: records.clone(),
+                tris: Default::default(),
+                records: records.clone().into(),
                 gradient: Some(crate::run_fill::gradient_uniforms(g, box_w, box_h)),
                 paint: None,
             });
@@ -2773,8 +2773,8 @@ pub fn ops(
             blur_px: 0.0,
             stroke_px: 0.0,
             additive: false,
-            tris: tris.clone(),
-            records: Vec::new(),
+            tris: tris.clone().into(),
+            records: Default::default(),
             gradient: None,
             paint: supplied(paint),
         });
@@ -2931,12 +2931,12 @@ mod tests {
                 ));
                 node.height = Some(200.0);
                 let top = expected_vector(&node, &store, &catalog, placement, "text must render");
-                let top_records: Vec<_> = top.ops.iter().flat_map(|op| &op.records).collect();
+                let top_records: Vec<_> = top.ops.iter().flat_map(|op| op.records.iter()).collect();
                 assert!(!top_records.is_empty());
                 for (alignment, fraction) in [("middle", 0.5), ("bottom", 1.0)] {
                     node.vertical_align = Some(alignment.into());
                     let aligned = expected_vector(&node, &store, &catalog, placement, "text must render");
-                    let aligned_records: Vec<_> = aligned.ops.iter().flat_map(|op| &op.records).collect();
+                    let aligned_records: Vec<_> = aligned.ops.iter().flat_map(|op| op.records.iter()).collect();
                     assert_eq!(aligned_records.len(), top_records.len());
                     let offset = (200.0 - f64::from(lines) * 40.0) * fraction;
                     for (original, actual) in top_records.iter().zip(aligned_records) {
@@ -4168,7 +4168,7 @@ mod tests {
                 "expected vector decision",
             );
             let mut counts: Vec<(i64, usize)> = Vec::new();
-            for r in &ops.ops[0].records {
+            for r in ops.ops[0].records.iter() {
                 let y = r.baseline_y.round() as i64;
                 match counts.last_mut() {
                     Some((ly, n)) if *ly == y => *n += 1,
@@ -4228,7 +4228,7 @@ mod tests {
         let recs = &ops.ops[0].records;
         assert_eq!(recs.len(), 4);
         let mut last_y = -1.0f32;
-        for r in recs {
+        for r in recs.iter() {
             let mid_x = (r.em_box[0] + r.em_box[2]) * 0.5; // em units; bounds centre ± AA pad is symmetric
             let on = drawn(r, mid_x, 0.0);
             assert!((on.0 - 100.0).abs() < 0.05, "{on:?}");
@@ -4263,7 +4263,7 @@ mod tests {
                 s.text_path.as_mut().unwrap().start_offset = offset;
                 let measure = crate::text_path::PathMeasure::new(&ring, true, false).unwrap();
                 let ops = expected_vector(&s, &store, &catalog, VectorPlacement::VectorParity, "vector");
-                let records: Vec<_> = ops.ops.iter().flat_map(|o| &o.records).collect();
+                let records: Vec<_> = ops.ops.iter().flat_map(|o| o.records.iter()).collect();
                 assert!(!records.is_empty());
                 assert!(records.len() < 36, "overset glyphs must be hidden");
                 let mut previous = -1.0;
@@ -4347,7 +4347,7 @@ mod tests {
     fn path_anchors(ops: &crate::vector::VectorNodeOps) -> Vec<(f64, (f64, f64), f32)> {
         ops.ops
             .iter()
-            .flat_map(|o| &o.records)
+            .flat_map(|o| o.records.iter())
             .map(|r| {
                 let mid = (r.em_box[0] + r.em_box[2]) * 0.5;
                 let at = drawn(r, mid, 0.0);
@@ -4416,7 +4416,7 @@ mod tests {
             let boundary = ops
                 .ops
                 .iter()
-                .flat_map(|o| &o.records)
+                .flat_map(|o| o.records.iter())
                 .filter(|rec| rec.font_size_px == second as f32)
                 .map(|rec| rec.pen_x as f64)
                 .fold(f64::INFINITY, f64::min);
@@ -4457,7 +4457,7 @@ mod tests {
         let records = &ops.ops[0].records;
         // Baselines: three lines, each with its counter glyphs before the text.
         let mut lines: Vec<(f32, Vec<f32>)> = Vec::new();
-        for r in records {
+        for r in records.iter() {
             match lines.last_mut() {
                 Some((y, xs)) if (*y - r.baseline_y).abs() < 0.5 => xs.push(r.pen_x),
                 _ => lines.push((r.baseline_y, vec![r.pen_x])),
@@ -4666,7 +4666,7 @@ mod tests {
         assert_eq!(ops.ops[0].records.len(), 5);
         // No unitTransforms → every record is identity → shader fast-path → byte-exact.
         for op in &ops.ops {
-            for r in &op.records {
+            for r in op.records.iter() {
                 assert_eq!(r.glyph_lin, [1.0, 0.0, 0.0, 1.0]);
                 assert_eq!(r.glyph_off, [0.0, 0.0]);
                 assert_eq!(r.glyph_opacity, 1.0);

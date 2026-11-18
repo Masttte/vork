@@ -155,6 +155,7 @@ impl Source {
         })
     }
     pub(crate) fn frame_exact(&mut self,time:&Germ,fps:vork_time::Time,max_side:u32)->Result<image::DynamicImage> {
+        let _decode = moda_engine::prof::span("canvas.input_decode");
         let index=self.frame_index_exact(time,fps)?;
         match self {
             Self::Sequence {files,..} => {
@@ -171,6 +172,7 @@ impl Source {
     /// (an environment), and a colour that conversion carries outside the upload's gamut is limited to it
     /// (`texture_source::decode_light`).
     pub(crate) fn frame_color_exact(&mut self,time:&Germ,fps:vork_time::Time,max_side:u32,explicit:Option<vork_scene::v2::ColorSpace>,upload:vork_scene::v2::WorkingColorSpace,light:bool)->Result<image::DynamicImage> {
+        let _decode = moda_engine::prof::span("canvas.input_decode");
         let index=self.frame_index_exact(time,fps)?;
         match self {
             Self::Sequence {files,..} => {
@@ -925,6 +927,7 @@ impl Installed {
             self.mips.encode(encoder,None);
             return Ok(());
         }
+        let _decode = moda_engine::prof::span("canvas.input_decode");
         let source=self.source.as_ref().expect("a file source");
         let frame=source.lock().unwrap().frame_color_exact(time,fps,r.device.limits().max_texture_dimension_2d,self.color_space,self.upload,false)
             .map_err(|error|crate::texture_source::for_image(error,&self.name))?;

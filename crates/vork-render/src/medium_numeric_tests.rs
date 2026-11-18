@@ -1,5 +1,75 @@
 use super::*;
 use wgpu::util::DeviceExt;
+
+/// Signed crossings must cancel outside a closed carrier, including rays through
+/// tangent edges and vertices, independently of face diagonals and orientation.
+#[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+fn medium_boundary_winding_matches_closed_carrier_membership() -> Result<()> {
+    let r=crate::test_renderer()?;
+    let mut cases=Vec::<[f32;4]>::new();
+    for (scale,translation) in [([1.,1.,1.],[0.,0.,0.]),([0.25,4.,2.],[8.,-4.,2.]),([-2.,0.5,4.],[-8.,2.,-4.])] {
+        for diagonal in [0.,1.] {for reverse in [0.,1.] {
+            for x in [-3.,0.,3.] {for y in [-3.,0.,3.] {for z in [-3.,0.,3.] {
+                for dx in -2..=2 {for dy in -2..=2 {for dz in -2..=2 {
+                    if dx==0 && dy==0 && dz==0 {continue;}
+                    let origin=[x,y,z];let direction=[dx as f32,dy as f32,dz as f32];
+                    let expected=if origin==[0.;3] {1.} else {0.};
+                    cases.extend([
+                        [x*scale[0]+translation[0],y*scale[1]+translation[1],z*scale[2]+translation[2],expected],
+                        [direction[0]*scale[0],direction[1]*scale[1],direction[2]*scale[2],0.],
+                        [scale[0],scale[1],scale[2],diagonal],
+                        [translation[0],translation[1],translation[2],reverse],
+                    ]);
+                }}}
+            }}}
+        }}
+    }
+    let source=r#"
+import vork_medium_domain;
+[[vk::binding(0,0)]] RWStructuredBuffer<float4> values;
+[[vk::binding(1,0)]] StructuredBuffer<float4> cases;
+[shader("compute")][numthreads(1,1,1)] void numerical_test(uint3 id:SV_DispatchThreadID) {
+    let origin=cases[id.x*4u].xyz;let direction=cases[id.x*4u+1u].xyz;
+    let scale=cases[id.x*4u+2u];let translation=cases[id.x*4u+3u];
+    float3 vertices[8]={float3(-1.,-1.,-1.),float3(1.,-1.,-1.),float3(1.,1.,-1.),float3(-1.,1.,-1.),
+        float3(-1.,-1.,1.),float3(1.,-1.,1.),float3(1.,1.,1.),float3(-1.,1.,1.)};
+    uint4 faces[6]={uint4(0,3,2,1),uint4(4,5,6,7),uint4(0,4,7,3),uint4(1,2,6,5),uint4(0,1,5,4),uint4(3,7,6,2)};
+    var winding=0.;
+    for(var face=0u;face<6u;face++) {for(var half=0u;half<2u;half++) {
+        let q=faces[face];
+        var indices=scale.w==0. ? (half==0u ? uint3(q.x,q.y,q.z) : uint3(q.x,q.z,q.w))
+            : (half==0u ? uint3(q.y,q.z,q.w) : uint3(q.y,q.w,q.x));
+        if(translation.w!=0.) {indices=indices.xzy;}
+        let a=vertices[indices.x]*scale.xyz+translation.xyz;
+        let b=vertices[indices.y]*scale.xyz+translation.xyz;
+        let c=vertices[indices.z]*scale.xyz+translation.xyz;
+        let edge1=b-a;let edge2=c-a;let determinant=dot(edge1,cross(direction,edge2));
+        if(abs(determinant)<=1e-20 || !volume_crosses(a,b,c,origin,direction)) {continue;}
+        let distance=dot(edge2,cross(origin-a,edge1))/determinant;
+        if(distance>0.) {winding+=sign(determinant);}
+    }}
+    values[id.x]=float4(winding,0.,0.,0.);
+}"#;
+    let count=cases.len()/4;let bytes=(count*16) as u64;
+    let output=crate::gpu_memory::buffer(&r.device,&wgpu::BufferDescriptor {label:Some("medium boundary winding"),size:bytes,usage:wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false});
+    let input=r.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {label:None,contents:bytemuck::cast_slice(&cases),usage:wgpu::BufferUsages::STORAGE});
+    let readback=crate::gpu_memory::buffer(&r.device,&wgpu::BufferDescriptor {label:None,size:bytes,usage:wgpu::BufferUsages::MAP_READ|wgpu::BufferUsages::COPY_DST,mapped_at_creation:false});
+    let entries=[pipelines::buffer_entry(0,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:false}),pipelines::buffer_entry(1,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:true})];
+    let pipeline=test_pipeline(&r,source,&Native::default(),&entries,(1,1,1))?;
+    let bind=r.device.create_bind_group(&wgpu::BindGroupDescriptor {label:None,layout:&pipeline.get_bind_group_layout(0),entries:&[entry(0,output.as_entire_binding()),entry(1,input.as_entire_binding())]});
+    let mut encoder=r.device.create_command_encoder(&Default::default());
+    {let mut pass=encoder.begin_compute_pass(&Default::default());pass.set_pipeline(&pipeline);pass.set_bind_group(0,&bind,&[]);pass.dispatch_workgroups(count as u32,1,1);}
+    encoder.copy_buffer_to_buffer(&output,0,&readback,0,bytes);
+    let submission=r.queue.submit([encoder.finish()]);let (tx,rx)=std::sync::mpsc::channel();
+    readback.map_async(wgpu::MapMode::Read,..,move |v| {let _=tx.send(v);});r.device.poll(wgpu::PollType::Wait {submission_index:Some(submission),timeout:None})?;rx.recv()??;
+    let mapped=readback.get_mapped_range(..);let values:&[[f32;4]]=bytemuck::cast_slice(&mapped);
+    for (i,case) in cases.chunks_exact(4).enumerate() {
+        assert_eq!(values[i][0].abs(),case[0][3],"closed-carrier winding case {i}: {case:?}");
+    }
+    r.errors.check()?;Ok(())
+}
+
 #[test]
 #[ignore = "requires pinned Slang and Vulkan (lavapipe works)"]
 fn path_medium_free_flight_and_phase() -> Result<()> {
@@ -675,6 +745,102 @@ fn fog_admission_segment_witness(r:&Renderer)->Result<()> {
     Ok(())
 }
 
+/// A medium that emits and has no extinction covers nothing, and its glow over a
+/// transparent background is radiance at alpha zero. The float readback is
+/// associated colour and keeps it. Raw colour has the analytic value E.
+/// Denoised colour must match the same medium over black, not E: OIDN is
+/// a reconstruction filter, including at zero alpha, not an exact integrator.
+#[test]
+#[ignore="requires real GPU and pinned Slang"]
+fn uncovered_medium_emission_survives_in_associated_float_output() -> Result<()> {
+    let r = crate::test_renderer()?;
+    let fixture:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/analytic.json"))?;
+    let positions=fixture["buffers"]["shape_box_position"]["data"].clone();
+    let count=positions.as_array().unwrap().len() as u32;
+    for denoise in [false,true] {
+        let mut settings=serde_json::json!({"integrator":"path","samples":4});
+        if !denoise {settings["denoiser"]=serde_json::Value::Null;}
+        let mut images=Vec::new();
+        for background in [serde_json::json!("transparent"),serde_json::json!([0,0,0])] {
+        let scene:vork_scene::v2::Scene=vork_scene::v2::from_test_value(serde_json::json!({
+            "version":2,"render":{"resolution":[16,16],"background":background,"settings":settings},
+            "buffers":{"p":{"type":"vec3","data":positions},"i":{"type":"u32","data":(0..count).collect::<Vec<u32>>()}},
+            "geometry":{"carrier":{"attributes":{"POSITION":"p"},"indices":"i"}},
+            "programs":{"glow":{"source":"struct Inputs {}; MediumCoefficients medium(MediumContext c, Inputs i) {MediumCoefficients m={};m.emission=float3(0.4,0.8,1.2);return m;}"}},
+            "materials":{"glow":{"program":"glow"}},
+            "nodes":[{"type":"camera","translation":[0,0,2],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":0.1}}},
+                {"type":"mesh","name":"glow","geometry":"carrier","materials":["glow"]}]
+        }))?;
+        ensure!(scene.render.settings.integrator.denoiser().is_some()==denoise,"denoiser setting");
+        let mut installed=r.install_with_options(scene,Path::new("."),InstallOptions {test_participating_media:false,..Default::default()})?;
+        let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+        let output=installed.render_frame(&r,&mut slot,0.)?;
+        images.push(output.linear_rgba.context("missing glow image")?);
+        }
+        for (pixel,black) in images[0].iter().zip(&images[1]) {
+            ensure!(pixel[3]==0.,"a medium without extinction covers nothing (denoise {denoise}): {pixel:?}");
+            ensure!(black[3]==1.,"opaque control: {black:?}");
+            for c in 0..3 {
+                ensure!(pixel[c].is_finite() && pixel[c]>0.,"lost uncovered emission (denoise {denoise}): {pixel:?}");
+                ensure!((pixel[c]-black[c]).abs()<1e-5,"background changed associated RGB (denoise {denoise}): {pixel:?} vs {black:?}");
+                if !denoise {ensure!((pixel[c]-[0.4,0.8,1.2][c]).abs()<1e-3,"raw uncovered emission: {pixel:?}");}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Two coincident carriers whose certified bounds are each finite and whose
+/// sum leaves the float range: no certificate is broken, the scene's numbers
+/// are out of range. The frame is refused as the scene's (exit 3).
+#[test]
+#[ignore="requires real GPU and pinned Slang"]
+fn overlapping_bounds_past_float_range_refuse_as_the_scene() -> Result<()> {
+    let r = crate::test_renderer()?;
+    let fixture:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/analytic.json"))?;
+    let positions=fixture["buffers"]["shape_box_position"]["data"].clone();
+    let count=positions.as_array().unwrap().len() as u32;
+    let scene:vork_scene::v2::Scene=vork_scene::v2::from_test_value(serde_json::json!({
+        "version":2,"render":{"resolution":[4,4],"background":"environment","settings":{"integrator":"path","samples":1,"denoiser":null}},
+        "buffers":{"p":{"type":"vec3","data":positions},"i":{"type":"u32","data":(0..count).collect::<Vec<u32>>()}},
+        "geometry":{"carrier":{"attributes":{"POSITION":"p"},"indices":"i"}},
+        "programs":{"dense":{"source":"struct Inputs {}; MediumCoefficients medium(MediumContext c, Inputs i) {MediumCoefficients m={};m.absorption=float3(1.8e38+1e36*c.position.z);return m;}"}},
+        "materials":{"dense":{"program":"dense"}},
+        "nodes":[{"type":"camera","translation":[0,0,0],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":0.1,"clip_start":0.0001}}},
+            {"type":"light","shape":"environment","color":[1,1,1],"energy":1},
+            {"type":"mesh","name":"a","geometry":"carrier","materials":["dense"]},
+            {"type":"mesh","name":"b","geometry":"carrier","materials":["dense"]}]
+    }))?;
+    let mut installed=r.install_with_options(scene,Path::new("."),InstallOptions {test_participating_media:false,..Default::default()})?;
+    let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+    let error=installed.render_frame(&r,&mut slot,0.).err().context("an overflowing summed bound delivered a frame")?;
+    let message=format!("{error:#}");
+    ensure!(message.contains("medium tracking rate exceeds finite numeric range"),"{message}");
+    ensure!(crate::failure::exit_code(&error)==3,"a numeric-range refusal is the scene's: {message}");
+    // One component alone: a constant medium whose finite absorption and
+    // scattering add past the float range, beside an ordinary varying one.
+    let scene:vork_scene::v2::Scene=vork_scene::v2::from_test_value(serde_json::json!({
+        "version":2,"render":{"resolution":[4,4],"background":"environment","settings":{"integrator":"path","samples":1,"denoiser":null}},
+        "buffers":{"p":{"type":"vec3","data":fixture["buffers"]["shape_box_position"]["data"].clone()},"i":{"type":"u32","data":(0..count).collect::<Vec<u32>>()}},
+        "geometry":{"carrier":{"attributes":{"POSITION":"p"},"indices":"i"}},
+        "programs":{
+            "thin":{"source":"struct Inputs {}; MediumCoefficients medium(MediumContext c, Inputs i) {MediumCoefficients m={};m.absorption=float3(.1+.01*c.position.z);return m;}"},
+            "dense":{"source":"struct Inputs {}; MediumCoefficients medium(MediumContext c, Inputs i) {MediumCoefficients m={};m.absorption=float3(1.8e38);m.scattering=float3(1.8e38);return m;}"}},
+        "materials":{"thin":{"program":"thin"},"dense":{"program":"dense"}},
+        "nodes":[{"type":"camera","translation":[0,0,0],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":0.1,"clip_start":0.0001}}},
+            {"type":"light","shape":"environment","color":[1,1,1],"energy":1},
+            {"type":"mesh","name":"a","geometry":"carrier","materials":["thin"]},
+            {"type":"mesh","name":"b","geometry":"carrier","materials":["dense"]}]
+    }))?;
+    let mut installed=r.install_with_options(scene,Path::new("."),InstallOptions {test_participating_media:false,..Default::default()})?;
+    let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+    let error=installed.render_frame(&r,&mut slot,0.).err().context("an overflowing component delivered a frame")?;
+    let message=format!("{error:#}");
+    ensure!(message.contains("medium tracking rate exceeds finite numeric range"),"{message}");
+    ensure!(crate::failure::exit_code(&error)==3,"a numeric-range refusal is the scene's: {message}");
+    Ok(())
+}
+
 #[test]
 #[ignore="requires real GPU and pinned Slang"]
 fn general_fog_carriers_exceed_old_shape_and_count_limits() -> Result<()> {
@@ -716,6 +882,105 @@ fn general_fog_carriers_exceed_old_shape_and_count_limits() -> Result<()> {
     }
     }
     fog_admission_segment_witness(&r)?;
+    Ok(())
+}
+
+/// Over a transparent background a medium's coverage is what it withholds from
+/// the backdrop. An absorbing, emitting unit box of extinction σ and emission E
+/// has alpha 1-exp(-σ) and premultiplied radiance (E/σ)·alpha, which the float
+/// readback holds; alpha zero would discard the emission.
+#[test]
+#[ignore="requires real GPU and pinned Slang"]
+fn medium_emission_keeps_its_coverage_over_a_transparent_background() -> Result<()> {
+    let r = crate::test_renderer()?;
+    let fixture:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/analytic.json"))?;
+    let positions=fixture["buffers"]["shape_box_position"]["data"].clone();
+    let count=positions.as_array().unwrap().len() as u32;
+    let scene:vork_scene::v2::Scene=vork_scene::v2::from_test_value(serde_json::json!({
+        "version":2,"render":{"resolution":[8,8],"background":"transparent","settings":{"integrator":"path","samples":1,"denoiser":null}},
+        "buffers":{"p":{"type":"vec3","data":positions},"i":{"type":"u32","data":(0..count).collect::<Vec<u32>>()}},
+        "geometry":{"carrier":{"attributes":{"POSITION":"p"},"indices":"i"}},
+        "programs":{"glow":{"source":"struct Inputs {}; MediumCoefficients medium(MediumContext c, Inputs i) {MediumCoefficients m={};m.absorption=float3(0.4);m.emission=float3(0.4,0.8,1.2);return m;}"}},
+        "materials":{"glow":{"program":"glow"}},
+        "nodes":[{"type":"camera","translation":[0,0,2],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":0.1}}},
+            {"type":"mesh","name":"glow","geometry":"carrier","materials":["glow"]}]
+    }))?;
+    let mut installed=r.install_with_options(scene,Path::new("."),InstallOptions {test_participating_media:false,..Default::default()})?;
+    let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+    let output=installed.render_frame(&r,&mut slot,0.)?;
+    let alpha=1.-(-0.4_f32).exp();
+    for pixel in output.linear_rgba.context("missing transparent medium image")? {
+        ensure!((pixel[3]-alpha).abs()<1e-4,"medium coverage: {pixel:?}, expected alpha {alpha}");
+        for (channel,expected) in pixel[..3].iter().zip([1.,2.,3.]) {ensure!((*channel-expected*alpha).abs()<1e-3,"premultiplied emission: {pixel:?}");}
+    }
+    Ok(())
+}
+
+/// Coloured free flights across two carriers: an escaping sample carries the
+/// product of its survival weights, so its coverage estimate is signed (here
+/// 1-2.125) while a scattering sample is covered. Their mean is the coverage,
+/// 1-mean(1,0.01,0.01) = 0.66; clamping each sample first would deliver 0.84.
+#[test]
+#[ignore="requires real GPU and pinned Slang"]
+fn coloured_scattering_coverage_averages_signed_samples() -> Result<()> {
+    let r = crate::test_renderer()?;
+    let fixture:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/analytic.json"))?;
+    let original=fixture["buffers"]["shape_box_position"]["data"].as_array().unwrap();
+    let mut positions=Vec::new();
+    for z in [0.,-3.] {for p in original {
+        positions.push([p[0].as_f64().unwrap(),p[1].as_f64().unwrap(),p[2].as_f64().unwrap()+z]);
+    }}
+    let scene:vork_scene::v2::Scene=vork_scene::v2::from_test_value(serde_json::json!({
+        "version":2,"render":{"resolution":[8,8],"background":"transparent","settings":{"integrator":"path","samples":4096,"denoiser":null}},
+        "buffers":{"p":{"type":"vec3","data":positions},"i":{"type":"u32","data":(0..positions.len() as u32).collect::<Vec<u32>>()}},
+        "geometry":{"carrier":{"attributes":{"POSITION":"p"},"indices":"i"}},
+        "programs":{"haze":{"source":"struct Inputs {}; MediumCoefficients medium(MediumContext c, Inputs i) {MediumCoefficients m={};m.scattering=float3(0.,2.302585093,2.302585093);return m;}"}},
+        "materials":{"haze":{"program":"haze"}},
+        "nodes":[{"type":"camera","translation":[0,0,2],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":0.1}}},
+            {"type":"mesh","name":"haze","geometry":"carrier","materials":["haze"]}]
+    }))?;
+    let mut installed=r.install_with_options(scene,Path::new("."),InstallOptions {test_participating_media:false,..Default::default()})?;
+    let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+    let output=installed.render_frame(&r,&mut slot,0.)?;
+    let pixels=output.linear_rgba.context("missing coloured haze image")?;
+    let mean=pixels.iter().map(|pixel|f64::from(pixel[3])).sum::<f64>()/pixels.len() as f64;
+    ensure!((mean-0.66).abs()<0.01,"coloured scattering coverage: mean alpha {mean}, expected 0.66");
+    Ok(())
+}
+
+/// Null collisions in a production-admitted exponential world must estimate
+/// the same coverage under unit, channel-zero and all-zero radiance gains.
+#[test]
+#[ignore="requires real GPU and pinned Slang"]
+fn propagation_gain_does_not_change_medium_coverage() -> Result<()> {
+    let r = crate::test_renderer()?;
+    let fixture:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/fog-height-carriers.json"))?;
+    // Looking upward from the near plane: optical depths (0, exp(-.0005),
+    // 2*exp(-.0005)). Coloured extinction makes genuine null collisions.
+    let tau=(-0.0005_f64).exp();
+    let expected=1.-(1.+(-tau).exp()+(-2.*tau).exp())/3.;
+    let mut reference=None;
+    for gain in ["float3(1.)","float3(0.,1.,1.)","float3(0.)"] {
+        let scene:vork_scene::v2::Scene=vork_scene::v2::from_test_value(serde_json::json!({
+            "version":2,"render":{"resolution":[8,8],"background":"transparent","settings":{"integrator":"path","samples":4096,"denoiser":null}},
+            "programs":{
+                "haze":fixture["programs"]["fog"],
+                "gain":{"source":format!("struct Inputs {{}}; PropagationStep propagation(PropagationContext c,Inputs i) {{PropagationStep s;s.direction=c.direction;s.distance=.25;s.radiance={gain};return s;}}")}},
+            "propagation":{"program":"gain","bounds":[[-2,-2,-2],[2,2,3]]},
+            "materials":{"haze":{"program":"haze","inputs":{"scattering":[0,0.5,1],"absorption":[0,0,0],"base_height":0,"falloff":0.5,"anisotropy":0}}},
+            "nodes":[{"type":"camera","rotation":[0.7071067811865476,0,0,0.7071067811865476],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":0.1,"clip_start":0.001}}},
+                {"type":"light","shape":"environment","color":[0,0,0],"medium":"haze"}]
+        }))?;
+        let mut installed=r.install_with_options(scene,Path::new("."),InstallOptions {test_participating_media:false,..Default::default()})?;
+        let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+        let output=installed.render_frame(&r,&mut slot,0.)?;
+        let pixels=output.linear_rgba.context("missing propagated haze image")?;
+        let alpha=pixels.iter().map(|pixel|pixel[3]).collect::<Vec<_>>();
+        let mean=alpha.iter().map(|&a|f64::from(a)).sum::<f64>()/alpha.len() as f64;
+        ensure!((mean-expected).abs()<0.01,"coverage under propagation gain {gain}: mean alpha {mean}, expected {expected}");
+        if let Some(ref reference)=reference {ensure!(&alpha==reference,"propagation gain {gain} changed coverage");}
+        else {reference=Some(alpha);}
+    }
     Ok(())
 }
 

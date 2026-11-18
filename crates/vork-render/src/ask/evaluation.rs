@@ -226,10 +226,10 @@ impl CpuScene {
             let default = if material.program == "std/openpbr" {
                 let p = v2::OpenPbrParam::find(input).context("unknown OpenPBR input")?;
                 match material.inputs.get(input) {
-                    Some(v2::Input::Number(v)) => animation::Sample::Numeric(vec![*v]),
-                    Some(v2::Input::Vector(v)) => animation::Sample::Numeric(v.clone()),
+                    Some(v2::Input::Number(v)) => animation::Sample::numeric(vec![*v]),
+                    Some(v2::Input::Vector(v)) => animation::Sample::numeric(v.clone()),
                     Some(v2::Input::Attribute(binding)) => {
-                        animation::Sample::Numeric(match &binding.factor {
+                        animation::Sample::numeric(match &binding.factor {
                             Some(v2::Factor::Number(v)) => vec![*v],
                             Some(v2::Factor::Vector(v)) => v.clone(),
                             None => vec![
@@ -245,7 +245,7 @@ impl CpuScene {
                             ],
                         })
                     }
-                    None => animation::Sample::Numeric(if p.kind == v2::OpenPbrKind::Vector3 {
+                    None => animation::Sample::numeric(if p.kind == v2::OpenPbrKind::Vector3 {
                         vec![0.; 3]
                     } else {
                         p.default.to_vec()

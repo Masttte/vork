@@ -325,7 +325,7 @@ pub struct FrameTiming {
     /// scene had not landed when the exposure was submitted.
     pub variants_pending: bool,
     /// The kernel that drew this frame's path transport, snapshotted when the
-    /// exposure was submitted: "prebuilt engine" or "scene kernel"; None without path transport.
+    /// exposure was submitted: "prebuilt engine", "covering kernel" or "scene kernel"; None without path transport.
     pub path_kernel: Option<&'static str>,
 }
 /// Storage precision is chosen once when a frame slot is installed.
@@ -1044,6 +1044,8 @@ impl FrameSlot {
         time: f32,
         outputs: ReadbackOutputs,
     ) -> Result<()> {
+        #[cfg(feature = "frame-profile")]
+        let _profile_event = crate::frame_profile::event("submit", self.nominal_frame, time);
         self.gpu_check(r)?;
         ensure!(!self.pending, "collect this frame slot before resubmitting");
         ensure!(time.is_finite() && time >= 0., "time must be nonnegative and finite");
@@ -1089,7 +1091,7 @@ impl FrameSlot {
         }
         // The encoders below choose each drawn pipeline by this same pending state.
         let specialized = !self.view.variants_pending();
-        self.path_kernel = s.path.as_ref().map(|path| if path.draws_engine(specialized) { "prebuilt engine" } else { "scene kernel" });
+        self.path_kernel = s.path.as_ref().map(|path| path.drawn_route(specialized));
         ensure!(
             !outputs.float.any() || self.view.float_output,
             "float channels require a Float precision frame slot"
@@ -1330,8 +1332,12 @@ impl FrameSlot {
         if batch {
             let start = Instant::now();
             debug_assert!(recording.is_none());
-            for (buffer, bytes) in &self.exposure_upload {
-                r.queue.write_buffer(buffer, 0, bytes);
+            {
+                #[cfg(feature = "frame-profile")]
+                let _profile = crate::frame_profile::span("queue_upload");
+                for (buffer, bytes) in &self.exposure_upload {
+                    r.queue.write_buffer(buffer, 0, bytes);
+                }
             }
             let (submission, finish_ms) = crate::command_finish::Segments::publish(
                 r, finish_workers.take().unwrap(), &self.sample_upload,
@@ -1383,6 +1389,8 @@ impl FrameSlot {
             "time must be nonnegative and finite"
         );
         self.read_pixels = read_pixels;
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("encode_sample_inclusive");
         let start = Instant::now();
         self.view.queries = self.queries.clone();
         // Rule 7: the environment's movies show its node's local time while its scene-owned tracks
@@ -1501,6 +1509,8 @@ impl FrameSlot {
             );
         }
         self.prep_ms = start.elapsed().as_secs_f64() * 1000.;
+        #[cfg(feature = "frame-profile")]
+        let _profile_recording = crate::frame_profile::span("record_commands_inclusive");
         let mut encoder = recording.unwrap_or_else(|| self.sample_segments.encoder(r, Some("installed sample group")));
         let mut compute_cursor = s
             .compute
@@ -1654,6 +1664,8 @@ impl FrameSlot {
                 }
                 Pass::Deform => self.geometry_chain.encode(&mut encoder, s, &self.queries),
                 Pass::Rays => {
+                    #[cfg(feature = "frame-profile")]
+                    let _profile = crate::frame_profile::span("as_recording");
                     timing::boundary(r, &mut encoder, &self.queries, timing::query("acceleration structures"));
                     crate::rt::encode(&mut encoder, s, self);
                     timing::boundary(r, &mut encoder, &self.queries, timing::query("acceleration structures") + 1);
@@ -1953,6 +1965,8 @@ impl FrameSlot {
             limits.max_storage_buffer_binding_size.min(limits.max_buffer_size)&!3)
     }
     fn collect_readback_inner(&mut self, r: &Renderer) -> Result<FrameReadback> {
+        #[cfg(feature = "frame-profile")]
+        let _profile_event = crate::frame_profile::event("collect", self.nominal_frame, self.submitted_time);
         self.gpu_check(r)?;
         ensure!(self.pending, "frame slot has no submitted frame");
         if let Some(done) = self.completed.take() {
@@ -2187,6 +2201,7 @@ impl FrameSlot {
                 anyhow::bail!("fog path exceeded the work limit; simplify the scene or render fog separately; frame refused");
             }
             if count == vork_slang::registry::PATH_MEDIUM_MAJORANT {
+                if !f32::from_bits(capacity).is_finite() {return Err(self.authored(r, completion, FrameRefused("medium tracking rate exceeds finite numeric range; rescale scene distances and coefficients; frame refused".into()).into()));}
                 return Err(FrameRefused(format!("certified medium extinction bound violated (observed {}): shader produced coefficients outside its compiler certificate; frame refused",f32::from_bits(capacity))).into());
             }
             if count == vork_slang::registry::ENVIRONMENT_INVALID {return Err(self.authored(r, completion, FrameRefused("environment radiance must be finite and nonnegative; fix the environment program; frame refused; see vork help upgrade".into()).into()));}
@@ -2233,6 +2248,11 @@ impl FrameSlot {
         self.gpu_check(r)?;
         // A rejected exposure must not persist partially evaluated compute state.
         if let Some(checkpoint) = self.simulation_checkpoint.take() { checkpoint.publish(); }
+        #[cfg(feature = "frame-profile")]
+        crate::frame_profile::detail("gpu", serde_json::json!({
+            "passes_ms": gpu_spans_ms, "variants_pending": self.view.variants_pending(),
+            "elapsed_ms": timing::elapsed_ms(gpu_begin, gpu_end, r.queue.get_timestamp_period())
+        }));
         Ok(FrameReadback {
             credit: self
                 .read_pixels

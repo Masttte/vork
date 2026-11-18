@@ -12,6 +12,17 @@ second one, and keeps the rest of Moda's text planning (`text_draw.rs`'s plan si
 
 ## Changes
 
+- `src/scratch.rs`, `src/prof.rs`: disposable-frame cancellation discards deferred
+  commands/writes and avoids GPU synchronization during unwind. Shared image
+  publication flushes prerequisite mip commands before other engines can use them.
+
+- `src/paint/draw.rs`, `src/frame.rs`: immutable image uploads can share ownership
+  between engines on one device/working colour. Pixel identity changes replace
+  entries; shared textures are never rewritten or explicitly destroyed by another
+  cache. Weak publication does not pin residency; mutable surfaces/streams stay local.
+- `src/gpu_profile.rs`: disjoint worker/handoff recordings combine on the same GPU
+  clock, retaining every pass and the complete first-to-last span.
+
 - `src/scratch.rs`: destructor-time buffer/texture cleanup uses fallible TLS access and
   borrowing; unavailable scratch state leaves release to wgpu handle ownership.
 - `src/external_texture.rs`: capture registration cleanup tolerates an already-destroyed
@@ -205,3 +216,8 @@ Upstream ignored diagnostic/performance and gallery tests retain their ignored s
   format; the floating-point filter covers any extent), from the image's straight colour where the asset store
   kept it (`DecodedImage::straight`); such an image past the drawing device's texture limit refuses the frame. `RenderOptions::working` names the encoding to the planner, which plans a luminance mask of such a plan as its
   rendered picture unless the mask is one layer of one solid colour (`PlanMasks::in_working_color`).
+
+- `src/frame.rs`: rendered-mask admission uses rotating bounded membership filters so
+  every identity participates; texture reuse still requires exact content keys.
+
+- Parallel canvas shader-image caches also share immutable RGBA8 uploads. Their namespace is separate from colour-managed paint mipmaps; cache eviction drops shared ownership without destroying another engine's image.

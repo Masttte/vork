@@ -187,6 +187,35 @@ struct Draw {
 
 /// A canvas document: its text laid out, its fonts loaded, its tracks compiled.
 pub(crate) struct Document {
+    prepared: Arc<Prepared>,
+    styles: RefCell<Vec<Option<StyledItem>>>,
+    fonts: Fonts,
+    /// The tracks' samples, reused from frame to frame.
+    samples: RefCell<crate::animation::Samples>,
+    media: RefCell<crate::canvas_draw::Media>,
+    retained: RefCell<Option<crate::canvas_draw::Retained>>,
+    text_specs: RefCell<Vec<Option<TextSpecs>>>,
+    evaluated: RefCell<Option<Evaluated>>,
+    /// Whether the installed scene is owed the whole evaluated table. A frame writes the scene as it ends
+    /// (`write_rows`), so this is set only before the first install, after a failure part way through a write,
+    /// and, for a canvas with worlds, after a frame that needs a whole write: those wait for the plan, which has
+    /// the worlds' pictures.
+    stale: std::cell::Cell<bool>,
+    /// The text builder made of the evaluated table's batches; `None` when a frame changed a batch since.
+    text: RefCell<Option<crate::canvas_draw::CanvasTextBuilder>>,
+    /// Which document this is, unique in the process, and how many snapshots tests have taken of it.
+    #[cfg(test)]
+    id: u64,
+    #[cfg(test)]
+    snapshots: std::cell::Cell<u64>,
+    /// Scratch for naming the changed items: per item, 0 or one more than its slot among them.
+    item_marks: RefCell<Vec<u32>>,
+    /// Frames by what changed since the frame before: unchanged, then each `ChangeKind`.
+    changes: std::cell::Cell<[u64; 5]>,
+}
+/// Immutable installed inputs shared by concurrently sampled frames. Each document owns
+/// its samples, stamped scene, planner and draw caches; no frame copies these inputs.
+pub(crate) struct Prepared {
     /// The canvas's scene, kept when its image graph or a view stage is prepared from it: it keeps a float
     /// picture (`float`), or it blends in another encoding than sRGB, which only its view turns into code
     /// values a reader or a display takes.
@@ -206,7 +235,6 @@ pub(crate) struct Document {
     /// What a restyling track starts from, for each item one names (`restyled_field`); `None` for every other
     /// item. By item.
     authored: Vec<Option<Box<Authored>>>,
-    styles: RefCell<Vec<Option<StyledItem>>>,
     size: [u32; 2],
     items: Vec<Item>,
     /// Each item's rest values, by item.
@@ -214,30 +242,11 @@ pub(crate) struct Document {
     children: Children,
     /// Each named node's item.
     by_name: HashMap<String, usize>,
-    fonts: Fonts,
     plan: crate::animation::Plan,
-    /// The tracks' samples, reused from frame to frame.
-    samples: RefCell<crate::animation::Samples>,
     /// The output page Moda draws on: its size, the viewBox placement and the background.
     page: crate::canvas_draw::Page,
     /// The worlds in the canvas: each one's item and its scene, drawn at `size` px.
     worlds: Vec<WorldPart>,
-    media: RefCell<crate::canvas_draw::Media>,
-    retained: RefCell<Option<crate::canvas_draw::Retained>>,
-    text_specs: RefCell<Vec<Option<TextSpecs>>>,
-    evaluated: RefCell<Option<Evaluated>>,
-    /// Whether the installed scene is owed the whole evaluated table. A frame writes the scene as it ends
-    /// (`write_rows`), so this is set only before the first install, after a failure part way through a write,
-    /// and, for a canvas with worlds, after a frame that needs a whole write: those wait for the plan, which has
-    /// the worlds' pictures.
-    stale: std::cell::Cell<bool>,
-    /// The text builder made of the evaluated table's batches; `None` when a frame changed a batch since.
-    text: RefCell<Option<crate::canvas_draw::CanvasTextBuilder>>,
-    /// Which document this is, unique in the process, and how many snapshots tests have taken of it.
-    #[cfg(test)]
-    id: u64,
-    #[cfg(test)]
-    snapshots: std::cell::Cell<u64>,
     /// Each track's kind, by flat track index (every track of a canvas is authored, so that is `Plan::sampled`
     /// order); `None` for a control track (a layer's weight).
     kinds: Vec<Option<ChangeKind>>,
@@ -251,10 +260,12 @@ pub(crate) struct Document {
     item_tracks: Vec<u32>,
     /// The tracks of the page's background: the tracks that target no item and still draw.
     page_tracks: Vec<u32>,
-    /// Scratch for naming the changed items: per item, 0 or one more than its slot among them.
-    item_marks: RefCell<Vec<u32>>,
-    /// Frames by what changed since the frame before: unchanged, then each `ChangeKind`.
-    changes: std::cell::Cell<[u64; 5]>,
+    font_host: Arc<moda_text::TextHost>,
+    font_layouts: HashMap<LaidKey, std::sync::Weak<Laid>>,
+}
+impl std::ops::Deref for Document {
+    type Target = Prepared;
+    fn deref(&self) -> &Prepared { &self.prepared }
 }
 /// A world inside the canvas.
 pub(crate) struct WorldPart {
@@ -270,6 +281,7 @@ struct StyledItem {
 }
 struct TextSpecs {
     revision: u64,
+    content_revision: u64,
     style_revision: u64,
     units: BTreeMap<(TextUnit, usize), UnitValue>,
     specs: Vec<Arc<moda_text::ops::TextNodeSpec>>,
@@ -1030,13 +1042,51 @@ impl Document {
         let float = !worlds.is_empty() || composition.view.is_some() || !composition.compositor.is_empty() || working.is_linear();
         let graph_images = whole.compositor_image_reads(whole.compositor()).into_iter()
             .filter_map(|name| whole.images.get(&name).map(|image| image.time.clone()).map(|time| (name, time))).collect();
-        Ok(Self { view: (float || working != v2::WorkingColorSpace::Srgb).then(|| whole.clone()), float, working, graph_images, images: scene.images.clone(), base: base.into(), font_lists: lists, keyed, glyphs_keyed, authored, styles, size: [w, h], items, rest, children, by_name, fonts, plan, samples, page, worlds, media: RefCell::new(media),
-            retained: RefCell::new(None), text_specs, evaluated: Default::default(), stale: std::cell::Cell::new(true), text: Default::default(),
+        let prepared = Arc::new(Prepared {
+            view: (float || working != v2::WorkingColorSpace::Srgb).then(|| whole.clone()),
+            float, working, graph_images, images: scene.images.clone(), base: base.into(),
+            font_lists: lists, keyed, glyphs_keyed, authored, size: [w, h], items, rest,
+            children, by_name, plan, page, worlds, kinds, track_items, track_parts,
+            item_tracks_first, item_tracks, page_tracks,
+            font_host: fonts.host.clone(), font_layouts: fonts.layouts.borrow().by_content.clone(),
+        });
+        Ok(Self { prepared, fonts, samples, styles, media: RefCell::new(media),
+            retained: Default::default(), text_specs, evaluated: Default::default(),
+            stale: std::cell::Cell::new(true), text: Default::default(), changes: Default::default(), item_marks,
             #[cfg(test)]
-            id: { static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) },
+            id: Self::next_id(),
             #[cfg(test)]
             snapshots: Default::default(),
-            kinds, changes: Default::default(), track_items, track_parts, item_tracks_first, item_tracks, page_tracks, item_marks })
+        })
+    }
+    #[cfg(test)]
+    fn next_id() -> u64 {
+        static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Start a worker's retained history over the same installed content and laid-out text.
+    fn from_prepared(prepared: Arc<Prepared>, media: crate::canvas_draw::Media) -> Self {
+        let host = prepared.font_host.clone();
+        let fonts = Fonts {
+            store: std::rc::Rc::new(host.vector_font_store_lenient()), host,
+            degraded: Default::default(),
+            layouts: std::rc::Rc::new(RefCell::new(Layouts {
+                by_content: prepared.font_layouts.clone(), sweep_at: 0,
+            })),
+        };
+        let items = prepared.items.len();
+        Self {
+            samples: RefCell::new(prepared.plan.samples_naming_changes()), prepared, fonts,
+            styles: RefCell::new((0..items).map(|_| None).collect()),
+            text_specs: RefCell::new((0..items).map(|_| None).collect()),
+            media: RefCell::new(media), retained: Default::default(), evaluated: Default::default(),
+            stale: std::cell::Cell::new(true), text: Default::default(), changes: Default::default(),
+            item_marks: RefCell::new(vec![0; items]),
+            #[cfg(test)]
+            id: Self::next_id(),
+            #[cfg(test)]
+            snapshots: Default::default(),
+        }
     }
     /// Item `i` as authored. Only an item a track restyles is read this way, and `new` kept exactly those.
     fn authored(&self, i: usize) -> Result<&Authored> {
@@ -1085,6 +1135,8 @@ impl Document {
         });
         let mut encoder = renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("canvas view") });
         view.encode(renderer, &mut encoder, &drawn, &viewed, &frame.request, errors)?;
+        #[cfg(feature = "frame-profile")]
+        crate::frame_profile::count("queue_submissions", 1);
         renderer.queue.submit([encoder.finish()]);
         if errors.is_none() { view.check(renderer)?; }
         Ok(viewed)
@@ -1105,6 +1157,7 @@ impl Document {
     /// table, so the next one is evaluated whole. The values are written into the table; the frame returned is the
     /// instant and its worlds' clocks.
     fn frame(&self, request: &vork_time::Request) -> Result<Frame> {
+        let _profile = moda_engine::prof::span("canvas.evaluation");
         let frame = self.evaluate(request).and_then(|(frame, changed)| {
             self.write_rows(&changed)?;
             Ok(frame)
@@ -1254,7 +1307,7 @@ impl Document {
     /// The values an item's slot holds before its first evaluation writes them.
     fn unevaluated(&self, i: usize) -> crate::canvas_draw::Values {
         crate::canvas_draw::Values { style_revision: 0, transform: self.rest[i].transform.clone(), visible: false, opacity: 0., path: None, texts: 0,
-            text_composition: Vec::new(), text_revision: 0, world: None }
+            text_composition: Vec::new(), text_revision: 0, text_paint_revision: 0, world: None }
     }
 
     /// Item `i`'s tracks, ascending: the order they blend in.
@@ -1353,7 +1406,7 @@ impl Document {
                     _ => false,
                 };
                 let rest = !same_node || old.style_revision != values.style_revision || old.visible != values.visible || old.path != values.path
-                    || old.texts != values.texts || old.text_revision != values.text_revision || old.text_composition != values.text_composition;
+                    || old.texts != values.texts || old.text_revision != values.text_revision || old.text_paint_revision != values.text_paint_revision || old.text_composition != values.text_composition;
                 debug_assert!(drawing == state.drawing[i] && (old.transform == values.transform || what & change::TRANSFORM != 0)
                     && (old.opacity == values.opacity || what & change::OPACITY != 0) && (!rest || what & change::REST != 0),
                     "item {:?} changed in a way its changed tracks do not name (named {what:#b})", self.items[i].name);
@@ -1516,7 +1569,7 @@ impl Document {
             }
         }
         // Only a text node has kept batches.
-        let text_revision = |specs: &[Option<TextSpecs>]| if at_rest.text { specs[i].as_ref().map_or(0, |c| c.revision) } else { 0 };
+        let text_revision = |specs: &[Option<TextSpecs>]| if at_rest.text { specs[i].as_ref().map_or(0, |c| c.content_revision) } else { 0 };
         // A node that does not draw (hidden, or absent on its clock: §8 rule 1) has no picture.
         if !shown {
             if node.is_some() { *node = None; }
@@ -1528,6 +1581,7 @@ impl Document {
             values.texts = 0;
             values.text_composition.clear();
             values.text_revision = text_revision(&*specs);
+            values.text_paint_revision = if at_rest.text { specs[i].as_ref().map_or(0, |c| c.revision) } else { 0 };
             return Ok(false);
         }
         // Style tracks restyle the node: it is parsed again when a content field differs from the one kept.
@@ -1638,7 +1692,12 @@ impl Document {
                         }).collect();
                         Some(Arc::new(self.batches(&item.name, &geometry, &clip_units)?.0.remove(0)))
                     } else { None };
-                    *slot = Some(TextSpecs { revision, style_revision, units: keyed, composition, clip, specs: text_specs.into_iter().map(Arc::new).collect() });
+                    let same_geometry = !text.degraded() && slot.as_ref().is_some_and(|old|
+                        old.composition == composition && old.specs.len() == text_specs.len()
+                        && old.specs.iter().zip(&text_specs).all(|(a,b)| a.same_paint_geometry(b))
+                        && match (&old.clip, &clip) { (None,None) => true, (Some(a),Some(b)) => a == b, _ => false });
+                    let content_revision = slot.as_ref().map_or(1, |old| old.content_revision + u64::from(!same_geometry));
+                    *slot = Some(TextSpecs { revision, content_revision, style_revision, units: keyed, composition, clip, specs: text_specs.into_iter().map(Arc::new).collect() });
                 }
                 let cached = slot.as_ref().unwrap();
                 for (sub, spec) in cached.specs.iter().enumerate() {
@@ -1659,6 +1718,7 @@ impl Document {
         values.path = path;
         values.texts = texts;
         values.text_revision = text_revision(&*specs);
+        values.text_paint_revision = if at_rest.text { specs[i].as_ref().map_or(0, |c| c.revision) } else { 0 };
         match if at_rest.text { specs[i].as_ref() } else { None } {
             Some(cached) => values.text_composition.clone_from(&cached.composition),
             None => values.text_composition.clear(),
@@ -1949,12 +2009,15 @@ impl Document {
             None => {
                 let fonts = self.fonts.clone();
                 let draws: HashMap<_, _> = state.batches().map(|d| ((d.item, d.sub), d.clone())).collect();
-                let text = std::rc::Rc::new(move |item: usize, sub: usize, model: [f32; 16], z: f64, clip: [f32; 4], scale: f64, opacity: f64| {
+                let text = std::rc::Rc::new(move |item: usize, sub: usize, model: [f32; 16], z: f64, clip: [f32; 4], scale: f64, opacity: f64, kept: Option<&moda_text_draw::TextQuadBatch>| {
                     let draw = draws.get(&(item, sub)).context("a text batch the frame did not plan")?;
                     let mut placed = draw.clone();
                     placed.model = model;
                     Arc::make_mut(&mut placed.spec).opacity = opacity;
-                    fonts.build(&placed, z, clip, scale)
+                    match kept {
+                        Some(kept) => fonts.repaint(&placed, kept),
+                        None => fonts.build(&placed, z, clip, scale),
+                    }
                 });
                 text as crate::canvas_draw::CanvasTextBuilder
             }
@@ -2054,6 +2117,37 @@ impl Fonts {
         }
         layouts.by_content.insert(key, Arc::downgrade(&laid));
         Ok(laid)
+    }
+
+    /// Recolour an unchanged vector op stream. Effects/emoji keep their ordinary preparation path.
+    fn repaint(&self, draw: &Draw, kept: &moda_text_draw::TextQuadBatch) -> Result<Option<Arc<moda_text_draw::TextQuadBatch>>> {
+        if draw.layout.vector.is_none() || kept.degraded.is_some() || !kept.ops.is_empty()
+            || !draw.spec.effects.is_empty() || draw.spec.gradient.is_some() || draw.spec.shader_fill { return Ok(None); }
+        let Some(vector) = &kept.vector else { return Ok(None) };
+        if !vector.emojis.is_empty() { return Ok(None); }
+        let stroke = draw.spec.stroke_color.as_deref().map(|css|
+            moda_text::color::css_color_to_normalized_rgba(css).unwrap_or([0., 0., 0., 1.]).map(|c| c as f32));
+        let fill = draw.spec.fill_override.as_deref().filter(|s| !s.is_empty()).map(|css|
+            moda_text::color::css_color_to_normalized_rgba(css).unwrap_or([0., 0., 0., 1.]).map(|c| c as f32));
+        // Unnamed analytic fills use the node override. Unnamed primitives may instead carry their
+        // own decoration colour, so they retain ordinary preparation.
+        if vector.ops.iter().any(|op| op.stroke_px == 0. && op.paint.is_none()
+            && (fill.is_none() || op.pipeline != moda_text::vector::VectorOpPipeline::Analytic)) { return Ok(None); }
+        let mut batch = kept.clone();
+        for op in &mut batch.vector.as_mut().unwrap().ops {
+            if op.stroke_px > 0. {
+                let Some(color) = stroke else { return Ok(None) };
+                op.color = color;
+            } else {
+                let Some(color) = op.paint.and_then(|p| draw.spec.run_colors.get(p as usize)).copied().or(fill)
+                    else { return Ok(None) };
+                op.color = color;
+            }
+            op.opacity = draw.spec.opacity as f32;
+        }
+        // This replacement has a new picture identity; it was not built through the content cache.
+        batch.content_key = None;
+        Ok(Some(Arc::new(batch)))
     }
 
     /// Moda's batch for one draw of its layout: its vector lane's, or, for text its degraded tier draws, its raster.
@@ -2177,6 +2271,7 @@ impl Pictures {
     /// `errors`: the shader diagnostics of the frame the picture is drawn for, where the graph records a result
     /// that is not finite; without them the graph's own word (`CanvasGraph::errors`).
     fn draw(&self, renderer: &Renderer, document: &Document, frame: &Frame, engine: &crate::canvas_draw::Engine, errors: Option<&wgpu::Buffer>) -> Result<wgpu::Texture> {
+        let _gpu = moda_engine::prof::capturing().then(moda_engine::gpu_profile::resume);
         // Each present world is drawn by the 3D renderer at its local time, and its frame crosses into a pool
         // texture Moda's engine samples as an image: on the GPU, in queue order before Moda's drawing.
         let worlds_profile = (!frame.worlds.is_empty()).then(|| moda_engine::prof::span("canvas.worlds"));
@@ -2190,6 +2285,8 @@ impl Pictures {
             let texture = self.pool.acquire(w, h, moda_engine::pixel::image::Storage::F16).map_err(|error| device(anyhow::anyhow!("a world's picture: {error}")))?;
             let mut encoder = renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world picture") });
             self.convert.encode(renderer, &mut encoder, output, texture.view(), texture.texture().format(), crate::canvas_world::Crossing::ToCanvas);
+            #[cfg(feature = "frame-profile")]
+            crate::frame_profile::count("queue_submissions", 1);
             renderer.queue.submit([encoder.finish()]);
             let capture = moda_engine::external_texture::CaptureTexture::new(texture);
             stored.push((capture.key().to_string(), [w, h], capture.upload_id));
@@ -2205,7 +2302,7 @@ impl Pictures {
         };
         drop(captures);
         match &self.graph {
-            Some(graph) => graph.draw(renderer, &drawn, &frame.request, &frame.images, errors),
+            Some(graph) => { let _profile = moda_engine::prof::span("canvas.compositor"); graph.draw(renderer, &drawn, &frame.request, &frame.images, errors) },
             None => Ok(drawn),
         }
     }
@@ -2226,6 +2323,9 @@ struct Slot {
     picture_errors: Option<wgpu::Buffer>,
     /// This render's read of the canvas's picture after its view, for EXR.
     raw: Option<RawRead>,
+    diagnostic_gpu: Option<moda_engine::gpu_profile::PendingFrame>,
+    diagnostic_time: Option<moda_engine::gpu_profile::GpuTime>,
+    diagnostic_host: moda_engine::prof::HostTimings,
 }
 /// A slot's read of the canvas's picture after its view, as a reader takes it: associated sRGB code values,
 /// RGBA16F or (an 8-bit sRGB canvas, whose drawn picture it is) RGBA8.
@@ -2236,6 +2336,32 @@ struct RawRead {
     stride: u32,
     readback: wgpu::Buffer,
 }
+struct NativeCanvasFrame {
+    diagnostic_gpu: Option<moda_engine::gpu_profile::PendingFrame>,
+    surfaces: Vec<Surface>,
+    frame: Option<usize>,
+}
+type CanvasJob = (u32, f32, vork_time::Request, Slot);
+type CanvasCompletion = Result<(usize, Slot, Option<wgpu::SubmissionIndex>)>;
+type CanvasWorkers = Vec<(std::sync::mpsc::SyncSender<CanvasJob>, std::sync::mpsc::Receiver<CanvasCompletion>)>;
+
+fn stop_canvas_workers(pool: CanvasWorkers, joins: Vec<std::thread::ScopedJoinHandle<'_, ()>>,
+    slots: &mut [Option<Slot>], renderer: &Renderer) -> Result<()> {
+    if pool.is_empty() { return Ok(()); }
+    let (senders, receivers): (Vec<_>, Vec<_>) = pool.into_iter().unzip();
+    drop(senders);
+    for join in joins { join.join().map_err(|panic| panicked("canvas frame worker", panic))?; }
+    for receiver in receivers {
+        for result in receiver.try_iter() {
+            let (frame, slot, _) = result?;
+            let entry = frame % slots.len();
+            slots[entry] = Some(slot);
+        }
+    }
+    // Retire GPU consumers before crediting any removed worker's memory.
+    crate::gpu_memory::wait(&renderer.device, &renderer.queue, &renderer.errors, None)
+}
+
 impl Target {
     fn new(renderer: &Renderer, size: [u32; 2], document: &Document, base: &Path) -> Result<Self> {
         let limit = renderer.device.limits().max_texture_dimension_2d;
@@ -2318,6 +2444,7 @@ impl Target {
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
                 })),
             raw,
+            diagnostic_gpu: None, diagnostic_time: None, diagnostic_host: Default::default(),
         }
     }
 
@@ -2371,7 +2498,6 @@ impl Target {
     /// and rounded; an encoder surface then takes that finished `frame`'s code values.
     fn finish(&self, renderer: &Renderer, encoder: &mut wgpu::CommandEncoder, destination: &wgpu::Texture, request: &vork_time::Request, frame: Option<&wgpu::Texture>) -> Result<()> {
         ensure!(destination.usage().contains(wgpu::TextureUsages::STORAGE_BINDING), "the video encoder's surface cannot be written on this device");
-        let device = &self.device;
         let drawn = self.drawn.borrow();
         let drawn = drawn.as_ref().context("no frame drawn")?;
         let display = self.display.borrow();
@@ -2380,6 +2506,12 @@ impl Target {
             (Some(view), None) => return view.encode(renderer, encoder, drawn, destination, request, None),
             (Some(_), Some(frame)) => (Finish::Copy, frame),
         };
+        self.finish_from(encoder, source, destination, kind)
+    }
+
+    fn finish_from(&self, encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::Texture, destination: &wgpu::Texture, kind: Finish) -> Result<()> {
+        let device = &self.device;
         let source = source.create_view(&Default::default());
         let mut pipelines = self.finish.borrow_mut();
         let pipeline = pipelines.entry((destination.format(), kind)).or_insert_with(|| {
@@ -2420,13 +2552,14 @@ impl Target {
     /// raw read the picture after its view as associated float RGBA.
     fn collect(&self, renderer: &Renderer, slot: &mut Slot, submission: wgpu::SubmissionIndex) -> Result<(crate::Exposure, Option<Vec<u8>>, Option<Vec<[f32; 4]>>)> {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let mapped = [slot.stats.pending().context("canvas exposure was not recorded")?].into_iter().chain(slot.readback.then_some(&slot.ring.readback)).chain(&slot.picture_errors).chain(slot.raw.as_ref().map(|raw| &raw.readback)).collect::<Vec<_>>();
+        let mapped = [slot.stats.pending().context("canvas exposure was not recorded")?].into_iter().chain(slot.readback.then_some(&slot.ring.readback)).chain(&slot.picture_errors).chain(slot.raw.as_ref().map(|raw| &raw.readback)).chain(slot.diagnostic_gpu.iter().flat_map(|gpu| gpu.readbacks())).collect::<Vec<_>>();
         for buffer in &mapped {
             let sender = sender.clone();
             buffer.map_async(wgpu::MapMode::Read, .., move |result| { let _ = sender.send(result); });
         }
         renderer.wait(Some(submission))?;
         for _ in &mapped { receiver.recv().context("canvas readback").map_err(device)?.context("canvas readback").map_err(device)?; }
+        slot.diagnostic_time = slot.diagnostic_gpu.as_ref().map(|gpu| gpu.time());
         let picture_errors = slot.picture_errors.as_ref().map(|errors| {
             let codes = { let mapped = errors.get_mapped_range(..); [0, 4, 8].map(|at| u32::from_le_bytes(mapped[at..at + 4].try_into().expect("four bytes"))) };
             errors.unmap();
@@ -2448,6 +2581,7 @@ impl Target {
             if let Some(raw) = &slot.raw { raw.readback.unmap(); }
             return Err(scene_error(if wrong_display { error } else { anyhow::Error::new(crate::FrameRefused(error.to_string())) }));
         }
+        let _conversion = moda_engine::prof::span("canvas.output.convert_record");
         let pixels = slot.readback.then_some(&slot.ring.readback).map(|readback| {
             let mut rgba = Vec::with_capacity((self.size[0] * self.size[1] * 4) as usize);
             {
@@ -2539,6 +2673,8 @@ pub(crate) fn warm(scene: &Scene, base: &Path, renderer: &Renderer, display: cra
         usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
     });
     target.finish(renderer, &mut command, &surface, &frame.request, Some(&slot.frame))?;
+    #[cfg(feature = "frame-profile")]
+    crate::frame_profile::count("queue_submissions", 1);
     let submission = renderer.queue.submit([command.finish()]);
     renderer.wait(Some(submission))?;
     renderer.errors.check()
@@ -2625,6 +2761,7 @@ pub(crate) struct Request {
 /// Render a canvas to the destinations a 3D shot writes: a PNG still, a directory of frames, EXR frames, MP4 or MOV.
 pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHandle<'_, Result<Renderer>>, warnings: &crate::warnings::Collector, wall: Instant) -> Result<RenderedShot> {
     let Request { scene, base, out, outputs, at: authored_at, frame_start, frame_end, png_depth, exr_codec, raw_colors, display, no_write, gpu_only, diagnostics, stop, profile_record, device_reused, sound, kept } = request;
+    let _capture = diagnostics.then(|| moda_engine::prof::capture(crate::canvas_timing::category));
     let parse_start = Instant::now();
     let [w, h] = scene.render.resolution;
     let fps = scene.render.fps;
@@ -2700,16 +2837,19 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let (kept_document, kept_target) = kept.map_or((None, None), |kept| (Some(kept.document), Some(kept.target)));
     // The video encoders' sessions open while the text is laid out.
     let (document, prepared) = std::thread::scope(|scope| {
-        let prepared = scope.spawn(|| {
+        // The worker walks the scene to hash it, so it has the stack a scene nested to its limit needs.
+        let prepared = vork_scene::scene_thread().spawn_scoped(scope, || {
+            let start = diagnostics.then(Instant::now);
             let prepared = video_paths.iter().map(|path| {
                 Encoder::prepare(Backend::Auto, w, h, fps, EncodeSettings { diagnostics, primaries: display.video_primaries(), ..EncodeSettings::default() }, path).map_err(device)
             }).collect::<Result<Vec<_>>>();
+            let encoder_prepare_ms = start.map_or(0., |s| s.elapsed().as_secs_f64() * 1000.);
             let identity = match known {
                 Some(identity) => Ok(identity),
                 None => Kept::identity(&scene, &base),
             };
-            (prepared, identity)
-        });
+            (prepared, identity, encoder_prepare_ms)
+        }).expect("start the encoder preparation worker");
         let document = match kept_document {
             Some(document) => Ok(document),
             None => Document::new(&scene, &base).map_err(scene_error),
@@ -2718,14 +2858,15 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     });
     let document = document?;
     let scene_parse_ms = parse_start.elapsed().as_secs_f64() * 1000.;
-    let (prepared, identity) = prepared?;
+    let (prepared, identity, encoder_prepare_ms) = prepared?;
     let prepared = prepared?;
     let identity = identity?;
     let renderer = device_worker.join().map_err(|panic| panicked("device creation worker", panic))??;
     // Receipts describe this request: timings from earlier renders on a retained device are excluded.
     let pipeline_timings_before: std::collections::BTreeMap<String, f64> =
         if device_reused { renderer.pipeline_timings().into_iter().collect() } else { Default::default() };
-    let gpu_profile = moda_engine::prof::gpu();
+    let _gpu_capture = diagnostics.then(moda_engine::gpu_profile::capture_state);
+    let gpu_profile = moda_engine::prof::gpu() && !diagnostics;
     if gpu_profile {
         let available = moda_engine::gpu_profile::enable(&renderer.device, &renderer.queue);
         eprintln!("canvas GPU timestamps available: {available}; query resolution serializes frames");
@@ -2738,11 +2879,6 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             else { None };
         Some(crate::output_run::OutputRun::begin(&out, selected)?)
     };
-    // Frames in flight: the CPU builds the next frames while the GPU draws and the encoders take the earlier ones.
-    let in_flight = crate::constants::FRAMES_IN_FLIGHT.min(frames);
-    let mut encoders = prepared.into_iter().map(|prepared| prepared.open(renderer.device.clone(), renderer.queue.clone(), frames as u64, in_flight).map_err(device)).collect::<Result<Vec<_>>>()?;
-    // Each slot's ring entry on every encoder, installed in frame order so entry indices match the slots.
-    let surfaces = (0..in_flight).map(|_| encoders.iter_mut().map(|encoder| encoder.create_surface().map_err(setup)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
     let install_start = Instant::now();
     let target = match kept_target {
         Some(target) => target,
@@ -2755,20 +2891,56 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let as_authored = !document.float() && (document.working() == v2::WorkingColorSpace::Srgb || document.working().display() == Some(display.display));
     // Images already in Moda's store are not read again.
     document.install_images().map_err(scene_error)?;
+    // Sharing belongs only to optional replicas. Serial and nested-world
+    // histories retain their ordinary image-cache eviction/destruction path.
+    let shared_images = std::sync::Arc::new(moda_engine::paint::draw::SharedImages::default());
+    let target_install_ms = install_start.elapsed().as_secs_f64() * 1000.;
+    // Frames in flight: the CPU builds the next frames while the GPU draws and the encoders take the earlier ones.
+    let forced_workers = std::env::var("VORK_CANVAS_WORKERS").ok().and_then(|v| v.parse::<usize>().ok());
+    let independent = document.worlds.is_empty() && document.media.borrow().is_empty();
+    let limit = forced_workers.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from).min(crate::constants::CANVAS_DEFAULT_MAX_WORKERS))
+        .clamp(1, crate::constants::CANVAS_MAX_WORKERS).min(frames);
+    let frame_bytes = (u64::from(w) * 4).div_ceil(256) * 256 * u64::from(h);
+    // Native device/local/unified headroom decides whether replication is
+    // optional. The encoder validates its fixed serial buffer independently.
+    let free = crate::canvas_parallel::headroom(&renderer.device).map(|(_, free)| free);
+    let host_working_set = crate::canvas_parallel::host_working_set();
+    let serial_capacity = crate::constants::FRAMES_IN_FLIGHT.min(frames);
+    // Each destination may retain conversion textures and a native shared ring;
+    // readback/output slots include both the 8-bit and float pictures.
+    let slot_bytes = frame_bytes.saturating_mul(8 + 3 * video_paths.len() as u64);
+    let ring_workers = (renderer.device.limits().max_buffer_size / frame_bytes.max(1) / 2).max(1) as usize;
+    let limit = limit.min(ring_workers);
+    let full_capacity = serial_capacity.max(limit * 2).min(frames);
+    let capacity = crate::canvas_parallel::ring_limit(free, slot_bytes, serial_capacity, full_capacity);
+    let worker_limit = if independent && (forced_workers.is_some() || frames >= crate::constants::CANVAS_PARALLEL_MIN_FRAMES) && free.is_some() && (cfg!(not(target_os = "macos")) || host_working_set.is_some()) { crate::canvas_parallel::replicas_for_ring(limit, capacity, full_capacity) } else { 1 };
+    let mut workers = 1;
+    // Native encoders keep the serial ring. Optional output slots and histories
+    // are reserved only when main's existing policy admits parallel rendering.
+    let mut in_flight = serial_capacity;
+    let encoder_open_start = diagnostics.then(Instant::now);
+    let mut encoders = prepared.into_iter().map(|prepared| prepared.open(renderer.device.clone(), renderer.queue.clone(), frames as u64, serial_capacity).map_err(device)).collect::<Result<Vec<_>>>()?;
+    // Each slot's ring entry on every encoder, installed in frame order so entry indices match the slots.
+    let surfaces = (0..in_flight).map(|_| encoders.iter_mut().map(|encoder| encoder.create_surface().map_err(setup)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+    let encoder_start_ms = if video { encoder_prepare_ms + encoder_open_start.map_or(0., |s| s.elapsed().as_secs_f64() * 1000.) } else { 0. };
     // PNG files read the 8-bit frame back; EXR files read the picture after its view.
     let pngs = !no_write && !gpu_only && directory_paths.iter().any(|path| !is_exr(path));
     let raws = !no_write && !gpu_only && directory_paths.iter().any(|path| is_exr(path));
     if raws { target.set_raw(&renderer, &document, &base)?; }
-    let mut slots: Vec<Slot> = surfaces.into_iter().map(|surfaces| target.slot(&renderer, pngs, raws, surfaces)).collect();
+    let slot_start = Instant::now();
+    let native_frames = RefCell::new(surfaces.into_iter().map(|surfaces| NativeCanvasFrame { surfaces, frame: None, diagnostic_gpu: None }).collect::<Vec<_>>());
+    let mut slots: Vec<Option<Slot>> = (0..in_flight).map(|_| Some(target.slot(&renderer, pngs, raws, Vec::new()))).collect();
+    let mut serial_slots = None;
     let png_writers: Vec<_> = directory_paths.iter().filter(|path| pngs && !is_exr(path)).map(|path|
         crate::png_output::FrameOutputWriter::canvas(path.clone(), w, h, in_flight, output_index(0) as usize, display.display)).collect();
     let raw_writers: Vec<_> = directory_paths.iter().filter(|path| raws && is_exr(path)).map(|path|
         crate::png_output::FrameOutputWriter::canvas_exr(path.clone(), w, h, exr_codec, in_flight, output_index(0) as usize,
             (fps.numerator() as i32, fps.denominator() as u32), raw_colors[path])).collect();
-    let install_ms = install_start.elapsed().as_secs_f64() * 1000.;
+    let install_ms = target_install_ms + slot_start.elapsed().as_secs_f64() * 1000.;
     eprintln!("render: canvas {w}x{h}; {frames} frames; {} text and {} path node(s), {} world(s)", document.items.iter().filter(|item| item.text.is_some()).count(),
         document.items.iter().filter(|item| matches!(item.node.kind, crate::canvas_draw::Kind::Path(_))).count(), document.worlds.len());
     vork_slang::progress::phase("Rendering frames", frames);
+    let setup_host = diagnostics.then(moda_engine::prof::take_capture);
     let loop_start = Instant::now();
     let mut metadata_frames = Vec::new();
     let mut frame_exposures = Vec::new();
@@ -2779,21 +2951,137 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let mut interrupted = false;
     let mp4 = video_paths.iter().any(|path| has_format(path, "mp4"));
     let mut refused = shot::Refusals::default();
-    let result = (|| -> Result<()> {
-        let mut pending: std::collections::VecDeque<(usize, f32, Instant, wgpu::SubmissionIndex)> = std::collections::VecDeque::new();
+    let optional_budget = crate::canvas_parallel::budget(&renderer.device,
+        cfg!(not(target_os = "macos")) && renderer.adapter_info.device_type == wgpu::DeviceType::DiscreteGpu);
+    let worker_limit = if optional_budget.is_some() { worker_limit } else { 1 };
+    let result = std::thread::scope(|scope| -> Result<()> {
+        let spawn_workers = |count: usize| {
+            let mut pool = Vec::new();
+            let mut joins = Vec::new();
+            if count > 0 {
+                for _ in 0..count {
+                    let (send, receive) = std::sync::mpsc::sync_channel::<(u32, f32, vork_time::Request, Slot)>(1);
+                    let (done, completed) = std::sync::mpsc::channel();
+                    let renderer = &renderer;
+                    let scene = &scene;
+                    let base = &base;
+                    let prepared = document.prepared.clone();
+                    let shared_images = shared_images.clone();
+                    let budget = optional_budget.as_ref().expect("native headroom admits workers").clone();
+                    joins.push(vork_scene::scene_thread().spawn_scoped(scope, move || {
+                        let _warnings = warnings.enter();
+                        // A job's output lease survives cancellation of disposable
+                        // target/planner state. Retrying it never skips an output frame.
+                        let current = RefCell::new(None::<(usize, Slot)>);
+                        let run = || -> Result<()> {
+                            let _host_reservation = host_working_set.map(|bytes| budget.reserve_capacity(bytes)).transpose()?;
+                            // Thread-affine document, font stores, planner and GPU records live for the worker.
+                            let document = Document::from_prepared(prepared, crate::canvas_draw::Media::new(scene, base).map_err(scene_error)?);
+                            let mut target = Target::new(renderer, [w, h], &document, base).map_err(scene_error)?;
+                            target.engine.share_images(shared_images);
+                            target.set_display(renderer, &document, scene, base, display).map_err(scene_error)?;
+                            if raws { target.set_raw(renderer, &document, base)?; }
+                            if gpu_profile { moda_engine::gpu_profile::enable(&renderer.device, &renderer.queue); }
+                            let _capture = diagnostics.then(|| moda_engine::prof::capture(crate::canvas_timing::category));
+                            let _gpu_capture = diagnostics.then(moda_engine::gpu_profile::capture_state);
+                            while let Ok((_frame, _time, request, slot)) = receive.recv() {
+                                current.replace(Some((_frame as usize, slot)));
+                                let mut job = current.borrow_mut();
+                                let slot = &mut job.as_mut().unwrap().1;
+                                #[cfg(feature = "frame-profile")]
+                                let _profile_event = crate::frame_profile::event("canvas_submit",
+                                    match &request { vork_time::Request::Frame(frame, _) => *frame, _ => _frame }, _time);
+                                budget.refresh()?;
+                                let frame_profile = moda_engine::prof::span("canvas.frame");
+                                let instant = document.frame(&request).map_err(scene_error)?;
+                                if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, slot.diagnostic_gpu.take()); }
+                                let mut command = target.encode(renderer, &document, &instant, slot)?;
+                                let output_profile = moda_engine::prof::span("canvas.output.release_convert_submit");
+                                let convert_profile = moda_engine::prof::span("canvas.output.encoder_convert");
+                                for surface in &slot.ring.encoder_surfaces {
+                                    match &surface.texture {
+                                        Some(destination) => target.finish(renderer, &mut command, destination, &instant.request, Some(&slot.frame)).map_err(device)?,
+                                        None => surface.record_copy(&mut command, &slot.frame),
+                                    }
+                                }
+                                drop(convert_profile);
+                                if diagnostics { slot.diagnostic_gpu = moda_engine::gpu_profile::end_frame(&mut command); }
+                                // All consumers of this worker's resolve texture are queued before its next draw.
+                                #[cfg(feature = "frame-profile")]
+                                crate::frame_profile::count("queue_submissions", 1);
+                                let submission = renderer.queue.submit([command.finish()]);
+                                drop(output_profile);
+                                drop(frame_profile);
+                                if diagnostics {
+                                    for (name, ms) in moda_engine::prof::take_capture() { *slot.diagnostic_host.entry(name).or_default() += ms; }
+                                }
+                                if gpu_profile { moda_engine::gpu_profile::resolve_into_prof(&renderer.device, &renderer.queue); }
+                                drop(job);
+                                let (frame, slot) = current.take().unwrap();
+                                if done.send(Ok((frame, slot, Some(submission)))).is_err() { break; }
+                            }
+                            Ok(())
+                        };
+                        let result = match budget.run(run) { Ok(result) => result, Err(refused) => Err(refused.into()) };
+                        if let Err(error) = result {
+                            if error.downcast_ref::<wgpu::optional_allocations::Refused>().is_some() {
+                                moda_engine::scratch::discard_pending();
+                                if let Some((frame, slot)) = current.take() {
+                                    let _ = done.send(Ok((frame, slot, None)));
+                                }
+                                // Return every queued lease, then exit after the
+                                // export thread disconnects and joins this worker.
+                                while let Ok((frame, _, _, slot)) = receive.recv() {
+                                    if done.send(Ok((frame as usize, slot, None))).is_err() { break; }
+                                }
+                            } else { let _ = done.send(Err(error)); }
+                        }
+                    }).expect("start canvas frame worker"));
+                    pool.push((send, completed));
+                }
+            }
+            (pool, joins)
+        };
+        let (mut pool, mut joins) = spawn_workers(0);
+        let mut retry_from = 0;
+        let accepted = std::cell::Cell::new(0usize);
+        let mut memory_refused = false;
+        let mut cold_host_ms = 0.;
+        let mut host_ms = 0.;
+        let delivery_ms = std::cell::Cell::new(0.);
+        let mut host_samples = 0usize;
+        let mut profitable_windows = 0usize;
+        loop {
+        let result = (|| -> Result<()> {
+        let mut pending: std::collections::VecDeque<(usize, f32, Instant, Option<wgpu::SubmissionIndex>)> = std::collections::VecDeque::new();
         // How many submitted frames wait for acceptance. A ring entry is busy from its frame's submission until
         // every consumer lets go of it. PNG writers take a copy at acceptance, so the whole ring can be on the
-        // GPU. A video encoder holds the entry after acceptance until the entry is reused, and reuse waits for
-        // it: the ring is split, half for frames the GPU is drawing and the rest for frames the encoders are
-        // draining, so neither wait lands on a frame that was only just queued.
-        let window = if encoders.is_empty() { in_flight } else { in_flight.div_ceil(2) };
-        let mut collect = |(frame, time, frame_start, submission): (usize, f32, Instant, wgpu::SubmissionIndex), slots: &mut [Slot], encoders: &mut [Encoder]| -> Result<()> {
+        // GPU. A video encoder retains an entry until reuse. Serial rendering keeps its small submission
+        // window; parallel rendering fills the bounded ring so workers can continue while acceptance waits.
+        // The ordered native encoder ring releases its lease before accepting another frame.
+        let mut collect = |(frame, time, frame_start, submission): (usize, f32, Instant, Option<wgpu::SubmissionIndex>), slots: &mut [Option<Slot>], encoders: &mut [Encoder], pool: &CanvasWorkers, workers: usize, in_flight: usize| -> Result<()> {
+            let delivery_start = (worker_limit > 1).then(Instant::now);
+            let parallel = submission.is_none();
+            let submission = match submission {
+                Some(submission) => submission,
+                None => {
+                    let _wait = moda_engine::prof::span("canvas.output.wait_readback");
+                    let (completed, slot, submission) = pool[frame % workers].1.recv().context("canvas frame worker stopped")??;
+                    ensure!(completed == frame, "canvas worker completion order");
+                    slots[frame % in_flight] = Some(slot);
+                    submission.ok_or(wgpu::optional_allocations::Refused)?
+                }
+            };
             // Everything done to accept one frame; `canvas.output.wait_readback` and `canvas.output.deliver` are
             // inside it, so what they leave is this span's own.
+            #[cfg(feature = "frame-profile")]
+            let _profile_event = crate::frame_profile::event("canvas_collect", index(frame) as u32, time);
             let _accept_profile = moda_engine::prof::span("canvas.accept");
-            let slot = &mut slots[frame % in_flight];
+            let slot = slots[frame % in_flight].as_mut().expect("frame owns its ring entry");
             // A credit bounds raw pixels and compressed output until every destination finishes writing.
+            let credit_profile = moda_engine::prof::span("canvas.output.wait_readback");
             let png_lease = (pngs || raws).then(|| std::sync::Arc::new(slot.ring.credit.acquire()));
+            drop(credit_profile);
             let collected = {
                 let _profile = moda_engine::prof::span("canvas.output.wait_readback");
                 target.collect(&renderer, slot, submission.clone())
@@ -2804,6 +3092,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                 Err(error) if encoders.is_empty() && refused.skip(output_index(frame), &error) => {
                     for writer in png_writers.iter().chain(&raw_writers) { writer.skip(output_index(frame) as usize)?; }
                     vork_slang::progress::completed(rendered_frames + refused.count());
+                    accepted.set(frame + 1);
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -2819,14 +3108,56 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                     "--out {}: MP4 needs an opaque picture and this canvas leaves pixels transparent at {time} s; write .mov (ProRes 4444 keeps transparency) or PNG frames",
                     path.display());
             }
+            let handoff_profile = moda_engine::prof::span("canvas.output.handoff");
             if !encoders.is_empty() {
                 let started = Instant::now();
-                for (encoder, surface) in encoders.iter_mut().zip(&mut slot.ring.encoder_surfaces) {
+                let mut native = native_frames.borrow_mut();
+                let native = &mut native[frame % serial_capacity];
+                if let Some(previous) = native.frame.take() {
+                    #[cfg(test)]
+                    frame_event("release", previous);
+                    for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) {
+                        encoder.release(previous as u64, surface).map_err(device)?;
+                    }
+                }
+                let submission = if parallel {
+                    let convert_profile = moda_engine::prof::span("canvas.output.encoder_convert");
+                    // Only the export thread writes the encoder's ordered ring.
+                    // Optional worker pixels never reserve native encoder entries.
+                    if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, native.diagnostic_gpu.take()); }
+                    let mut copy = renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("canvas encoder handoff") });
+                    for surface in &native.surfaces {
+                        match &surface.texture {
+                            Some(destination) => target.finish_from(&mut copy, &slot.frame, destination, Finish::Copy)?,
+                            None => surface.record_copy(&mut copy, &slot.frame),
+                        }
+                    }
+                    if diagnostics { native.diagnostic_gpu = moda_engine::gpu_profile::end_frame(&mut copy); }
+                    #[cfg(feature = "frame-profile")]
+                    crate::frame_profile::count("queue_submissions", 1);
+                    let submission = renderer.queue.submit([copy.finish()]);
+                    drop(convert_profile);
+                    if let Some(gpu) = native.diagnostic_gpu.as_ref().filter(|_| diagnostics) {
+                        let _wait = moda_engine::prof::span("canvas.output.wait_readback");
+                        let (send, receive) = std::sync::mpsc::channel();
+                        let buffers = gpu.readbacks().collect::<Vec<_>>();
+                        for buffer in &buffers {
+                            let send = send.clone();
+                            buffer.map_async(wgpu::MapMode::Read, .., move |result| { let _ = send.send(result); });
+                        }
+                        renderer.wait(Some(submission.clone()))?;
+                        for _ in buffers { receive.recv().context("canvas handoff timestamps")??; }
+                        slot.diagnostic_time.get_or_insert_default().append(gpu.time());
+                    }
+                    if gpu_profile { moda_engine::gpu_profile::resolve_into_prof(&renderer.device, &renderer.queue); }
+                    submission
+                } else { submission };
+                for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) {
                     let source = surface.texture.clone().unwrap_or_else(|| slot.frame.clone());
                     encoder.push(frame as u64, source, surface, &submission).map_err(device)?;
                 }
                 crate::timing::encoded(started);
-                slot.ring.frame = Some(frame);
+                native.frame = Some(frame);
                 #[cfg(test)]
                 frame_event("push", frame);
             }
@@ -2844,6 +3175,9 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                     writer.push_canvas_float(output_index(frame) as usize, raw.clone(), lease.clone())?;
                 }
             }
+            drop(handoff_profile);
+            drop(_profile);
+            drop(_accept_profile);
             if diagnostics && (frame == 0 || frame + 1 == frames) {
                 if let Some(memory) = renderer.device.generate_allocator_report() {
                     memory_frames.push(serde_json::json!({"frame": output_index(frame),
@@ -2854,16 +3188,73 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             if rendered_frames == 0 { first_frame_ms = loop_start.elapsed().as_secs_f64() * 1000.; }
             metadata_frames.push(serde_json::json!({"index": output_index(frame), "time": time, "camera": null, "exposure": e.json()}));
             frame_exposures.push((index(frame), e));
-            samples.push(serde_json::json!({"frame": index(frame), "time": time, "frame_wall_ms": frame_start.elapsed().as_secs_f64() * 1000.}));
+            let mut sample = serde_json::json!({"frame": output_index(frame), "time": time, "frame_wall_ms": frame_start.elapsed().as_secs_f64() * 1000.});
+            if diagnostics {
+                for (name, ms) in moda_engine::prof::take_capture() { *slot.diagnostic_host.entry(name).or_default() += ms; }
+                sample["breakdown"] = crate::canvas_timing::frame(&slot.diagnostic_host, slot.diagnostic_time);
+                sample["host_spans_inclusive_ms"] = serde_json::to_value(&slot.diagnostic_host)?;
+                slot.diagnostic_host.clear();
+            }
+            samples.push(sample);
             rendered_frames += 1;
+            accepted.set(frame + 1);
             vork_slang::progress::completed(rendered_frames + refused.count());
+            if let Some(start) = delivery_start { delivery_ms.set(delivery_ms.get() + start.elapsed().as_secs_f64() * 1000.); }
             Ok(())
         };
-        for frame in 0..frames {
+        for frame in retry_from..frames {
             if stop.as_ref().is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed)) && frame > 0 { interrupted = true; break; }
+            let mut admit_workers = !memory_refused && frame == 0 && forced_workers.is_some() && worker_limit > 1;
+            if !memory_refused && workers == 1 && worker_limit > 1 && host_samples >= crate::constants::CANVAS_PARALLEL_PROBE_FRAMES {
+                let warm_ms = host_ms / host_samples.max(1) as f64;
+                // Require enough remaining host work to repay duplicated target setup with
+                // margin, and avoid multiplying GPU- or encoder-bound work. Replicate target setup
+                // and cold frame preparation, not the shared parsing/layout installation.
+                let setup_ms = (install_ms + cold_host_ms) * worker_limit as f64;
+                // Delivery and worker preparation overlap. A delivery-bound parallel result can still
+                // save enough serial host work to repay startup. Compare those service times directly:
+                // requiring every worker to remain host-bound rejects gains as preparation gets faster.
+                let delivery_per_frame = delivery_ms.get() / host_samples.max(1) as f64;
+                let parallel_ms = (warm_ms / worker_limit as f64)
+                    .max(delivery_per_frame * crate::constants::CANVAS_PARALLEL_DELIVERY_MARGIN);
+                let gain = (warm_ms - parallel_ms).max(0.) * (frames - frame) as f64;
+                let profitable = frames - frame >= crate::constants::CANVAS_PARALLEL_MIN_FRAMES
+                    && gain > setup_ms * crate::constants::CANVAS_PARALLEL_SETUP_MARGIN;
+                profitable_windows = if profitable { profitable_windows + 1 } else { 0 };
+                if profitable_windows >= crate::constants::CANVAS_PARALLEL_PROBE_WINDOWS {
+                    admit_workers = true;
+                }
+                // Intro frames and initial GPU waits need not represent the rest of a clip.
+                // Reconsider sustained warm work without charging old waits to later windows.
+                host_ms = 0.;
+                host_samples = 0;
+                delivery_ms.set(0.);
+            }
+            if admit_workers {
+                // Preserve the existing policy's chosen count; native memory can
+                // only reduce it. The serial working set overestimates a replica
+                // because images are shared. Reservations guard later growth too.
+                let (used, free) = crate::canvas_parallel::headroom(&renderer.device).unwrap_or((u64::MAX, 0));
+                let wanted = forced_workers.unwrap_or(worker_limit).clamp(1, worker_limit)
+                    .min((free / used.max(frame_bytes).max(1)) as usize);
+                if wanted > 1 {
+                    while let Some(old) = pending.pop_front() { collect(old, &mut slots, &mut encoders, &pool, workers, in_flight)?; }
+                    let extra = optional_budget.as_ref().unwrap().run(|| (0..capacity.min(serial_capacity.max(wanted * 2)))
+                        .map(|_| Some(target.slot(&renderer, pngs, raws, Vec::new()))).collect::<Vec<_>>())
+                        .map_err(anyhow::Error::new)?;
+                    serial_slots = Some(std::mem::replace(&mut slots, extra));
+                    workers = wanted;
+                    in_flight = slots.len();
+                    (pool, joins) = spawn_workers(workers);
+                    if diagnostics { eprintln!("canvas concurrency: 1 -> {workers} at frame {frame}; used={used}, free={free}"); }
+                } else {
+                    memory_refused = true;
+                }
+            }
+            let window = if workers > 1 || encoders.is_empty() { in_flight } else { crate::constants::FRAMES_IN_FLIGHT.div_ceil(2).min(in_flight) };
             // Frames stay in flight: the oldest is accepted only when the window is full, so the GPU draws it while
             // the next ones are built.
-            if pending.len() == window { collect(pending.pop_front().expect("a frame in flight"), &mut slots, &mut encoders)?; }
+            if pending.len() == window { collect(pending.pop_front().expect("a frame in flight"), &mut slots, &mut encoders, &pool, workers, in_flight)?; }
             let frame_start = Instant::now();
             // Everything done to build and submit one frame: `canvas.evaluate`, `canvas.worlds`, `canvas.plan`,
             // `canvas.draw`, `canvas.output.convert_record` and `canvas.output.release_convert_submit` are inside
@@ -2871,29 +3262,67 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             let frame_profile = moda_engine::prof::span("canvas.frame");
             let time = frame_time(frame).map_err(scene_error)?;
             let request = match at { Some(t) => vork_time::Request::Numeric(t), None => vork_time::Request::Frame(index(frame) as u32, fps) };
+            if !pool.is_empty() {
+                let slot = slots[frame % in_flight].take().expect("frame owns its ring entry");
+                if pool[frame % workers].0.send((frame as u32, time, request, slot)).is_err() {
+                    // Initialization can fail before a worker accepts its first slot.
+                    // Preserve that error rather than replacing it with channel closure.
+                    return match pool[frame % workers].1.recv() {
+                        Ok(Err(error)) => Err(error),
+                        _ => Err(anyhow::anyhow!("canvas frame worker stopped")),
+                    };
+                }
+                pending.push_back((frame, time, frame_start, None));
+                continue;
+            }
+            #[cfg(feature = "frame-profile")]
+            let _profile_event = crate::frame_profile::event("canvas_submit", index(frame) as u32, time);
             let instant = document.frame(&request).map_err(scene_error)?;
-            let slot = &mut slots[frame % in_flight];
+            let slot = slots[frame % in_flight].as_mut().expect("frame owns its ring entry");
             // Moda submits the draw independently of the output surfaces. Start it before
             // waiting for this ring entry's previous encoder payload to drain.
             #[cfg(test)]
             frame_event("draw", frame);
+            if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, slot.diagnostic_gpu.take()); }
             let mut command = target.encode(&renderer, &document, &instant, slot)?;
+            let frame_host_ms = if worker_limit > 1 { frame_start.elapsed().as_secs_f64() * 1000. } else { 0. };
+            let output_start = (worker_limit > 1).then(Instant::now);
             let output_profile = moda_engine::prof::span("canvas.output.release_convert_submit");
-            if let Some(previous) = slot.ring.frame.take() {
+            let release_profile = moda_engine::prof::span("canvas.output.encoder_release");
+            let mut native_guard = native_frames.borrow_mut();
+            let native = &mut native_guard[frame % serial_capacity];
+            if let Some(previous) = native.frame.take() {
                 #[cfg(test)]
                 frame_event("release", previous);
-                for (encoder, surface) in encoders.iter_mut().zip(&mut slot.ring.encoder_surfaces) { encoder.release(previous as u64, surface).map_err(device)?; }
+                for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) { encoder.release(previous as u64, surface).map_err(device)?; }
             }
-            for surface in &slot.ring.encoder_surfaces {
+            drop(release_profile);
+            let convert_start = (worker_limit > 1).then(Instant::now);
+            let convert_profile = moda_engine::prof::span("canvas.output.encoder_convert");
+            for surface in &native.surfaces {
                 match &surface.texture {
                     Some(destination) => target.finish(&renderer, &mut command, destination, &instant.request, Some(&slot.frame)).map_err(device)?,
                     None => surface.record_copy(&mut command, &slot.frame),
                 }
             }
+            drop(convert_profile);
+            drop(native_guard);
+            let convert_ms = convert_start.map_or(0., |start| start.elapsed().as_secs_f64() * 1000.);
+            if diagnostics { slot.diagnostic_gpu = moda_engine::gpu_profile::end_frame(&mut command); }
+            #[cfg(feature = "frame-profile")]
+            crate::frame_profile::count("queue_submissions", 1);
             let submission = renderer.queue.submit([command.finish()]);
             drop(output_profile);
             drop(frame_profile);
-            if gpu_profile {
+            if let Some(start) = output_start {
+                // Compositor input decode and conversion are worker-local frame work;
+                // only slot release and submission remain serial output overhead here.
+                let ms = frame_host_ms + convert_ms;
+                if frame == 0 { cold_host_ms = ms; } else { host_ms += ms; host_samples += 1; }
+                delivery_ms.set(delivery_ms.get() + (start.elapsed().as_secs_f64() * 1000. - convert_ms).max(0.));
+            }
+            if diagnostics { slot.diagnostic_host = moda_engine::prof::take_capture(); }
+            if gpu_profile && !diagnostics {
                 moda_engine::gpu_profile::resolve_into_prof(&renderer.device, &renderer.queue);
             }
             if moda_engine::prof::on() {
@@ -2904,11 +3333,26 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                     eprintln!("canvas plan cache frame {frame} cumulative: {}", retained.profile_counters());
                 }
             }
-            pending.push_back((frame, time, frame_start, submission));
+            pending.push_back((frame, time, frame_start, Some(submission)));
         }
-        while let Some(frame) = pending.pop_front() { collect(frame, &mut slots, &mut encoders)?; }
+        while let Some(frame) = pending.pop_front() { collect(frame, &mut slots, &mut encoders, &pool, workers, in_flight)?; }
         Ok(())
-    })();
+        })();
+        if result.as_ref().err().is_some_and(|error| error.downcast_ref::<wgpu::optional_allocations::Refused>().is_some()) {
+            stop_canvas_workers(std::mem::take(&mut pool), std::mem::take(&mut joins), &mut slots, &renderer)?;
+            retry_from = accepted.get();
+            workers = 1;
+            if let Some(serial) = serial_slots.take() { slots = serial; }
+            in_flight = slots.len();
+            crate::gpu_memory::wait(&renderer.device, &renderer.queue, &renderer.errors, None)?;
+            memory_refused = true;
+            if diagnostics { eprintln!("canvas concurrency: memory reservation refused; retry serial at frame {retry_from}"); }
+            continue;
+        }
+        stop_canvas_workers(std::mem::take(&mut pool), std::mem::take(&mut joins), &mut slots, &renderer)?;
+        return result;
+        }
+    });
     // Join all output workers even when a render or another destination failed.
     let png_finished: Vec<_> = png_writers.into_iter().chain(raw_writers).map(|writer| writer.finish()).collect();
     result?;
@@ -2969,7 +3413,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             if !is_video(path) { meta["output_png_depth"] = 8.into(); }
         }
         if let Some(parent) = meta_path.parent() { std::fs::create_dir_all(parent)?; }
-        pending_metadata.push((meta_path.clone(), serde_json::to_vec_pretty(&meta)?));
+        pending_metadata.push((meta_path.clone(), serde_json::value_to_vec_pretty(&meta)?));
         sidecars.push(meta_path);
     }
     let pipeline_creation_ms: Vec<_> = renderer.pipeline_timings().into_iter().filter_map(|(name, ms)| {
@@ -2987,8 +3431,11 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
         "encoder_finish_ms": encoder_finish_ms, "scene_parse_ms": scene_parse_ms, "install_ms": install_ms,
         "device_ms": if device_reused { 0. } else { renderer.startup.as_secs_f64() * 1000. },
         "first_frame_ms": first_frame_ms, "ready_ms": (loop_start - wall).as_secs_f64() * 1000.,
-        "loop_wall_ms": (stages_end - loop_start).as_secs_f64() * 1000., "wall_ms": (stages_end - wall).as_secs_f64() * 1000., "samples": samples,
+        "loop_wall_ms": (stages_end - loop_start).as_secs_f64() * 1000., "wall_ms": (stages_end - wall).as_secs_f64() * 1000.,
     });
+    // The completed rows already are JSON values; json! would serialize a
+    // borrowed copy of every per-frame diagnostic into a second value tree.
+    report["samples"] = serde_json::Value::Array(samples);
     // Canvas painting records no per-pass GPU spans; its compile and encode stages are timed.
     let (stages, pipeline_cache_saves) = crate::timing::stages(&renderer.device, wall, stages_end, crate::timing::StageTotals {
         setup_ms: (loop_start - wall).as_secs_f64() * 1000., first_frame_ms, frames_ms: (stages_end - loop_start).as_secs_f64() * 1000.,
@@ -2998,12 +3445,15 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     report["pipeline_cache_saves"] = serde_json::to_value(pipeline_cache_saves)?;
     report["pipeline_cache_save_pending"] = renderer.compiler.save_pending().into();
     if diagnostics {
+        report["breakdown"] = crate::canvas_timing::total(report["samples"].as_array().unwrap(), setup_host.as_ref().unwrap(), encoder_start_ms, encoder_finish_ms);
+        report["stages"]["gpu_ms"] = report["breakdown"]["gpu_busy_ms"].clone();
         report["memory_frames"] = memory_frames.into();
         report["retained_gpu_bytes"] = renderer.residency.retained_bytes().into();
     }
     report["render_settings"] = render_settings;
     report["device_reused"] = device_reused.into();
     report["install_reused"] = install_reused.into();
+    if diagnostics { eprintln!("render: {workers} canvas frame worker(s)"); }
     report["interrupted"] = interrupted.into();
     report["warnings"] = serde_json::to_value(warnings.snapshot())?;
     report["sidecars"] = serde_json::to_value(sidecars)?;
@@ -3013,7 +3463,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
         let mut timing_paths = Vec::new();
         for path in &out {
             let timing_path = if is_video(path) || is_png(path) || is_exr(path) { shot::sidecar(path, "timings.json") } else { path.join("timings.json") };
-            std::fs::write(&timing_path, serde_json::to_vec_pretty(&report)?)?;
+            std::fs::write(&timing_path, serde_json::value_to_vec_pretty(&report)?)?;
             timing_paths.push(timing_path);
         }
         if let Some(sidecars) = report["sidecars"].as_array_mut() {
@@ -3021,6 +3471,8 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
         }
     }
     if let Some(run) = &output_run { run.complete(&pending_metadata)?; }
+    #[cfg(feature = "frame-profile")]
+    crate::frame_profile::report(&report);
     Ok(RenderedShot::canvas(report, encoders, renderer, Kept { identity, document, target }))
 }
 
@@ -3578,8 +4030,17 @@ mod canvas_regressions {
             Ok(bytes)
         };
         let rendered = crate::shot::Shot { scene: scene.clone(), out: vec![root.join("a").into(), root.join("b").into()],
-            frame_start: Some(3), frame_end: Some(10), ..Default::default() }.render()?;
+            frame_start: Some(3), frame_end: Some(10), diagnostics: true, ..Default::default() }.render()?;
         assert_eq!(rendered.report["frames"], 8);
+        let rows = rendered.report["samples"].as_array().unwrap();
+        assert_eq!(rows[0]["frame"], 3);
+        for row in rows {
+            assert!(row["breakdown"]["evaluation_ms"].as_f64().unwrap() > 0.);
+            assert!(row["breakdown"]["gpu_busy_ms"].as_f64().unwrap() > 0.);
+            assert_eq!(row["breakdown"]["gpu_untimed_passes"], 0);
+        }
+        let gpu_sum: f64 = rows.iter().map(|row| row["breakdown"]["gpu_busy_ms"].as_f64().unwrap()).sum();
+        assert!((rendered.report["breakdown"]["gpu_busy_ms"].as_f64().unwrap() - gpu_sum).abs() < 1e-6);
         for frame in 3..=10 {
             let name = format!("{frame:06}.png");
             assert_eq!(pixels(root.join("a").join(&name))?, pixels(root.join("b").join(&name))?);
@@ -3589,6 +4050,9 @@ mod canvas_regressions {
         drop(rendered);
         let still = crate::shot::Shot { scene, out: vec![root.join("still.png").into(), root.join("at").into()],
             at: Some("0.2".parse()?), ..Default::default() }.render()?;
+        assert!(still.report.get("breakdown").is_none());
+        assert!(!moda_engine::prof::capturing());
+        assert!(!moda_engine::gpu_profile::enabled());
         let expected = pixels(root.join("a/000006.png"))?;
         assert_eq!(pixels(root.join("still.png"))?, expected);
         assert_eq!(pixels(root.join("at/000006.png"))?, expected);
@@ -4731,7 +5195,7 @@ mod retained_tests {
         let nodes: Vec<_> = doc.items.iter().map(|item| &item.node).collect();
         let mut values = frame.values.clone();
         let mut retained = crate::canvas_draw::Retained::new(&doc.page, &nodes, &values)?;
-        let builder: crate::canvas_draw::CanvasTextBuilder = std::rc::Rc::new(|_,_,_,_,_,_,_| Ok(None));
+        let builder: crate::canvas_draw::CanvasTextBuilder = std::rc::Rc::new(|_,_,_,_,_,_,_,_| Ok(None));
         let mut previous_plan = crate::canvas_draw::plan(&mut retained, &doc.page, builder.clone())?;
         let counter = |r: &crate::canvas_draw::Retained, name: &str| -> u64 {
             serde_json::from_str::<serde_json::Value>(&r.profile_counters()).unwrap()[name].as_u64().unwrap()
@@ -4742,9 +5206,10 @@ mod retained_tests {
             // The fade crosses opaque, so the planner prepares `a` again; `b` follows its recipe.
             (vec![("a",5.),("g",2.)], true, true),
             // The generated clip copy is under the translated wrapper, so its
-            // mask changes too. The patcher must rebuild unequal masks.
-            (vec![("clipped",7.)], false, false),
-            (vec![("mask",9.)], false, false),
+            // mask changes too. Recorded units update the mask and rebuild its
+            // consumers in place, retaining the rest of the plan.
+            (vec![("clipped",7.)], false, true),
+            (vec![("mask",9.)], false, true),
         ] {
             let changes_mask = edits.iter().any(|(name, _)| matches!(*name, "clipped" | "mask"));
             let before = counter(&retained, "incr_patch_hits");
@@ -4781,7 +5246,7 @@ mod retained_tests {
         let nodes: Vec<_> = doc.items.iter().map(|item| &item.node).collect();
         let fonts = doc.fonts.clone();
         let draws: HashMap<_, _> = frame.batches().map(|d| ((d.item, d.sub), d.clone())).collect();
-        let builder: crate::canvas_draw::CanvasTextBuilder = std::rc::Rc::new(move |item, sub, model, z, clip, scale, opacity| {
+        let builder: crate::canvas_draw::CanvasTextBuilder = std::rc::Rc::new(move |item, sub, model, z, clip, scale, opacity, _| {
             let mut placed: Draw = draws.get(&(item, sub)).context("a text batch the frame did not plan")?.clone();
             placed.model = model;
             Arc::make_mut(&mut placed.spec).opacity = opacity;
@@ -5112,6 +5577,7 @@ mod style_tests {
                 for picture in [&mut restored, &mut reference] {
                     for node in picture["nodes"].as_array_mut().unwrap() {
                         if let Some(binding) = node.get_mut("vorkText") { binding[2] = json!(0); }
+                        if let Some(paint) = node.get_mut("vorkPaint") { *paint = json!(0); }
                     }
                 }
                 assert_eq!(restored,reference);
@@ -5192,6 +5658,102 @@ mod style_tests {
         }
     }
 
+    #[test]
+    fn text_paint_revisions_keep_geometry_and_match_fresh_plans() -> Result<()> {
+        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
+        let node = json!({"name":"n","type":"text","content":"Paint","font":font,"font-size":32,"fill":"red",
+            "stroke":"blue","stroke-width":2});
+        let tracks = json!([
+            {"path":["nodes","n","fill"],"keys":[[0,"red"],[1,"green"],[2,"blue"]]},
+            {"path":["nodes","n","stroke"],"keys":[[0,"blue"],[1,"red"],[2,"lime"]]}]);
+        let kept = doc(node.clone(), tracks.clone());
+        let mut content = None;
+        let mut last_paint = 0;
+        for time in [0., 0.25, 0.75, 1.5, 0.25] {
+            let frame = kept.snapshot(&vork_time::Request::Numeric(time))?;
+            let revision = frame.values[0].text_revision;
+            assert_eq!(*content.get_or_insert(revision), revision);
+            assert!(frame.values[0].text_paint_revision > last_paint);
+            last_paint = frame.values[0].text_paint_revision;
+            let actual = kept.plan_snapshot(&frame, &[])?;
+            let fresh = doc(node.clone(), tracks.clone());
+            let fresh_frame = fresh.snapshot(&vork_time::Request::Numeric(time))?;
+            let expected = fresh.plan_snapshot(&fresh_frame, &[])?;
+            assert_eq!(format!("{:?}", actual.items), format!("{:?}", expected.items), "time {time}");
+            if time != 0. {
+                assert!(actual.items.iter().any(|item| matches!(item, moda_engine::seams::DrawItem::Text(b) if b.content_key.is_none())), "paint patches bypass content preparation");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_paint_and_path_placement_share_the_incremental_writer() -> Result<()> {
+        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
+        let node = json!({"name":"group","children":[
+            {"name":"n","type":"text","content":"Paint","font":font,"font-size":32,"fill":"red"},
+            {"name":"p","type":"path","d":"M0 50H20V70H0Z","fill":"blue"}]});
+        let tracks = json!([
+            {"path":["nodes","n","fill"],"keys":[[0,"red"],[1,"green"]]},
+            {"path":["nodes","p","translation"],"keys":[[0,[0,0,0]],[1,[20,0,0]]]}]);
+        let kept = doc(node.clone(), tracks.clone());
+        let mut geometry: Option<moda_text::vector::VectorNodeOps> = None;
+        for time in [0., 0.25, 0.75, 0.25] {
+            let frame = kept.snapshot(&vork_time::Request::Numeric(time))?;
+            let actual = kept.plan_snapshot(&frame, &[])?;
+            let fresh = doc(node.clone(), tracks.clone());
+            let frame = fresh.snapshot(&vork_time::Request::Numeric(time))?;
+            let expected = fresh.plan_snapshot(&frame, &[])?;
+            assert_eq!(format!("{:?}", actual.items), format!("{:?}", expected.items));
+            let batch = actual.items.iter().find_map(|item| match item {
+                moda_engine::seams::DrawItem::Text(b) => Some(b), _ => None,
+            }).unwrap();
+            let vector = batch.vector.as_ref().unwrap();
+            if let Some(old) = &geometry {
+                assert!(batch.content_key.is_none(), "mixed writes must repaint text");
+                assert!(Arc::ptr_eq(&old.curve_points, &vector.curve_points));
+                for (a,b) in old.ops.iter().zip(&vector.ops) {
+                    assert!(Arc::ptr_eq(&a.records, &b.records));
+                    assert!(Arc::ptr_eq(&a.tris, &b.tris));
+                }
+            }
+            geometry = Some(vector.clone());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn glyph_fill_repaints_kept_batches_when_coverage_is_unchanged() -> Result<()> {
+        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
+        let node = json!({"name":"n","type":"text","content":"AB","font":font,"font-size":32,"fill":"red"});
+        let tracks = json!([{ "path":["nodes","n","glyphs",0,"fill"],"keys":[[0,"blue"],[1,"green"]]}]);
+        let kept = doc(node.clone(), tracks.clone());
+        let mut content = None;
+        let mut geometry: Vec<moda_text::vector::VectorNodeOps> = Vec::new();
+        for time in [0., 0.25, 0.75, 0.25] {
+            let frame = kept.snapshot(&vork_time::Request::Numeric(time))?;
+            assert_eq!(*content.get_or_insert(frame.values[0].text_revision), frame.values[0].text_revision);
+            let actual = kept.plan_snapshot(&frame, &[])?;
+            let fresh = doc(node.clone(), tracks.clone());
+            let frame = fresh.snapshot(&vork_time::Request::Numeric(time))?;
+            let expected = fresh.plan_snapshot(&frame, &[])?;
+            assert_eq!(format!("{:?}", actual.items), format!("{:?}", expected.items));
+            let batches: Vec<_> = actual.items.iter().filter_map(|item| match item {
+                moda_engine::seams::DrawItem::Text(b) => Some(b), _ => None,
+            }).collect();
+            if !geometry.is_empty() {
+                for (old, batch) in geometry.iter().zip(&batches) {
+                    assert!(batch.content_key.is_none());
+                    for (a,b) in old.ops.iter().zip(&batch.vector.as_ref().unwrap().ops) {
+                        assert!(Arc::ptr_eq(&a.records, &b.records));
+                    }
+                }
+            }
+            geometry = batches.iter().map(|b| b.vector.as_ref().unwrap().clone()).collect();
+        }
+        Ok(())
+    }
+
     /// A snapshot planned by another document is that snapshot's state, not the other document's own latest, even
     /// when both have taken as many snapshots.
     #[test]
@@ -5236,7 +5798,7 @@ mod style_tests {
     #[test]
     fn solid_colour_tracks_are_paint_values_however_they_are_spelled() {
         let kinds = |fill: &str, keys: serde_json::Value| doc(serde_json::json!({"name":"p","type":"path","d":"M0 0H10V10H0Z","fill":fill}),
-            serde_json::json!([{"path":["nodes","p","fill"],"keys":keys}])).kinds;
+            serde_json::json!([{"path":["nodes","p","fill"],"keys":keys}])).kinds.clone();
         assert_eq!(kinds("red", serde_json::json!([[0,[1,0,0,1]],[1,[0,0,1,1]]])), [Some(ChangeKind::PaintValue)]);
         assert_eq!(kinds("red", serde_json::json!([[0,"red"],[1,"blue"]])), [Some(ChangeKind::PaintValue)]);
         // A key that is not a colour, or a rest paint that is not one, changes the paint's kind.
@@ -5294,6 +5856,62 @@ mod style_tests {
         let widened = scene(json!({"path":["nodes","p","stroke-width"],"keys":[[0,[4]],[1,[4]]]}));
         for time in [0.25, 0.5, 0.75] { widened.snapshot(&vork_time::Request::Numeric(time)).unwrap(); }
         assert_eq!(widened.change_counters(), json!({"unchanged":0,"placement":0,"paint_value":0,"content":2,"structure":1}));
+    }
+
+    #[test]
+    fn shared_inputs_keep_independent_frame_histories_across_threads() -> Result<()> {
+        fn picture(document: &Document, time: f32) -> (serde_json::Value, Vec<(Arc<moda_text::ops::TextNodeSpec>, [f32; 16])>) {
+            let frame = document.snapshot(&vork_time::Request::Numeric(time)).unwrap();
+            let nodes: Vec<_> = document.items.iter().enumerate().map(|(i, n)| frame.nodes[i].as_deref().unwrap_or(&n.node)).collect();
+            let mut picture = crate::canvas_draw::document(&document.page, &nodes, &frame.values).unwrap();
+            // Each retained history has its own cache revision. Compare picture
+            // content and the bound text specs, not those history-local stamps.
+            for node in picture["nodes"].as_array_mut().unwrap() {
+                if let Some(binding) = node.get_mut("vorkText") { binding[2] = json!(0); }
+                if let Some(paint) = node.get_mut("vorkPaint") { *paint = json!(0); }
+            }
+            (picture, frame.batches().map(|draw| (draw.spec.clone(), draw.model)).collect())
+        }
+        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
+        let scene = Scene::from_json(&serde_json::to_vec(&json!({
+            "version":2,"composition":{"space":"2d"},
+            "nodes":[{"name":"g","active":[0,3],"children":[
+                {"name":"p","type":"path","d":"M0 0H20V20H0Z","fill":"red"},
+                {"name":"t","type":"text","content":"AB","font":font}
+            ]}],
+            "animation":[{"tracks":[
+                {"path":["nodes","p","translation"],"keys":[[0,[0,0,0]],[2,[25,15,0]]]},
+                {"path":["nodes","t","content"],"keys":[[0,"AB"],[1,"CD"]],"interpolation":"STEP"},
+                {"path":["nodes","g","opacity"],"keys":[[0,1],[2,0.4]]}
+            ]}]
+        }))?)?;
+        let original = Document::new(&scene, Path::new("."))?;
+        let expected: Vec<_> = (0..32).map(|frame| {
+            picture(&Document::new(&scene, Path::new(".")).unwrap(), frame as f32 / 8.)
+        }).collect();
+        for count in [1, 2, 4, 8] {
+            std::thread::scope(|scope| {
+                let mut joins = Vec::new();
+                for lane in 0..count {
+                    let prepared = original.prepared.clone();
+                    let scene = &scene;
+                    let expected = &expected;
+                    joins.push(scope.spawn(move || -> Result<()> {
+                        let worker = Document::from_prepared(prepared, crate::canvas_draw::Media::new(scene, Path::new("."))?);
+                        for frame in (lane..32).step_by(count).chain((lane..32).step_by(count).rev()) {
+                            assert_eq!(picture(&worker, frame as f32 / 8.), expected[frame], "workers {count}, frame {frame}");
+                            worker.plan(&[])?;
+                        }
+                        let held_before = worker.changes.get()[0];
+                        worker.frame(&vork_time::Request::Numeric(lane as f32 / 8.))?;
+                        assert_eq!(worker.changes.get()[0], held_before + 1, "unchanged samples retain their history");
+                        Ok(())
+                    }));
+                }
+                for join in joins { join.join().unwrap().unwrap(); }
+            });
+        }
+        Ok(())
     }
 
     #[test]
@@ -5459,5 +6077,32 @@ mod style_tests {
         let animated=doc(node,json!([]));
         let static_doc=doc(json!({"name":"n","type":"path","d":"M0 0H100V100H0Z","fill":"linear-gradient(rgb(127.5 0 127.5), rgb(127.5 0 127.5))"}),json!([]));
         assert_eq!(drawing(&animated,0.5),drawing(&static_doc,0.5));
+    }
+}
+
+#[cfg(test)]
+mod nesting_tests {
+    use super::*;
+    /// A canvas nested to the stated depth is read, built, evaluated and hashed on a scene thread, as the command
+    /// thread and the hashing worker do it.
+    #[test]
+    fn a_canvas_nested_to_the_stated_depth_builds_and_hashes() {
+        let groups = vork_scene::MAX_NODE_DEPTH;
+        let mut text = String::from(r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[64,64]},"nodes":["#);
+        for depth in 0..groups { text.push_str(&format!(r#"{{"name":"g{depth}","children":["#)); }
+        text.push_str(r##"{"type":"path","name":"leaf","d":"M0 0H16V16H0Z","fill":"#38bdf8"}"##);
+        for _ in 0..groups { text.push_str("]}"); }
+        text.push_str(r#"],"animation":[{"tracks":[{"path":["nodes","leaf","translation"],"keys":[[0,[0,0,0]],[1,[8,0,0]]]}]}]}"#);
+        let built = vork_scene::scene_thread().spawn(move || -> Result<(usize, Option<usize>)> {
+            let scene = Scene::from_json(text.as_bytes())?;
+            let document = Document::new(&scene, Path::new("."))?;
+            document.frame(&vork_time::Request::Numeric(0.5))?;
+            let hashed = std::thread::scope(|scope| {
+                vork_scene::scene_thread().spawn_scoped(scope, || Kept::identity(&scene, Path::new("."))).unwrap().join().unwrap()
+            })?;
+            ensure!(hashed == Kept::identity(&scene, Path::new("."))?, "the scene hashes the same on any scene thread");
+            Ok((document.items.len(), document.rest[groups].parent))
+        }).unwrap().join().unwrap().unwrap();
+        assert_eq!(built, (groups + 1, Some(groups - 1)));
     }
 }

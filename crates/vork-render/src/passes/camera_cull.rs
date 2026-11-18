@@ -340,6 +340,8 @@ impl Resources {
         geometry_bounds: &[Option<(Vec3,Vec3)>],
         changes: &mut crate::values::ChangeTracker, reuse: bool,
     ) {
+        #[cfg(feature = "frame-profile")]
+        let _profile = crate::frame_profile::span("camera_selection");
         self.run.store(!reuse, std::sync::atomic::Ordering::Relaxed);
         if reuse { return; }
         if let Some(gpu) = self.plan.as_ref().and_then(|plan| plan.gpu.as_ref()) {

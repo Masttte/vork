@@ -220,6 +220,8 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub(crate) inner: dispatch::DispatchBuffer,
+    #[cfg(std)]
+    pub(crate) _reservation: Option<alloc::sync::Arc<crate::optional_allocations::Lease>>,
     pub(crate) map_context: Arc<Mutex<MapContext>>,
     pub(crate) size: wgt::BufferAddress,
     pub(crate) usage: BufferUsages,

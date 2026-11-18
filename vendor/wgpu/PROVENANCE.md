@@ -41,3 +41,14 @@ Local native geometry extension: axis-aligned bounding-box BLAS descriptions and
 build inputs use the existing Vulkan/Metal HAL AABB implementation. Core checks
 geometry counts, compatible flags, stride/alignment, buffer range, usage and device
 ownership, and tracks initialization and build-input transitions.
+
+Local optional-allocation extension: `src/optional_allocations.rs` and the native
+buffer/texture/queue API wrappers reserve disposable render capacity before
+backend allocation. Resource clones share a lease; upload staging retains its
+lease through queue completion. Native allocation and headroom refresh are
+serialized, and an epoch never reuses unconfirmed frees. A refused reservation
+unwinds only the enclosing disposable scope without invoking the panic hook or
+creating an invalid GPU handle. The caller owns recoverable jobs outside that
+scope and discards its mutable render state; ordinary panics still propagate.
+Abort-on-panic builds decline optional scopes. No ordinary allocation is refused
+outside an optional scope. The renderer uses this for bounded 2D frame workers.

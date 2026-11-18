@@ -62,8 +62,53 @@ public float3 substrate_albedo(float3 base, float3 subsurface, float weight, flo
 public float coat_transmission(float weight, float cosine, float eta) {
     return 1.-weight*fresnel(abs(cosine),eta);
 }
-public float3 compose_coat(float3 base, float3 coat, float weight, float no, float ni, float eta) {
-    return base*(coat_transmission(weight,no,eta)*coat_transmission(weight,ni,eta))+coat;
+// OpenPBR 1.1.1 coat medium (View-dependent absorption). A ray that meets the
+// coat at `cosine` refracts to cosine sqrt(1-(1-cosine²)/eta²) inside it, and
+// travels the reciprocal of that many normal thicknesses. The floor keeps a
+// matched or lighter coat finite at grazing incidence.
+public float coat_path(float cosine, float eta) {
+    return rsqrt(max(1.-(1.-cosine*cosine)/(eta*eta),1e-4));
+}
+// The cosine-weighted mean of coat_path over the directions that enter the coat,
+// 2η/(η+sqrt(η²-1)): the crossing of light integrated over the hemisphere.
+public float coat_mean_path(float eta) {
+    return eta>1. ? 2.*eta/(eta+sqrt(eta*eta-1.)) : 2.;
+}
+// coat_color is the squared normal-incidence transmittance of the coat medium,
+// so `path` normal thicknesses transmit coat_color^(path/2); two at normal
+// incidence give the colour itself. The coat is present over `weight` of the surface.
+public float3 coat_absorption(float3 color, float weight, float path) {
+    if (weight<=0. || all(color==float3(1.))) {return float3(1.);}
+    // A safe positive base avoids pow(0,x); black channels stay exactly black.
+    let safe=select(color>float3(0.),color,float3(1.));
+    return lerp(float3(1.),select(color>float3(0.),pow(safe,float3(.5*path)),float3(0.)),weight);
+}
+// Hemispherical average of the dielectric Fresnel factor, E_F(η) = 2∫F(μ,η)μdμ.
+// OpenPBR's d'Eon 2021 fit holds within 0.2% for η in [1,3]; the exact closed
+// form is well conditioned above that range, where the fit fails. E_F below
+// one follows from E_F(η) = 1-η²(1-E_F(1/η)).
+public float average_fresnel(float eta) {
+    if (eta==1.) {return 0.;}
+    let n=eta<1. ? 1./eta : eta;let n2=n*n;let n4=n2*n2;
+    var e=0.;
+    if (n<=3.) {e=log((10893.*n-1438.2)/(-774.4*n2+10212.*n+1.));}
+    else {
+        e=.5+(n-1.)*(3.*n+1.)/(6.*(n+1.)*(n+1.))+n2*(n2-1.)*(n2-1.)/((n2+1.)*(n2+1.)*(n2+1.))*log((n-1.)/(n+1.))
+            -2.*n*n2*(n2+2.*n-1.)/((n2+1.)*(n4-1.))+8.*n4*(n4+1.)/((n2+1.)*(n4-1.)*(n4-1.))*log(n);
+    }
+    e=clamp(e,0.,1.);
+    return eta<1. ? 1.-eta*eta*(1.-e) : e;
+}
+// OpenPBR 1.1.1 coat darkening. Internal reflection returns the fraction K of
+// the light leaving the base to it, so a base of normal-incidence albedo E
+// keeps Δ = (1-K)/(1-E·K) of its response. K runs from the coat's Fresnel
+// reflection toward the viewer under a smooth base to 1-(1-E_F)/η² under a
+// rough one. `amount` is coat_weight·coat_darkening: lerp(1,Δ,amount).
+public float3 coat_darkening(float3 albedo, float roughness, float exit_fresnel, float eta, float amount) {
+    if (amount<=0.) {return float3(1.);}
+    let rough=1.-(1.-average_fresnel(eta))/(eta*eta);
+    let k=clamp(lerp(exit_fresnel,rough,roughness),0.,1.);
+    return lerp(float3(1.),(1.-k)/max(float3(1.)-clamp(albedo,float3(0.),float3(1.))*k,float3(1e-6)),amount);
 }
 public float distribution(float nh, float alpha) {
     // Keep the transport form: subtracting one from alpha squared loses the

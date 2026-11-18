@@ -63,7 +63,7 @@ impl Adapter {
         async move {
             device
                 .await
-                .map(|(device, queue)| (Device { inner: device }, Queue { inner: queue }))
+                .map(|(device, queue)| (Device { inner: device }, Queue { inner: queue, #[cfg(std)] pending_reservations: Default::default() }))
         }
     }
 
@@ -92,6 +92,8 @@ impl Adapter {
             },
             Queue {
                 inner: queue.into(),
+                #[cfg(std)]
+                pending_reservations: Default::default(),
             },
         ))
     }

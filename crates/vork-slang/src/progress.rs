@@ -1,4 +1,5 @@
 //! Optional process progress, enabled by the CLI. No output or observer thread in library users.
+use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicUsize, Ordering}};
 use std::time::Instant;
 
@@ -49,30 +50,81 @@ pub fn completed(count: usize) { COMPLETED.fetch_max(count, Ordering::Relaxed); 
 pub fn snapshot() -> (State, usize) {
     (STATE.get().expect("progress enabled").lock().unwrap().clone(), COMPLETED.load(Ordering::Relaxed))
 }
-/// Creation events, for the CLI that owns this process's stderr. Like the
-/// progress above they are process-wide and off unless the CLI turns them on,
-/// once, for its own command: a library user or a retained session writes
-/// nothing. While on, every announced creation writes one `creation: {json}`
-/// line when it begins and one when it ends, so a process that is stopped
-/// mid-compile has still said what it finished, how long each took, and what
-/// was in flight.
+/// Creation events belong to the CLI's process. Producers enqueue a complete
+/// begin/end line at the job boundary; one writer publishes them immediately,
+/// coalescing already queued lines without waiting for another event. Slow
+/// redirected pipes must not serialize the compiler and pipeline threads.
 static EVENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn events(on: bool) { EVENTS.store(on, Ordering::Relaxed); }
+static EVENT_WRITER: OnceLock<Mutex<Option<EventWriter>>> = OnceLock::new();
+struct EventWriter {
+    send: std::sync::mpsc::Sender<String>,
+    worker: std::thread::JoinHandle<std::io::Result<()>>,
+}
+/// Drain diagnostic events on ordinary returns, including errors. The one-shot
+/// process-exit boundary calls `finish_events` explicitly because it skips drops.
+#[must_use]
+pub struct Events(bool);
+impl Drop for Events {
+    fn drop(&mut self) { if self.0 { finish_events(); } }
+}
+pub fn events(on: bool) -> Events {
+    if on {
+        let mut writer = EVENT_WRITER.get_or_init(Default::default).lock().unwrap();
+        assert!(writer.is_none(), "creation event writer already enabled");
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || write_events(receive, std::io::stderr()));
+        *writer = Some(EventWriter { send, worker });
+        EVENTS.store(true, Ordering::Release);
+    }
+    Events(on)
+}
+/// Drain what was announced, without waiting for unfinished optional compiles.
+pub fn finish_events() {
+    EVENTS.store(false, Ordering::Release);
+    let writer = EVENT_WRITER.get().and_then(|writer| writer.lock().unwrap().take());
+    if let Some(EventWriter { send, worker }) = writer {
+        drop(send);
+        worker.join().expect("creation event writer panicked").expect("write creation events");
+    }
+}
+fn write_events(receive: std::sync::mpsc::Receiver<String>, mut output: impl std::io::Write) -> std::io::Result<()> {
+    while let Ok(mut lines) = receive.recv() {
+        // No timer or delayed flush: publish the first event even if no second
+        // event arrives (for example, a driver compile that hangs).
+        while lines.len() < 64 * 1024 {
+            let Ok(line) = receive.try_recv() else { break; };
+            lines.push_str(&line);
+        }
+        output.write_all(lines.as_bytes())?;
+    }
+    output.flush()
+}
 
-/// One announced creation: its `begin` line is written by `announce`, its
-/// `end` line, with the milliseconds between, when this is dropped. Every
-/// `end` therefore has a `begin`.
+/// Every completed creation enqueues its end after its begin. A process stopped
+/// during compilation retains the already published events and in-flight begins.
 pub struct Announced { kind: &'static str, label: String, start: Instant }
-/// Announce a creation of KIND named LABEL. None, and no output, unless the CLI enabled events.
 pub fn announce(kind: &'static str, label: &str) -> Option<Announced> {
-    if !EVENTS.load(Ordering::Relaxed) { return None; }
-    eprintln!("creation: {{\"event\":\"begin\",\"kind\":{},\"label\":{}}}", json_string(kind), json_string(label));
+    if !EVENTS.load(Ordering::Acquire) { return None; }
+    event_line(format!("creation: {{\"event\":\"begin\",\"kind\":{},\"label\":{}}}\n", json_string(kind), json_string(label)));
     Some(Announced { kind, label: label.to_owned(), start: Instant::now() })
 }
 impl Drop for Announced {
     fn drop(&mut self) {
-        eprintln!("creation: {{\"event\":\"end\",\"kind\":{},\"label\":{},\"ms\":{:.3}}}",
-            json_string(self.kind), json_string(&self.label), self.start.elapsed().as_secs_f64() * 1000.);
+        event_line(format!("creation: {{\"event\":\"end\",\"kind\":{},\"label\":{},\"ms\":{:.3}}}\n",
+            json_string(self.kind), json_string(&self.label), self.start.elapsed().as_secs_f64() * 1000.));
+    }
+}
+/// Write a complete summary line without fragmented writes to redirected pipes.
+pub fn line(mut text: String) {
+    text.push('\n');
+    std::io::stderr().lock().write_all(text.as_bytes()).expect("stderr write failed");
+}
+
+fn event_line(line: String) {
+    if let Some(writer) = EVENT_WRITER.get() {
+        if let Some(writer) = &*writer.lock().unwrap() {
+            writer.send.send(line).expect("creation event writer stopped");
+        }
     }
 }
 fn json_string(text: &str) -> String {
@@ -167,6 +219,36 @@ pub fn passes(start: Instant, end: Instant) -> (Vec<(Pass, Instant, Instant)>, b
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn event_writer_publishes_live_and_drains_every_queued_line() {
+        struct Sink(std::sync::mpsc::Sender<Vec<u8>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.send(bytes.to_vec()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        let (published, output) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || write_events(receive, Sink(published)));
+        let first = "creation: {\"event\":\"begin\",\"kind\":\"Slang\",\"label\":\"slow\"}\n";
+        send.send(first.to_owned()).unwrap();
+        // A compile may stall indefinitely after begin: delivery cannot depend
+        // on another event, closing the channel or normal process termination.
+        assert_eq!(output.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), first.as_bytes());
+        let mut expected = String::new();
+        for i in 0..1000 {
+            let line = format!("creation: {{\"event\":\"end\",\"label\":\"{i}\"}}\n");
+            expected.push_str(&line);
+            send.send(line).unwrap();
+        }
+        drop(send);
+        worker.join().unwrap().unwrap();
+        let actual: Vec<u8> = output.into_iter().flatten().collect();
+        assert_eq!(actual, expected.as_bytes());
+    }
+
     #[test]
     fn slang_jobs_enter_the_pass_timeline_by_kind_and_driver_jobs_do_not() {
         let start = Instant::now();

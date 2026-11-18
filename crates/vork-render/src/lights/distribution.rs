@@ -6,7 +6,13 @@ pub(crate) fn node_count(lights: usize) -> usize { lights.saturating_mul(2).satu
 pub(crate) fn nodes(lights: &[Light]) -> anyhow::Result<Vec<Node>> {
     // path_sampler.sample_unit supplies 23-bit midpoint source coordinates.
     anyhow::ensure!(lights.len() <= (1 << 23), "analytic light tree exceeds the path sampler source-coordinate capacity");
-    let tree = Tree::build(&analytic_sources(lights))?;
+    // Membership is evaluated on every light upload, including animation and
+    // shutter samples. Keep installed identities for shadow links and RNG keys.
+    // Test RGB directly: a quantized/underflowed power guide is not proof of zero.
+    let sources: Vec<_> = analytic_sources(lights).into_iter()
+        .filter(|source| lights[source.identity as usize].radiance[..3].iter().any(|&v| v != 0.))
+        .collect();
+    let tree = Tree::build(&sources)?;
     Ok(if tree.nodes.is_empty() { vec![bytemuck::Zeroable::zeroed()] } else { tree.nodes })
 }
 
@@ -164,6 +170,45 @@ mod tests {
                 sampled_image = Some(image);
             }
         }
+        // A retained install must cross the exact/sampled boundary in both
+        // directions as the ninth emitter animates, matching static frames.
+        for profile in ["std/final", "std/path"] {
+            let mut source = document.clone();
+            for i in 0..budget {
+                source["nodes"].as_array_mut().unwrap().push(json!({
+                    "type":"light","shape":"sun","angle":0,"energy":1,
+                    "color":if i%2==0 {json!([1,0,0])} else {json!([0,0,1])}
+                }));
+            }
+            let install = |value: &serde_json::Value| -> anyhow::Result<crate::InstalledScene> {
+                let mut scene = crate::test_scene(value.clone(), std::path::Path::new("."))?;
+                let settings = vork_scene::Profile::load(profile)?.resolve(&serde_json::Map::new())?;
+                scene.apply_settings(settings, profile)?;
+                scene.render.settings.samples = 8;
+                scene.render.settings.disable_denoiser();
+                r.install(scene, std::path::Path::new("."))
+            };
+            let mut baseline = install(&source)?;
+            let mut slot = baseline.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
+            let baseline = baseline.render_frame(&r, &mut slot, 0.)?.linear_rgba.unwrap();
+            source["nodes"].as_array_mut().unwrap().push(json!({
+                "type":"light","name":"animated","shape":"sun","angle":0,"energy":0,"color":[0,1,0]
+            }));
+            source["animation"] = json!([{"tracks":[{"path":["nodes","animated","energy"],"keys":[[0,0],[1,8]]}]}]);
+            let mut animated = install(&source)?;
+            let mut a = animated.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
+            let mut b = animated.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
+            let dark = animated.render_frame(&r, &mut a, 0.)?.linear_rgba.unwrap();
+            assert_eq!(baseline, dark, "{profile}: inert ninth emitter changed the frame");
+            let bright = animated.render_frame(&r, &mut b, 1.)?.linear_rgba.unwrap();
+            assert!(bright.iter().zip(&dark).any(|(a,b)| a[1]>b[1]+0.01));
+            assert_eq!(dark, animated.render_frame(&r, &mut a, 0.)?.linear_rgba.unwrap());
+            source.as_object_mut().unwrap().remove("animation");
+            source["nodes"].as_array_mut().unwrap().last_mut().unwrap()["energy"] = json!(8);
+            let mut reference = install(&source)?;
+            let mut slot = reference.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
+            assert_eq!(bright, reference.render_frame(&r, &mut slot, 1.)?.linear_rgba.unwrap());
+        }
         Ok(())
     }
 
@@ -209,6 +254,27 @@ mod tests {
     }
 
     #[test]
+    fn active_membership_tracks_zero_crossings_without_renumbering() -> anyhow::Result<()> {
+        let mut lights = vec![Light::zeroed(); 10];
+        for light in &mut lights[..8] { light.radiance = [1.; 4]; }
+        let original = nodes(&lights[..8])?;
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&original), bytemuck::cast_slice::<_, u8>(&nodes(&lights)?));
+        lights[9].radiance[2] = f32::MIN_POSITIVE;
+        let active = nodes(&lights)?;
+        assert_eq!(active[0].links[3], 9);
+        assert!(active.iter().any(|n| n.links[0] == u32::MAX && n.source[1] == 9));
+        lights[9].radiance[2] = 0.;
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&original), bytemuck::cast_slice::<_, u8>(&nodes(&lights)?));
+        lights.fill(Light::zeroed());
+        assert_eq!(nodes(&lights)?[0].links[3], 0);
+        lights[9].radiance[0] = 1.;
+        let singleton = nodes(&lights)?;
+        assert_eq!(singleton[0].links[3], 1);
+        assert_eq!(singleton[0].source[1], 9);
+        Ok(())
+    }
+
+    #[test]
     fn spatial_nodes_handle_empty_dark_and_hdr_guides() -> anyhow::Result<()> {
         assert_eq!(nodes(&[])?.len(), node_count(0));
         let mut lights = vec![Light::zeroed(); 5];
@@ -217,9 +283,9 @@ mod tests {
             light.radiance = [if i == 0 { f32::MAX } else { 0. }; 4];
         }
         let tree = nodes(&lights)?;
-        assert_eq!(tree.len(), node_count(lights.len()));
+        assert_eq!(tree.len(), node_count(1));
         assert!(tree.iter().all(|n| n.lower_power.iter().chain(n.upper_infinite.iter()).all(|p| p.is_finite())));
-        assert_eq!(tree.iter().filter(|n| n.links[0] == u32::MAX).count(), lights.len());
+        assert_eq!(tree.iter().filter(|n| n.links[0] == u32::MAX).count(), 1);
         Ok(())
     }
 }

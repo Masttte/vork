@@ -133,20 +133,59 @@ pub fn without_bom(bytes: &[u8]) -> &[u8] {
 /// A user's JSON document as a value: without a byte-order mark, and with the reader's nesting limit said
 /// in scene terms. Every loader that reads authored scene text before expanding it starts here.
 pub fn read_document(bytes: &[u8]) -> anyhow::Result<Value> {
-    serde_json::from_slice(without_bom(bytes)).map_err(|error| nesting_error(&error, "scene").unwrap_or_else(|| error.into()))
+    let bytes = without_bom(bytes);
+    if let Some(refusal) = too_deep(bytes, super::MAX_JSON_DEPTH, "scene") { return Err(refusal); }
+    Ok(read_value(bytes)?)
 }
 
-/// The JSON reader admits [`super::MAX_JSON_DEPTH`] nested arrays and objects. A node's children nest two
-/// each, so a hierarchy about 62 nodes deep reaches it: say that, not only the reader's words. `None` for
-/// any other error.
-pub fn nesting_error(error: &serde_json::Error, what: &str) -> Option<anyhow::Error> {
-    error.to_string().contains("recursion limit exceeded").then(|| anyhow::anyhow!(
-        "the {what} nests arrays and objects more than {} deep (about 62 nested nodes); flatten the hierarchy ({error})",
-        super::MAX_JSON_DEPTH))
+/// JSON text as a value, however deeply it nests. The reader's own nesting limit is off: the limit a document
+/// has is [`too_deep`]'s, checked first, and the thread reading it has the stack for that depth
+/// ([`super::LOAD_STACK_BYTES`]).
+pub fn read_value(bytes: &[u8]) -> serde_json::Result<Value> {
+    let mut reader = serde_json::Deserializer::from_slice(bytes);
+    reader.disable_recursion_limit();
+    let value = <Value as serde::Deserialize>::deserialize(&mut reader)?;
+    reader.end()?;
+    Ok(value)
+}
+
+/// The refusal for JSON text that nests arrays and objects more than `limit` deep, or `None` when it does not.
+/// One pass over the bytes, counting brackets outside strings; text that is not JSON gets some answer here and
+/// its real error from the reader.
+pub fn too_deep(bytes: &[u8], limit: usize, what: &str) -> Option<anyhow::Error> {
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for &byte in bytes {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > limit { return Some(nesting_refusal(limit, what)); }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What a document nested more than `limit` arrays and objects deep is refused with. A node's children nest two
+/// each, so the limit is said in nodes too.
+pub fn nesting_refusal(limit: usize, what: &str) -> anyhow::Error {
+    anyhow::anyhow!("the {what} nests arrays and objects more than {limit} deep (a node hierarchy about {} deep); flatten the hierarchy",
+        super::MAX_NODE_DEPTH)
 }
 
 pub(super) fn decode_error(bytes: &[u8], original: serde_json::Error) -> anyhow::Error {
-    if let Ok(mut value) = serde_json::from_slice::<Value>(bytes) {
+    if let Ok(mut value) = read_value(bytes) {
         value.sort_all_objects();
         if value.get("animation").and_then(Value::as_array)
             .is_some_and(|layers| layers.iter().any(|layer| layer.get("blend").and_then(Value::as_str) == Some("add"))) {
@@ -276,7 +315,7 @@ fn inspect(value: &Value, schema: &Value, root: &Value, path: &str) -> Result<()
                         branch.get("oneOf").is_some() || branch.get("anyOf").is_some()
                     });
                     if !open && !nested && !fields.is_empty() {
-                        for key in object.keys().filter(|key| !fields.contains(key.as_str())) {
+                        if let Some(key) = object.keys().find(|key| !fields.contains(key.as_str())) {
                             bail!("{path}: {}", unknown("field", key, fields.iter().copied()));
                         }
                     }

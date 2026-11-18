@@ -154,6 +154,8 @@ impl Surface<'_> {
             Some(texture) => {
                 let surface_texture = SurfaceTexture {
                     texture: Texture {
+                        #[cfg(std)]
+                        _reservation: None,
                         inner: texture,
                         descriptor,
                     },

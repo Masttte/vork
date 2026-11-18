@@ -140,10 +140,10 @@ Response analytic_radiance_at<V:IVariant, S:IShadows>(Varying v, Surface s, Ligh
     // batch is already the exact cluster list, without a receiver lookup.
     // Source selection is a discrete outer proposal over the existing
     // emitter/GGX directional MIS. Small sets retain the exact traversal.
-    let source_count=uint(frame_light_count(frame));
+    let source_count=analytic_light_nodes[0].links.w;
     let tree_nodes=source_count==0u ? 0u : 2u*source_count-1u;
     let sampled=(frame.integrator.w&REG_INTEGRATOR_PREVIS_CENTER)==0u && !policy.exact_sources && !site.exact_sources && policy.selected_source<0
-        && source_count>REG_ANALYTIC_LIGHT_SAMPLES && analytic_light_nodes[0].links.w==source_count;
+        && source_count>REG_ANALYTIC_LIGHT_SAMPLES;
     let clustered=!sampled && policy.selected_source<0 && V.light_types>1u && site.camera_clusters && camera_cluster_base(v.world,frame,clusters,list_base);
     // Cluster lists are counted and sorted by light kind at construction.
     let count=uint(frame_light_count(frame));
@@ -240,7 +240,7 @@ Response analytic_radiance_at<V:IVariant, S:IShadows>(Varying v, Surface s, Ligh
             if (chord>=0. && chord<source.distance) {
                 let boundary=source_world+axis*chord;
                 var visibility=S.visibility_direction(boundary,axis,record,i,axis,source.distance-chord,site.position_error,source_sample,S.sample_count());
-                direct+=subsurface_transmission(original,geometric,view,axis,thickness)*max(-dot(geometric,axis),0.)/REG_PI*l.throughput*l.scale*weight*visibility;
+                direct+=subsurface_transmission(original,geometric,view,axis,thickness)*max(-dot(geometric,axis),0.)/REG_PI*l.throughput*l.crossing*weight*visibility;
             }
         }
     }
@@ -398,17 +398,20 @@ Response surface_radiance_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers
             }
         }
         let fuzz=c.fuzz_weight*c.fuzz_color*l.fuzz_albedo;
+        let back_ambient_received=back_ambient;
         var world_irradiance=frame.radiance.xyz;
         if (frame.environment.x>0.) { world_irradiance+=frame.environment.x*frame.environment.y*frame.environment_color.rgb*env_diffuse.SampleLevel(env_sampler,environment_uv(n,frame.environment_rotation),0.).rgb; }
 #ifdef VORK_PROBES
         world_irradiance=irradiance;
 #endif
+        // Light received through the back of a thin sheet crosses the coat once.
+        back_ambient*=l.throughput*l.crossing;
+        ambient=l.throughput*l.scale*(ambient-back_ambient_received)+back_ambient+coat_ambient;
 #ifdef VORK_PROBES
-        ambient=l.throughput*l.scale*ambient+coat_ambient+fuzz*world_irradiance;
+        ambient+=fuzz*world_irradiance;
 #else
-        ambient=l.throughput*l.scale*ambient+coat_ambient+select(world_diffuse,fuzz*world_irradiance,float3(0.));
+        ambient+=select(world_diffuse,fuzz*world_irradiance,float3(0.));
 #endif
-        back_ambient*=l.throughput*l.scale;
         reflection_environment=l.throughput*l.scale*reflection_environment+coat_ambient;
         // The packed roughness guides reconstruction and eligibility only.
         // Tracing samples both lobes; its guide must not switch at a dominant-lobe threshold.

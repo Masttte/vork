@@ -96,6 +96,15 @@ pub(crate) fn module(closure: &[Field]) -> String {
     s
 }
 
+/// A predicate rather than squared weights: tiny nonzero weights must not
+/// disappear through underflow, nor signed weights through cancellation.
+pub(super) fn scattering_effect(closure: &[Field]) -> String {
+    let weights=["base_weight","specular_weight","coat_weight","fuzz_weight","transmission_weight","subsurface_weight"];
+    let terms=weights.into_iter().filter(|name|closure.iter().any(|f|f.name==*name))
+        .map(|name|format!("c.{name}!=0.")).collect::<Vec<_>>();
+    if terms.is_empty() {"0.".into()} else {format!("({}) ? 1. : 0.",terms.join(" || "))}
+}
+
 pub(super) fn emission_effect(closure: &[Field]) -> String {
     if ["emission_color", "emission_luminance"].iter().all(|name| closure.iter().any(|f| f.name == *name)) {
         format!("(c.emission_color.x*c.emission_color.x+c.emission_color.y*c.emission_color.y+c.emission_color.z*c.emission_color.z)*c.emission_luminance*c.emission_luminance{}",
@@ -195,10 +204,10 @@ fn blend_module_with_capacity(closure: &[Field], capacity: u32, layer_effects: b
          return vork_lobe(s,lobe,u,weight,count); }}\n",
         overflow = u32::MAX,
         last = capacity - 1,
-        layer_field = if layer_effects {" internal float3 layers; internal float weighted_ior; internal float wavelength; internal float emission;"} else {""},
-        layer_init = if layer_effects {format!(" s.layers={}; s.weighted_ior=vork_closure_weighted_ior(c); s.wavelength=vork_closure_wavelength(c); s.emission=vork_closure_emission(c);",format!("float3({},{},{})",square("coat_weight", "c.coat_weight"),square("fuzz_weight", "c.fuzz_weight"), if closure.iter().any(|f| f.name == "specular_color") {"(c.specular_color.x-1.)*(c.specular_color.x-1.)+(c.specular_color.y-1.)*(c.specular_color.y-1.)+(c.specular_color.z-1.)*(c.specular_color.z-1.)"} else {"0."}))}else{String::new()},
-        layer_sum = if layer_effects {"a.layers=float3(a.layers.x+b.layers.x,a.layers.y+b.layers.y,a.layers.z+b.layers.z); a.weighted_ior+=b.weighted_ior; a.wavelength+=b.wavelength+vork_effect_wavelength(w); a.emission+=b.emission*w*w;"} else {""},
-        layer_reader = if layer_effects {format!("public float vork_closure_weighted_ior(__constref Closure c) {{return {weighted_ior};}}\npublic float vork_blend_weighted_ior(__constref Blend s) {{return s.weighted_ior;}}\npublic float vork_closure_emission(__constref Closure c) {{return {emission};}}\npublic float vork_blend_emission(__constref Blend s) {{return s.emission;}}\npublic float3 vork_blend_layers(__constref Blend s) {{ return s.layers; }}\npublic float {WAVELENGTH_EFFECT}(float v) {{ __target_switch {{case wgsl: __intrinsic_asm \"{WAVELENGTH_EFFECT}($0)\"; }} }}\npublic float vork_closure_wavelength(__constref Closure c) {{return {wavelength};}}\npublic float vork_blend_wavelength(__constref Blend s) {{return s.wavelength;}}", emission=emission_effect(closure), weighted_ior=square("specular_weight","c.specular_weight-1.")) } else {String::new()},
+        layer_field = if layer_effects {" internal float3 layers; internal float weighted_ior; internal float wavelength; internal float emission; internal float scattering;"} else {""},
+        layer_init = if layer_effects {format!(" s.layers={}; s.weighted_ior=vork_closure_weighted_ior(c); s.wavelength=vork_closure_wavelength(c); s.emission=vork_closure_emission(c); s.scattering=vork_closure_scattering(c);",format!("float3({},{},{})",square("coat_weight", "c.coat_weight"),square("fuzz_weight", "c.fuzz_weight"), if closure.iter().any(|f| f.name == "specular_color") {"(c.specular_color.x-1.)*(c.specular_color.x-1.)+(c.specular_color.y-1.)*(c.specular_color.y-1.)+(c.specular_color.z-1.)*(c.specular_color.z-1.)"} else {"0."}))}else{String::new()},
+        layer_sum = if layer_effects {"a.layers=float3(a.layers.x+b.layers.x,a.layers.y+b.layers.y,a.layers.z+b.layers.z); a.weighted_ior+=b.weighted_ior; a.wavelength+=b.wavelength+vork_effect_wavelength(w); a.emission+=b.emission*w*w; a.scattering+=b.scattering;"} else {""},
+        layer_reader = if layer_effects {format!("public float vork_closure_scattering(__constref Closure c) {{return {scattering};}}\npublic float vork_blend_scattering(__constref Blend s) {{return s.scattering;}}\npublic float vork_closure_weighted_ior(__constref Closure c) {{return {weighted_ior};}}\npublic float vork_blend_weighted_ior(__constref Blend s) {{return s.weighted_ior;}}\npublic float vork_closure_emission(__constref Closure c) {{return {emission};}}\npublic float vork_blend_emission(__constref Blend s) {{return s.emission;}}\npublic float3 vork_blend_layers(__constref Blend s) {{ return s.layers; }}\npublic float {WAVELENGTH_EFFECT}(float v) {{ __target_switch {{case wgsl: __intrinsic_asm \"{WAVELENGTH_EFFECT}($0)\"; }} }}\npublic float vork_closure_wavelength(__constref Closure c) {{return {wavelength};}}\npublic float vork_blend_wavelength(__constref Blend s) {{return s.wavelength;}}", scattering=scattering_effect(closure), emission=emission_effect(closure), weighted_ior=square("specular_weight","c.specular_weight-1.")) } else {String::new()},
         effect_fields = "internal float4 effects; internal float4 response;",
         effect_init = format!("s.effects=float4({},{},{},{}); s.response=float4({},{},{},{});", square("subsurface_weight", "c.subsurface_weight"), square("geometry_opacity", "1.-c.geometry_opacity"), square("transmission_weight", "c.transmission_weight"), spatial_subsurface(closure), format!("{}+{}",square("specular_roughness_anisotropy", "c.specular_roughness_anisotropy"),square("coat_roughness_anisotropy", "c.coat_weight*c.coat_roughness_anisotropy")), square("thin_film_weight", "c.thin_film_weight"), dispersion, square("coat_roughness_anisotropy", "c.coat_weight*c.coat_roughness_anisotropy")),
         effect_sum = "a.effects=float4(a.effects.x+b.effects.x,a.effects.y+b.effects.y,a.effects.z+b.effects.z,a.effects.w+b.effects.w); a.response=float4(a.response.x+b.response.x,a.response.y+b.response.y,a.response.z+b.response.z,a.response.w+b.response.w);",

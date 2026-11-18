@@ -843,6 +843,16 @@ fn medium_work_proof_refuses_unknown_loops_even_with_bounded_coefficients() {
 
 #[test]
 #[ignore = "requires pinned Slang toolchain"]
+fn authored_grid_sample_cannot_bypass_medium_work_proof() {
+    let source="import std.grid; float grid_sample(float x) {float v=0.;while(v<x){v+=1.;}return clamp(v,0.,1.);} struct Inputs {}; MediumCoefficients medium(MediumContext c,Inputs i){MediumCoefficients m={};m.absorption=float3(grid_sample(c.position.x));return m;}";
+    let compiler=Compiler::discover();let abi=abi();
+    let program=compiler.compile_medium(&abi,source,Path::new("authored-grid-sample.slang"),"authoredgridsample").unwrap();
+    let error=program.bounded_work_for_inputs(&abi,&[]).unwrap_err();
+    assert!(format!("{error:#}").contains("loop count is not provably finite"),"{error:#}");
+}
+
+#[test]
+#[ignore = "requires pinned Slang toolchain"]
 fn exponential_world_proof_accepts_world_and_identity_local_coordinates() {
     let compiler=Compiler::discover();let abi=abi();
     for coordinate in ["c.position.y","c.world_position.y"] {

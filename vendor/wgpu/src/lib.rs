@@ -116,6 +116,8 @@ mod cmp;
 mod dispatch;
 mod macros;
 pub mod util;
+#[cfg(std)]
+pub mod optional_allocations;
 
 //
 //

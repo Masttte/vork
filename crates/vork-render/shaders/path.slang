@@ -184,7 +184,7 @@ DielectricHit trace<V:IVariant,P:IProgram>(float3 origin, float3 direction, floa
         if(!medium_work_step(medium_work)) {break;}
 #endif
         let owner=instance_has_solid_owner<PathGeometry>(PathGeometry(path_words,path_hit_buffers),candidate.instance_index,path_settings.boundaries.xw);
-        let accepted=candidate_accepts<P,PathGeometry>(PathGeometry(path_words,path_hit_buffers),path_words,candidate,query.CandidateTriangleFrontFace(),query.CandidateWorldToObject3x4(),direction,float2(2./float(width),2./float(height)),owner);
+        let accepted=candidate_accepts<P,PathGeometry,V>(PathGeometry(path_words,path_hit_buffers),path_words,candidate,query.CandidateTriangleFrontFace(),query.CandidateWorldToObject3x4(),direction,float2(2./float(width),2./float(height)),owner);
         if (accepted) {query.CommitNonOpaqueTriangleHit();}
     }
     DielectricHit h={};h.t=-1.;
@@ -292,7 +292,7 @@ void medium_component(inout PathMediumInterval interval,uint slot,uint id,uint o
     let sigma=m.absorption+m.scattering;let constant=path_medium_homogeneous(id);
     let bound=constant ? medium_sample_majorant(m.absorption,m.scattering) : asfloat(material_words[context.input_base-1u]);
     interval.varying|=!constant;
-    if(!isfinite(bound) || bound<0. || !all(isfinite(sigma)) || !all(isfinite(m.emission)) || any(m.absorption<float3(0.)) || any(m.scattering<float3(0.))) {path_boundary_error(REG_PATH_MEDIUM_MAJORANT,0u);interval.valid=false;}
+    if(!isfinite(bound) || bound<0. || !all(isfinite(sigma)) || !all(isfinite(m.emission)) || any(m.absorption<float3(0.)) || any(m.scattering<float3(0.))) {path_boundary_error(REG_PATH_MEDIUM_MAJORANT,medium_range_payload(m.absorption,m.scattering,m.emission,bound>=0. && (!isfinite(bound) || !all(isfinite(sigma)))));interval.valid=false;}
     else if(any(sigma>float3(bound))) {path_boundary_error(REG_PATH_MEDIUM_MAJORANT,asuint(max(sigma.x,max(sigma.y,sigma.z))));interval.valid=false;}
 #endif
 }
@@ -334,7 +334,7 @@ PathMediumInterval medium_at(PathMediumInterval interval,float3 position VORK_WO
             interval.components[i]=m;continue;
         }
         let bound=asfloat(material_words[context.input_base-1u]);let sigma=m.absorption+m.scattering;
-        if(!all(isfinite(sigma)) || !all(isfinite(m.emission)) || any(m.absorption<float3(0.)) || any(m.scattering<float3(0.))) {path_boundary_error(REG_PATH_MEDIUM_MAJORANT,0u);interval.valid=false;}
+        if(!all(isfinite(sigma)) || !all(isfinite(m.emission)) || any(m.absorption<float3(0.)) || any(m.scattering<float3(0.))) {path_boundary_error(REG_PATH_MEDIUM_MAJORANT,medium_range_payload(m.absorption,m.scattering,m.emission,!all(isfinite(sigma))));interval.valid=false;}
         else if(any(sigma>float3(bound))) {path_boundary_error(REG_PATH_MEDIUM_MAJORANT,asuint(max(sigma.x,max(sigma.y,sigma.z))));interval.valid=false;}
     }
     medium_sum(interval);return interval;
@@ -401,7 +401,10 @@ PathMediumInterval medium_interval(float3 origin,float3 direction,float after,fl
     }
     medium_sum(result,true);
 #if VORK_PATH_HETEROGENEOUS
-    if(!isfinite(result.majorant)) {path_boundary_error(REG_PATH_MEDIUM_MAJORANT,0u);result.valid=false;}
+    // Finite bounds of overlapping components can sum past the float range:
+    // report the sum itself, which the host reads as the scene's numeric range
+    // and not as a broken certificate.
+    if(!isfinite(result.majorant)) {path_boundary_error(REG_PATH_MEDIUM_MAJORANT,asuint(result.majorant));result.valid=false;}
 #endif
     return result;
 }
@@ -463,7 +466,32 @@ PathPhaseDirection phase_direction(PathMediumInterval medium,float3 incident,flo
 }
 // Return a real scattering vertex, or finish the complete segment. True null
 // boundaries never spend a surface/volume bounce or an alpha crossing budget.
-bool advance_medium(float3 origin,float3 direction,float limit,PathBoundary optical,bool camera_ray,float optical_length,inout float3 throughput,inout float3 radiance,inout uint rng,out float distance,out PathMediumInterval vertex VORK_WORK_PARAMETER) {
+// The payload of a refused medium component. Finite, nonnegative coefficients
+// whose extinction adds past the float range are the scene's numeric range:
+// report infinity, as an overflowing sum of components does. A coefficient that
+// is itself invalid reports zero. The error record keeps the least payload, so
+// an overflow must never report zero.
+uint medium_range_payload(float3 absorption,float3 scattering,float3 emission,bool overflow) {
+    let physical=all(isfinite(absorption)) && all(isfinite(scattering)) && all(isfinite(emission))
+        && !any(absorption<float3(0.)) && !any(scattering<float3(0.));
+    return physical && overflow ? 0x7f800000u : 0u;
+}
+// Opaque installed views do not estimate medium coverage. Remove its live
+// state and arithmetic before compilation, including the null-loop exception.
+#ifdef VORK_OPAQUE_MEDIA_VIEWS
+#define VORK_COVERAGE_PARAMETER
+#define VORK_COVERAGE_ARGUMENT
+#define VORK_COVERAGE_ATTENUATE(weight)
+#else
+#define VORK_COVERAGE_PARAMETER , inout float3 transmitted
+#define VORK_COVERAGE_ARGUMENT , camera_transmittance
+#define VORK_COVERAGE_ATTENUATE(weight) if(camera_ray && frame.flags.z>0.) transmitted*=weight;
+#endif
+// `transmitted` takes every attenuation the media apply to `throughput` and
+// nothing else: what they alone passed along this ray. A camera ray is
+// integrated to the end of its media or a real collision whatever radiance it
+// carries, so its coverage does not depend on the throughput it arrived with.
+bool advance_medium(float3 origin,float3 direction,float limit,PathBoundary optical,bool camera_ray,float optical_length,inout float3 throughput VORK_COVERAGE_PARAMETER,inout float3 radiance,inout uint rng,out float distance,out PathMediumInterval vertex VORK_WORK_PARAMETER) {
     var cursor=0.;vertex={};distance=limit;
     while(cursor<limit) {
         var medium=medium_interval(origin,direction,cursor,limit,camera_ray VORK_WORK_ARGUMENT);
@@ -475,6 +503,8 @@ bool advance_medium(float3 origin,float3 direction,float limit,PathBoundary opti
             float3 a,b,g;path_world_exponential(a,b,g);
             let tau=medium_exponential_tau(path_spectrum(a),dot(g,origin+direction*cursor),dot(g,direction),length,medium.end==REG_FP32_MAX);
             throughput*=exp(-tau-medium_finite_extinction(medium)*length)*boundary_attenuation(optical,length);
+            VORK_COVERAGE_ATTENUATE(exp(-tau-medium_finite_extinction(medium)*length)*boundary_attenuation(optical,length))
+
             cursor=medium.end;continue;
         }
 #endif
@@ -488,22 +518,45 @@ bool advance_medium(float3 origin,float3 direction,float limit,PathBoundary opti
                 let sample=length*path_random(rng);let point=medium_at(medium,origin+direction*(cursor+sample) VORK_WORK_ARGUMENT);
                 if(!point.valid) {throughput=float3(0.);return false;}
                 radiance+=throughput*point.emission*boundary_attenuation(optical,sample)*length*path_arrival(optical_length+(cursor+sample)*boundary_ior(optical));
-                throughput*=boundary_attenuation(optical,length);cursor=medium.end;continue;
+                throughput*=boundary_attenuation(optical,length);
+                VORK_COVERAGE_ATTENUATE(boundary_attenuation(optical,length))
+                cursor=medium.end;continue;
             }
+#ifdef VORK_MEDIUM_EMISSION
+            if(medium.end!=REG_FP32_MAX) {
+                // Source sampling must not vanish with extinction. One expected
+                // proposal per normal-length interval bounds thin-emitter variance;
+                // normal-float limits keep the reciprocal representable.
+                let minimum_normal=1.17549435e-38;
+                let source_rate=max(minimum_normal,1./max(length,minimum_normal));
+                medium.majorant=max(medium.majorant,source_rate);
+            }
+#endif
             while(cursor<medium.end) {
                 let candidate=medium_interval_candidate(medium,origin,direction,cursor,rng VORK_WORK_ARGUMENT);
-                let stop=min(candidate,medium.end);throughput*=boundary_attenuation(optical,stop-cursor);cursor=stop;
+                let stop=min(candidate,medium.end);throughput*=boundary_attenuation(optical,stop-cursor);
+                VORK_COVERAGE_ATTENUATE(boundary_attenuation(optical,stop-cursor))
+                cursor=stop;
                 if(candidate>=medium.end) {break;}
                 let point=medium_at(medium,origin+direction*candidate VORK_WORK_ARGUMENT);
                 if(!point.valid) {throughput=float3(0.);return false;}
                 let rate=medium_interval_rate(medium,origin+direction*candidate);
+                if(!isfinite(rate) || rate<=0.) {path_boundary_error(REG_PATH_MEDIUM_MAJORANT,asuint(rate));throughput=float3(0.);return false;}
                 radiance+=throughput*point.emission/rate*path_arrival(optical_length+candidate*boundary_ior(optical));
                 let peak=max(point.extinction.x,max(point.extinction.y,point.extinction.z));
                 let extinction=peak>0. ? peak*((point.extinction.x/peak+point.extinction.y/peak+point.extinction.z/peak)/3.) : 0.;
                 let real=extinction/rate;
                 if(path_random(rng)<real) {throughput/=extinction;distance=candidate;vertex=point;return true;}
                 throughput*=(float3(1.)-point.extinction/rate)/(1.-real);
+                VORK_COVERAGE_ATTENUATE((float3(1.)-point.extinction/rate)/(1.-real))
+
+                // A ray that carries no radiance has nothing more to trace, but a
+                // camera ray's coverage is still being estimated: finish its media.
+#ifndef VORK_OPAQUE_MEDIA_VIEWS
+                if(!(camera_ray && frame.flags.z>0.) && !any(throughput>float3(0.))) {return false;}
+#else
                 if(!any(throughput>float3(0.))) {return false;}
+#endif
             }
             continue;
         }
@@ -538,8 +591,13 @@ bool advance_medium(float3 origin,float3 direction,float limit,PathBoundary opti
             let flight=medium_free_flight(medium.extinction,length,float2(ux,uy),infinite);
             if(flight.event && !isfinite(flight.distance)) {path_sample_nonfinite=true;throughput=float3(0.);return false;}
             throughput*=flight.weight*boundary_attenuation(optical,flight.distance);
+            VORK_COVERAGE_ATTENUATE(flight.weight*boundary_attenuation(optical,flight.distance))
+
             if(flight.event) {distance=cursor+flight.distance;vertex=medium;return true;}
-        }else{throughput*=attenuation*boundary_attenuation(optical,length);}
+        }else{
+            throughput*=attenuation*boundary_attenuation(optical,length);
+            VORK_COVERAGE_ATTENUATE(attenuation*boundary_attenuation(optical,length))
+        }
         cursor=medium.end;
     }
     return false;
@@ -680,6 +738,14 @@ HitSurface path_hit<V:IVariant,P:IProgram>(DielectricHit hit, float3 direction, 
     if (P.lit && P.lit_material(h.v)) {h.s=lit_surface<V,PathShadows<V,P>,P>(h.v,h.entering,h.k,h.s,hit_site(h.v,h.k,h.face,uint2(seed,pixel_hash(seed)),uint(frame.temporal.x),true));}
     return h;
 }
+// A final-output proof: never apply it to the surface that feeds a lit stage.
+Closure final_path_closure<V:IVariant>(Closure c) {
+    if (!V.has_scattering) {
+        c.base_weight=0.;c.specular_weight=0.;c.coat_weight=0.;
+        c.fuzz_weight=0.;c.transmission_weight=0.;c.subsurface_weight=0.;
+    }
+    return c;
+}
 // The scattering vertex's closure; `weight` scales its radiance (Cycles' closure
 // pick). path_hit is a compile boundary, so the installed proofs are stated here,
 // on the transport side of it: every lobe, fibre and boundary branch below
@@ -688,6 +754,7 @@ HitSurface path_hit<V:IVariant,P:IProgram>(DielectricHit hit, float3 direction, 
 Closure path_closure<V:IVariant,P:IProgram>(DielectricHit hit, float3 direction, float u, uint seed, out float3 geometric, out bool entering, out float weight, out HitSurface shading) {
     var h=path_hit<V,P>(hit,direction,u,seed);
     h.s=installed_surface<V>(h.s);
+    h.s.closure=final_path_closure<V>(h.s.closure);
     shading=h;geometric=h.face;entering=h.entering;weight=h.s.weight;
     var c=h.s.closure;
 #ifdef VORK_LIGHT_PATHS
@@ -719,7 +786,7 @@ float3 path_origin(HitSurface h,float3 world,float3 error,float3 direction) {
 // Position-dependent analytic source proposal; both direct strategies divide
 // by this same complete mixture mass at the scattering vertex.
 uint pick_light(float2 u, float3 world, out float probability) {
-    let count=uint(frame_light_count(frame));
+    let count=path_light_nodes[0].links.w;
     let pick=light_tree_pick(path_light_nodes,count==0u ? 0u : 2u*count-1u,world,u);
     probability=pick.probability;
     return pick.identity;
@@ -782,7 +849,7 @@ float3 analytic_mis_response(Closure c, float3 view, float3 direction, float3 ge
     return value;
 }
 float3 next_event<V:IVariant,P:IProgram>(HitSurface shading, Closure c, float3 view, float3 world, float3 error, float3 geometric, uint groups, uint transparent, DielectricInterface media, float subsurface_thickness, TransportPreparation prepared, BsdfSample sample, PathSampler sampler, float optical_length, inout uint rng VORK_WORK_PARAMETER) {
-    let count=uint(frame_light_count(frame));if (count==0u) {return float3(0.);}
+    let count=path_light_nodes[0].links.w;if (count==0u) {return float3(0.);}
     let u=path_light(sampler);
     float probability;let i=pick_light(u.zw,world,probability);if (probability<=0.) {return float3(0.);}
     let contribution=lights[i].shadow_offsets[REG_LIGHT_CONTRIBUTION_WORD];
@@ -832,7 +899,7 @@ float3 next_event<V:IVariant,P:IProgram>(HitSurface shading, Closure c, float3 v
         let chord=subsurface_exit(path_scene,shading.v.object,world,axis);
         if (thickness>=0. && chord>=0. && chord<distance) {
             let l=layers<V>(c,view,prepared.coat_albedo);
-            response+=subsurface_transmission(original,geometric,view,axis,thickness)*max(-dot(geometric,axis),0.)/REG_PI*l.throughput*l.scale;
+            response+=subsurface_transmission(original,geometric,view,axis,thickness)*max(-dot(geometric,axis),0.)/REG_PI*l.throughput*l.crossing;
             shadow_world=world+axis*chord;shadow_normal=axis;through_boundary=true;
         }
     }
@@ -952,6 +1019,16 @@ float3 mesh_connection<V:IVariant,P:IProgram>(float3 origin, float3 direction, f
     for (;;) {
         let hit=trace<V,P>(origin,direction,remaining,event VORK_GAUSSIAN_SOURCE_ARGUMENT(launch_point) VORK_WORK_ARGUMENT);
         if (hit.t<0.) {return transmittance;}
+#ifdef VORK_NO_GAUSSIANS
+        // A proven opaque builtin blocker with no straight-through response
+        // needs no surface. Keep the same traversal and consume no new RNG;
+        // lobes/lit and spatial or Gaussian coverage retain full evaluation.
+        if(!V.has_null_connection && !P.lobes && !P.lit) {
+            let r=material_record(hit.object);
+            if(material_records[r].tag.x==0u && (material_records[r].tag.z&REG_FLAG_VERTEX_ALPHA)==0u
+                && !material_alpha_bound<V>(r) && material_constant_alpha(r)>=1.) return float3(0.);
+        }
+#endif
         float3 face;bool entering;float weight;HitSurface shading;
         let c=path_closure<V,P>(hit,direction,P.lobes ? path_random(rng) : 0.,P.lit ? pixel_hash(rng) : 0u,face,entering,weight,shading);
 #ifndef VORK_NO_GAUSSIANS
@@ -1056,9 +1133,21 @@ float3 mesh_next_event<V:IVariant,P:IProgram>(HitSurface receiver, Closure c, fl
     if (distance<=0.) {return float3(0.);}
     let axis=delta/distance;let source_face=geometry.face;
     let pdf=mesh_pdf<V>(hit,world,point,source_face);if (pdf<=0.) {return float3(0.);}
+#ifdef VORK_CONSTANT_MESH_EMISSION
+    // The installed source-domain proof excludes programs, varying coverage,
+    // glTF unlit transfer and coat/fuzz attenuation. Values stay frame-local.
+    let entering=dot(geometry.face,axis)<0.;
+    if(!material_covers_side<V>(hit.object,entering)) {return float3(0.);}
+    let record=material_record(hit.object);
+    let emission=material_constant_color(record,MATERIAL_EMISSION_COLOR_WORD)*material_value(record,MATERIAL_EMISSION_LUMINANCE_WORD);
+    let emitted=path_spectrum(emission,true)*material_constant_alpha(record);
+    let offset_face=entering ? geometry.face : -geometry.face;
+#else
     let source=dielectric_surface<V,P,PathGeometry>(PathGeometry(path_words,path_hit_buffers),hit,axis,float2(0.),Lobe(0u,0.));
     if(source.s.discarded) {return float3(0.);}
     let emitted=path_spectrum(emitter_mesh_radiance<V,P>(source),true)*source.s.closure.geometry_opacity;
+    let offset_face=source.face;
+#endif
     if (max(emitted.x,max(emitted.y,emitted.z))<=0.) {return float3(0.);}
     let visible=objects[hit.object].metadata.y;
     var response=float3(0.);
@@ -1067,7 +1156,7 @@ float3 mesh_next_event<V:IVariant,P:IProgram>(HitSurface receiver, Closure c, fl
         if ((visible&event)==0u || !path_event_hemisphere(c,event,axis,geometric,prepared.smooth_normal)) {continue;}
         let f=transport_eval_mask(c,view,axis,event,prepared);if (max(f.x,max(f.y,f.z))<=0.) {continue;}
         let bsdf_pdf=(continuation&event)!=0u ? transport_pdf_mask(c,view,axis,event,prepared) : 0.;
-        let start=path_origin(receiver,world,error,axis);let end=origin_offset(hit.object,point,source.face,-axis);
+        let start=path_origin(receiver,world,error,axis);let end=origin_offset(hit.object,point,offset_face,-axis);
         let connection=end-start;let length_to_source=length(connection);
         if(length_to_source<=0.) {continue;}
         response+=f*mis_power(pdf,bsdf_pdf)*mesh_connection<V,P>(start,connection/length_to_source,length_to_source,event,transparent,dot(prepared.smooth_normal,axis)<0. ? media.transmitted : media.incident,rng VORK_GAUSSIAN_SOURCE_ARGUMENT((uint2(receiver.v.object,receiver.v.primitive))) VORK_WORK_ARGUMENT);
@@ -1087,7 +1176,7 @@ float3 phase_connection<V:IVariant,P:IProgram>(float3 world,float3 direction,flo
     return value*boundary_attenuation(optical,distance);
 }
 float3 phase_analytic<V:IVariant,P:IProgram>(PathMediumInterval medium,PathPhaseDirection phase,float3 incident,float3 world,uint groups,uint transparent,PathBoundary optical,PathSampler sampler,float optical_length, inout uint rng VORK_WORK_PARAMETER) {
-    if(uint(frame_light_count(frame))==0u) {return float3(0.);}
+    if(path_light_nodes[0].links.w==0u) {return float3(0.);}
     let u=path_light(sampler);
     float probability;let i=pick_light(u.zw,world,probability);if(probability<=0.) {return float3(0.);}
     let l=light_values<V>(i);let contribution=lights[i].shadow_offsets[REG_LIGHT_CONTRIBUTION_WORD];
@@ -1238,6 +1327,12 @@ float3 integrate<let spatial_subsurface:bool,V:IVariant,P:IProgram,let N:uint>(f
     var diffuse=0u;var glossy=0u;var transmission=0u;var transparent=0u;alpha=1.;
 #ifdef VORK_PATH_MEDIA
     var volume=0u;var previous_environment_weight=float3(1.);
+    // What the media alone passed along the camera ray, accumulated by the
+    // medium integration itself. Authored propagation gain multiplies the
+    // throughput too and is not coverage; after a scattering event this is unused.
+#ifndef VORK_OPAQUE_MEDIA_VIEWS
+    var camera_transmittance=float3(1.);
+#endif
 #endif
     var sampler=camera_sampler;
     var pending_segment=0.;var preserve_segment=false;
@@ -1282,7 +1377,7 @@ float3 integrate<let spatial_subsurface:bool,V:IVariant,P:IProgram,let N:uint>(f
             medium_hit=false;
             if(visibility_minimum<segment_limit) {
                 let visible_origin=origin+direction*visibility_minimum;
-                medium_hit=advance_medium(visible_origin,direction,(hit.t<0. ? segment_limit : hit.t)-visibility_minimum,occupancy.current(),ray_event==REG_RAY_CAMERA,optical_length+dot(visible_origin-physical_origin,direction)*occupancy.ior(),throughput,radiance,rng,distance,medium VORK_WORK_ARGUMENT);
+                medium_hit=advance_medium(visible_origin,direction,(hit.t<0. ? segment_limit : hit.t)-visibility_minimum,occupancy.current(),ray_event==REG_RAY_CAMERA,optical_length+dot(visible_origin-physical_origin,direction)*occupancy.ior(),throughput VORK_COVERAGE_ARGUMENT,radiance,rng,distance,medium VORK_WORK_ARGUMENT);
                 distance+=visibility_minimum;
             }
             if(medium_hit) break;
@@ -1349,7 +1444,18 @@ float3 integrate<let spatial_subsurface:bool,V:IVariant,P:IProgram,let N:uint>(f
 #endif
         if (hit.t<0.) {
             // Camera background eligibility follows ray permissions, not the MIS bounce.
-            if (ray_event==REG_RAY_CAMERA && frame.flags.z>0.) {alpha=0.;}
+            if (ray_event==REG_RAY_CAMERA && frame.flags.z>0.) {
+                alpha=0.;
+#if defined(VORK_PATH_MEDIA) && !defined(VORK_OPAQUE_MEDIA_VIEWS)
+                // A camera ray reaches the transparent background through its
+                // media. What they withheld is coverage. A deterministic
+                // attenuation reports its mean here. A sampled free flight that
+                // escapes carries its survival weight, so this is a signed
+                // estimate whose mean, with the covered rays that scattered,
+                // is the coverage; the resolve averages it before clamping.
+                alpha=1.-dot(camera_transmittance,float3(1./3.));
+#endif
+            }
             let sky=select(ray_event==REG_RAY_CAMERA && frame.flags.z>0.,float3(0.),select(ray_event==REG_RAY_CAMERA && frame.environment.w==0.,path_spectrum(frame.background.rgb,true),path_environment(direction,ray_event,groups,camera_origin)));
 #ifdef VORK_PROPAGATION
             let environment_mis=previous_pdf>0. ? mis_power(previous_pdf,1./(4.*REG_PI)) : 1.;
@@ -1368,7 +1474,8 @@ float3 integrate<let spatial_subsurface:bool,V:IVariant,P:IProgram,let N:uint>(f
         var u=0.;if (P.lobes) {u=scatter.w;}
         var seed=0u;if (P.lit) {seed=pixel_hash(rng+sampler.vertex);}
         HitSurface shading;
-        var c=path_closure<V,P>(hit,direction,u,seed,geometric,entering,weight,shading);world=shading.v.world;
+        var c=path_closure<V,P>(hit,direction,u,seed,geometric,entering,weight,shading);
+        c=final_path_closure<V>(c);world=shading.v.world;
 #ifndef VORK_NO_GAUSSIANS
         launch_point=uint2(shading.v.object,shading.v.primitive);
 #endif
@@ -1451,13 +1558,13 @@ float3 integrate<let spatial_subsurface:bool,V:IVariant,P:IProgram,let N:uint>(f
                 // first-hit albedo is the integral of the Chiang scattering
                 // orders, already provided by the uniform-world evaluator.
                 let base=guide_layers.base;
-                // Dielectric albedo includes transmitted energy. Preserve coat
-                // absorption through the existing layer throughput and scale.
+                // Dielectric albedo includes transmitted energy, which crosses
+                // the coat once.
                 var transmitted=float3(0.);
                 if(base.transmission_weight>0. && base.base_metalness<1.) {
                     let moments=brdf_moments(float2(max(dot(base.geometry_normal,-direction),DENOISE_GUIDE_COSINE_MIN),specular_roughness(base.specular_roughness)));
                     let reflected=all(guide_specular.directional_albedo>=float3(0.)) ? guide_specular.directional_albedo : specular_reflectance(guide_specular,moments,internal_reflection_quadrature<V>(base));
-                    transmitted=guide_layers.throughput*guide_layers.scale*(float3(1.)-reflected)*base.transmission_weight*(1.-base.base_metalness);
+                    transmitted=guide_layers.throughput*guide_layers.crossing*(float3(1.)-reflected)*base.transmission_weight*(1.-base.base_metalness);
                 }
                 let albedo=shading.s.is_hair ? strand_world(shading.s.hair0,shading.s.hair1,shading.s.strand,shading.s.geometric,-direction,float3(1.)) : response.diffuse+response.reflected+transmitted;
                 guide_albedo=float4(clamp(albedo*weight,float3(0.),float3(1.)),1.);

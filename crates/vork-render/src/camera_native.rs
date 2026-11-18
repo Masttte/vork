@@ -23,43 +23,6 @@ pub fn defines(rays:bool)->Vec<String> {
     if rays {defines.extend(["VORK_RAY_BINDINGS".into(),"VORK_RAY_REFRACTION".into()]);}
     defines
 }
-/// Metal evaluation kernels compile with every function inlined. Left to its
-/// own heuristics, the Metal compiler keeps calls once a helper has more than
-/// one call site, and on M2 Ultra such a call in a transmissive evaluation
-/// aborted the bin with Impacting Interactivity or never finished, at any
-/// resolution, whether or not the code on that call path ran. The Metal
-/// mechanism is unproven: forcing inlining flips it, and API validation reports
-/// nothing. Slang emits MSL source, so the contract travels as source directives
-/// around its functions, leaving the kernel entry itself out.
-pub fn inline_metal_functions(code:&[u8])->Vec<u8> {
-    const OPEN:&[u8]=b"#pragma clang attribute push(__attribute__((always_inline)),apply_to=function)\n";
-    const CLOSE:&[u8]=b"#pragma clang attribute pop\n";
-    const NAMESPACE:&[u8]=b"using namespace metal;";
-    const KERNEL:&[u8]=b"[[kernel]]";
-    let find=|needle:&[u8]|code.windows(needle.len()).position(|window|window==needle);
-    let start=find(NAMESPACE).expect("Slang MSL declares the metal namespace")+NAMESPACE.len();
-    // Slang writes native text files: Windows uses CRLF, Unix uses LF.
-    // Insert after the complete line without changing any emitted bytes.
-    let start=start+code[start..].iter().position(|&byte|byte==b'\n').expect("Slang MSL namespace ends with a newline")+1;
-    let end=find(KERNEL).expect("Slang MSL declares a kernel");
-    assert!(start<=end,"Slang MSL declares its kernel before the metal namespace");
-    [&code[..start],OPEN,&code[start..end],CLOSE,&code[end..]].concat()
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn metal_inlining_preserves_lf_and_crlf_source() {
-        for newline in ["\n", "\r\n"] {
-            let prefix=format!("#include <metal_stdlib>{newline}using namespace metal;{newline}");
-            let helper=format!("float helper() {{ return 1.; }}{newline}");
-            let kernel=format!("[[kernel]] void evaluate() {{ helper(); }}{newline}");
-            let source=format!("{prefix}{helper}{kernel}");
-            let expected=format!("{prefix}#pragma clang attribute push(__attribute__((always_inline)),apply_to=function)\n{helper}#pragma clang attribute pop\n{kernel}");
-            assert_eq!(super::inline_metal_functions(source.as_bytes()),expected.as_bytes());
-        }
-    }
-}
 #[allow(dead_code)] // Used by build_slang.rs.
 pub fn config_source()->String {
     let binding=CONFIG_BINDING;

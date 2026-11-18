@@ -254,6 +254,8 @@ pub(crate) struct VertexLayout {
     pub(crate) uv: [u8; 2],
     pub(crate) color: bool,
     pub(crate) custom: u8,
+    /// Immutable streams can omit trailing absent scene-wide attribute slots.
+    pub(crate) stored_custom: u8,
 }
 impl VertexLayout {
     /// Fetch layouts emitted by packing, for setup's built-in driver registry.
@@ -264,7 +266,7 @@ impl VertexLayout {
             if deform && !tangent { continue; }
             for uv in [[absent,absent], [0,absent], [absent,0], [0,0], [0,1]] {
                 for color in [false,true] {
-                    layouts.push(Self { points:false, deform, tangent, uv, color, custom });
+                    layouts.push(Self { points:false, deform, tangent, uv, color, custom, stored_custom:custom });
                 }
             }
         }}
@@ -278,6 +280,7 @@ impl VertexLayout {
             uv: [constants::VERTEX_DEFAULT_UV; 2],
             color: vertices.iter().any(|v| v.COLOR_0 != [1.; 4]),
             custom: 0,
+            stored_custom: 0,
         };
         let mut unique = 0;
         for slot in 0..2 {
@@ -322,7 +325,7 @@ impl VertexLayout {
         (self.surface_bytes()
             + self.uv_count() * 8
             + u64::from(self.color) * 16
-            + u64::from(self.custom) * 16)
+            + u64::from(self.stored_custom) * 16)
             .max(4)
     }
     pub(crate) fn pack(
@@ -354,7 +357,7 @@ impl VertexLayout {
             if self.color {
                 attributes.extend_from_slice(bytemuck::bytes_of(&v.COLOR_0));
             }
-            for name in names {
+            for name in names.iter().take(usize::from(self.stored_custom)) {
                 let value = custom.get(name).map_or([0.; 4], |data| data[index]);
                 attributes.extend_from_slice(bytemuck::bytes_of(&value));
             }
@@ -408,8 +411,13 @@ impl VertexLayout {
             out[3].push(a(4, 16, F::Float32x4));
         }
         for slot in 0..self.custom {
+            let location = if slot < 8 {7+u32::from(slot)} else {vork_slang::registry::VISIBILITY_LENS_LOCATION+1+u32::from(slot)-8};
+            if slot >= self.stored_custom {
+                out[3].push(a(location, 0, F::Float32x4));
+                continue;
+            }
             out[2].push(a(
-                if slot < 8 {7+u32::from(slot)} else {vork_slang::registry::VISIBILITY_LENS_LOCATION+1+u32::from(slot)-8},
+                location,
                 self.surface_bytes()
                     + self.uv_count() * 8
                     + u64::from(self.color) * 16
@@ -481,6 +489,35 @@ impl NativeDeform {
 #[cfg(test)]
 mod native_deformation_tests {
     use super::*;
+    #[test]
+    fn trailing_absent_attributes_fetch_as_zero_without_vertex_storage() {
+        let vertex = Vertex { POSITION:[1.,2.,3.], NORMAL:[0.,1.,0.],
+            TEXCOORD_0:[0.;2], TEXCOORD_1:[0.;2], pad:[0.;2],
+            COLOR_0:[1.;4], TANGENT:[0.;4] };
+        let names = vec!["present".into(), "absent".into(), "other mesh".into()];
+        let values = std::collections::BTreeMap::from([("present".into(),vec![[0.1,0.2,0.3,0.4];2])]);
+        let mut layout = VertexLayout::for_vertices(&[vertex;2],false);
+        layout.custom=3;layout.stored_custom=1;
+        let (_, bytes)=layout.pack(&[vertex;2],&names,&values);
+        assert_eq!(bytes.len(),2*(12+16));
+        let fetch=layout.attributes();
+        for slot in 0..3 {
+            let source=fetch.iter().enumerate().find_map(|(binding,fields)| {
+                fields.iter().find(|field|field.shader_location==7+slot).map(|field|(binding,field.offset))
+            }).unwrap();
+            if slot==0 {
+                assert_eq!(source,(2,12));
+                for vertex in 0..2 {
+                    let offset=vertex*layout.attribute_stride() as usize+source.1 as usize;
+                    assert_eq!(&bytes[offset..offset+16],bytemuck::bytes_of(&[0.1f32,0.2,0.3,0.4]));
+                }
+            } else {
+                assert_eq!(source,(3,0)); // Four zero words in the shared constant stream.
+            }
+        }
+        // The ray hit reader uses the same fixed slot ordinal and stride bound.
+        assert!(12+16*2 > layout.attribute_stride());
+    }
     #[test]
     fn indexing_preserves_corners_seams_and_primitive_order() {
         let vertex = Vertex { POSITION:[1.,2.,3.], NORMAL:[0.,1.,0.],

@@ -2,8 +2,10 @@
 //! switches, vertex-buffer binds, passes, buffer / texture uploads, and GPU time from timestamp queries written at
 //! the start and end of every render / compute pass the engine records.
 //!
-//! Off unless a bench calls [`enable`]; every hook is then a single relaxed atomic load. Process-global (the bench
-//! drives one device), so no engine API grows a parameter for it.
+//! Bench counters are enabled by [`enable`]. Canvas diagnostic queries use a thread-local frame stream
+//! ([`begin_frame`], [`end_frame`]) whose storage follows the caller's submission ring. Query blocks grow with
+//! pass count and are reused; the caller maps them at ordinary frame completion, adding no GPU wait.
+//! Disabled hooks read flags only; they create no queries and read no clocks.
 //!
 //! Timestamps need `wgpu::Features::TIMESTAMP_QUERY`, which [`crate::device::GpuContext::new`] requests only when
 //! `MODA_GPU_TIMESTAMPS=1` (or `MODA_RENDER_PROFILE=gpu`) and the adapter has it (Metal on Apple silicon:
@@ -12,7 +14,7 @@
 //! An export profiled with `MODA_RENDER_PROFILE=gpu` enables it too, and each pair carries the [`crate::prof`] span
 //! open when its pass was recorded, so [`resolve_into_prof`] adds each pass's GPU time to that stage.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -52,7 +54,7 @@ pub struct FrameCounters {
 
 #[inline]
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    !PAUSED.with(Cell::get) && (ENABLED.load(Ordering::Relaxed) || ASYNC_ENABLED.with(Cell::get))
 }
 
 #[inline]
@@ -139,8 +141,12 @@ pub fn enable(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
     if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
         return false;
     }
+    TIMER.with(|t| *t.borrow_mut() = Some(new_timer(device, queue.get_timestamp_period())));
+    true
+}
+fn new_timer(device: &wgpu::Device, period_ns: f32) -> Timer {
     let size = u64::from(MAX_PAIRS) * 2 * 8;
-    let timer = Timer {
+    Timer {
         queries: device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("gpu_profile timestamps"),
             ty: wgpu::QueryType::Timestamp,
@@ -158,13 +164,11 @@ pub fn enable(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }),
-        period_ns: queue.get_timestamp_period(),
+        period_ns,
         next_pair: 0,
         untimed: 0,
         labels: Vec::new(),
-    };
-    TIMER.with(|t| *t.borrow_mut() = Some(timer));
-    true
+    }
 }
 
 /// A begin/end timestamp pair for the next pass, or `None` when timing is off (or this frame ran out of pairs).
@@ -175,6 +179,21 @@ pub fn pass_timestamps() -> Option<(wgpu::QuerySet, u32)> {
         return None;
     }
     count_pass();
+    if let Some(pair) = ASYNC_FRAME.with(|cell| {
+        let mut state = cell.borrow_mut();
+        let frame = state.as_mut()?;
+        let block = (frame.pairs / MAX_PAIRS) as usize;
+        if block == frame.blocks.len() {
+            frame.blocks.push(new_timer(&frame.device, frame.period_ns));
+        }
+        let timer = &mut frame.blocks[block];
+        let index = timer.next_pair * 2;
+        timer.next_pair += 1;
+        frame.pairs += 1;
+        Some((timer.queries.clone(), index))
+    }) {
+        return Some(pair);
+    }
     TIMER.with(|cell| {
         let mut guard = cell.borrow_mut();
         let t = guard.as_mut()?;
@@ -220,6 +239,21 @@ pub struct GpuTime {
     pub span_ms: f64,
     pub timed_passes: u32,
     pub untimed_passes: u32,
+    #[serde(skip)]
+    bounds_ns: Option<[f64; 2]>,
+}
+impl GpuTime {
+    /// Combine disjoint recordings of one frame on the same device clock.
+    pub fn append(&mut self, other: Self) {
+        self.busy_ms += other.busy_ms;
+        self.timed_passes += other.timed_passes;
+        self.untimed_passes += other.untimed_passes;
+        self.bounds_ns = match (self.bounds_ns, other.bounds_ns) {
+            (Some(a), Some(b)) => Some([a[0].min(b[0]), a[1].max(b[1])]),
+            (a, b) => a.or(b),
+        };
+        self.span_ms = self.bounds_ns.map_or(0., |[first, last]| (last - first) / 1e6);
+    }
 }
 
 /// Resolve the timestamps written since the last call (the caller has submitted the frame), wait for them, and
@@ -241,7 +275,11 @@ pub fn resolve_into_prof(device: &wgpu::Device, queue: &wgpu::Queue) {
         return;
     };
     if time.timed_passes > 0 {
-        crate::prof::add_work("gpu.busy", (time.busy_ms * 1e6) as u128, u64::from(time.timed_passes));
+        crate::prof::add_work(
+            "gpu.busy",
+            (time.busy_ms * 1e6) as u128,
+            u64::from(time.timed_passes),
+        );
     }
     if time.untimed_passes > 0 {
         crate::prof::add_work("gpu.untimed", 0, u64::from(time.untimed_passes));
@@ -250,7 +288,8 @@ pub fn resolve_into_prof(device: &wgpu::Device, queue: &wgpu::Queue) {
 
 /// `gpu:<stage>`, made once per stage name (a profile has a few dozen).
 fn gpu_stage_name(stage: &'static str) -> &'static str {
-    static NAMES: std::sync::Mutex<Vec<(&'static str, &'static str)>> = std::sync::Mutex::new(Vec::new());
+    static NAMES: std::sync::Mutex<Vec<(&'static str, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
     let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(_, name)) = names.iter().find(|(s, _)| *s == stage) {
         return name;
@@ -260,7 +299,12 @@ fn gpu_stage_name(stage: &'static str) -> &'static str {
     name
 }
 
-fn resolve_timer(t: &mut Timer, device: &wgpu::Device, queue: &wgpu::Queue, mut per_pass: impl FnMut(&'static str, u128)) -> Option<GpuTime> {
+fn resolve_timer(
+    t: &mut Timer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mut per_pass: impl FnMut(&'static str, u128),
+) -> Option<GpuTime> {
     let pairs = t.next_pair;
     let untimed = t.untimed;
     let labels = std::mem::take(&mut t.labels);
@@ -298,7 +342,10 @@ fn resolve_timer(t: &mut Timer, device: &wgpu::Device, queue: &wgpu::Queue, mut 
             continue;
         }
         busy += e - b;
-        per_pass(labels.get(k).copied().unwrap_or("(none)"), ((e - b) as f64 * to_ms * 1e6) as u128);
+        per_pass(
+            labels.get(k).copied().unwrap_or("(none)"),
+            ((e - b) as f64 * to_ms * 1e6) as u128,
+        );
         first = first.min(b);
         last = last.max(e);
     }
@@ -311,6 +358,7 @@ fn resolve_timer(t: &mut Timer, device: &wgpu::Device, queue: &wgpu::Queue, mut 
         },
         timed_passes: pairs,
         untimed_passes: untimed,
+        bounds_ns: (last > first).then_some([first as f64 * f64::from(t.period_ns), last as f64 * f64::from(t.period_ns)]),
     })
 }
 
@@ -342,7 +390,9 @@ impl<'p> CountedPass<'p> {
     pub fn finish_bundle(self, label: &str) -> Option<wgpu::RenderBundle> {
         match self {
             CountedPass::Pass(_) => None,
-            CountedPass::Bundle(e) => Some(e.finish(&wgpu::RenderBundleDescriptor { label: Some(label) })),
+            CountedPass::Bundle(e) => {
+                Some(e.finish(&wgpu::RenderBundleDescriptor { label: Some(label) }))
+            }
         }
     }
     #[inline]
@@ -400,9 +450,144 @@ impl<'p> CountedPass<'p> {
         }
     }
     /// Replay bundles into a pass.
-    pub fn execute_bundles<'a>(&mut self, bundles: impl IntoIterator<Item = &'a wgpu::RenderBundle>) {
+    pub fn execute_bundles<'a>(
+        &mut self,
+        bundles: impl IntoIterator<Item = &'a wgpu::RenderBundle>,
+    ) {
         if let CountedPass::Pass(p) = self {
             p.execute_bundles(bundles);
         }
+    }
+}
+
+/// One asynchronous diagnostic frame. Its queries are resolved in the caller's
+/// final submission and mapped at its existing completion boundary, never by a
+/// profiling-only queue wait. Returned to the slot for reuse.
+struct AsyncFrame {
+    device: wgpu::Device,
+    period_ns: f32,
+    blocks: Vec<Timer>,
+    pairs: u32,
+}
+thread_local! {
+    static ASYNC_FRAME: RefCell<Option<AsyncFrame>> = const { RefCell::new(None) };
+    static ASYNC_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static PAUSED: Cell<bool> = const { Cell::new(false) };
+}
+pub struct PendingFrame(AsyncFrame);
+pub fn begin_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    reuse: Option<PendingFrame>,
+) -> bool {
+    if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        return false;
+    }
+    let mut frame = reuse.map(|p| p.0).unwrap_or_else(|| AsyncFrame {
+        device: device.clone(),
+        period_ns: queue.get_timestamp_period(),
+        blocks: Vec::new(),
+        pairs: 0,
+    });
+    frame.pairs = 0;
+    for timer in &mut frame.blocks {
+        timer.next_pair = 0;
+    }
+    ASYNC_FRAME.with(|t| {
+        t.replace(Some(frame));
+    });
+    ASYNC_ENABLED.with(|v| v.set(true));
+    true
+}
+pub fn end_frame(encoder: &mut wgpu::CommandEncoder) -> Option<PendingFrame> {
+    let frame = ASYNC_FRAME.with(|t| t.take())?;
+    for timer in frame.blocks.iter().filter(|t| t.next_pair > 0) {
+        encoder.resolve_query_set(&timer.queries, 0..timer.next_pair * 2, &timer.resolve, 0);
+        encoder.copy_buffer_to_buffer(
+            &timer.resolve,
+            0,
+            &timer.readback,
+            0,
+            u64::from(timer.next_pair) * 16,
+        );
+    }
+    ASYNC_ENABLED.with(|v| v.set(false));
+    Some(PendingFrame(frame))
+}
+impl PendingFrame {
+    pub fn readbacks(&self) -> impl Iterator<Item = &wgpu::Buffer> {
+        self.0
+            .blocks
+            .iter()
+            .filter(|t| t.next_pair > 0)
+            .map(|t| &t.readback)
+    }
+    /// Called after the frame's ordinary completion wait has mapped the buffers.
+    pub fn time(&self) -> GpuTime {
+        let mut time = GpuTime::default();
+        let mut first = u64::MAX;
+        let mut last = 0;
+        for t in self.0.blocks.iter().filter(|t| t.next_pair > 0) {
+            {
+                let bytes = t.readback.get_mapped_range(..u64::from(t.next_pair) * 16);
+                for pair in bytemuck::cast_slice::<u8, u64>(&bytes).chunks_exact(2) {
+                    if pair[0] == 0 || pair[1] < pair[0] {
+                        time.untimed_passes += 1;
+                        continue;
+                    }
+                    time.timed_passes += 1;
+                    time.busy_ms += (pair[1] - pair[0]) as f64 * f64::from(t.period_ns) / 1e6;
+                    first = first.min(pair[0]);
+                    last = last.max(pair[1]);
+                }
+            }
+            t.readback.unmap();
+        }
+        if last > first {
+            time.span_ms = (last - first) as f64 * f64::from(self.0.period_ns) / 1e6;
+            time.bounds_ns = Some([first as f64 * f64::from(self.0.period_ns), last as f64 * f64::from(self.0.period_ns)]);
+        }
+        time
+    }
+}
+
+/// Keep a nested renderer's own timestamp accounting disjoint from this stream.
+pub struct Pause(bool);
+pub fn pause() -> Pause {
+    Pause(PAUSED.with(|v| v.replace(true)))
+}
+/// A nested canvas submits its own passes before its world's commands. Capture
+/// those passes here; the world retains ownership of the crossing it records later.
+pub fn resume() -> Pause {
+    Pause(PAUSED.with(|v| v.replace(false)))
+}
+impl Drop for Pause {
+    fn drop(&mut self) {
+        PAUSED.with(|v| v.set(self.0));
+    }
+}
+
+/// Restore the bench profiler even when a diagnostic render fails mid-frame.
+pub struct CaptureState {
+    enabled: bool,
+    timer: Option<Timer>,
+    frame: Option<AsyncFrame>,
+}
+pub fn capture_state() -> CaptureState {
+    CaptureState {
+        enabled: ASYNC_ENABLED.with(|v| v.replace(false)),
+        timer: TIMER.with(|t| t.take()),
+        frame: ASYNC_FRAME.with(|t| t.take()),
+    }
+}
+impl Drop for CaptureState {
+    fn drop(&mut self) {
+        TIMER.with(|t| {
+            t.replace(self.timer.take());
+        });
+        ASYNC_FRAME.with(|t| {
+            t.replace(self.frame.take());
+        });
+        ASYNC_ENABLED.with(|v| v.set(self.enabled));
     }
 }

@@ -193,3 +193,56 @@ pub enum SemaphoreType {
     Binary(vk::Semaphore),
     Timeline(vk::Semaphore, u64),
 }
+
+/// Signals reserved by an external producer for its own next submission. A
+/// concurrent renderer submission must not release that producer's payload.
+#[derive(Default)]
+pub(super) struct ThreadSignals {
+    pending: parking_lot::Mutex<naga::FastHashMap<std::thread::ThreadId, SemaphoreList>>,
+}
+impl ThreadSignals {
+    pub(super) fn push(&self, signal: SemaphoreType) {
+        self.pending.lock().entry(std::thread::current().id())
+            .or_insert_with(|| SemaphoreList::new(SemaphoreListMode::Signal))
+            .push_signal(signal);
+    }
+    pub(super) fn take(&self) -> Option<SemaphoreList> {
+        self.pending.lock().remove(&std::thread::current().id())
+    }
+}
+
+#[cfg(test)]
+mod thread_signal_tests {
+    use super::*;
+    use ash::vk::Handle;
+
+    #[test]
+    fn concurrent_submission_cannot_take_another_producers_signal() {
+        let signals = ThreadSignals::default();
+        let first = vk::Semaphore::from_raw(1);
+        let second = vk::Semaphore::from_raw(2);
+        signals.push(SemaphoreType::Timeline(first, 11));
+        std::thread::scope(|scope| {
+            let (ready, receive) = std::sync::mpsc::channel();
+            let (done, finish) = std::sync::mpsc::channel();
+            let signals = &signals;
+            let other = scope.spawn(move || {
+                assert!(signals.take().is_none());
+                signals.push(SemaphoreType::Timeline(second, 22));
+                ready.send(()).unwrap();
+                finish.recv().unwrap();
+                let own = signals.take().unwrap();
+                assert_eq!(own.semaphores, [second]);
+                assert_eq!(own.values, [22]);
+                assert!(signals.take().is_none());
+            });
+            receive.recv().unwrap();
+            let own = signals.take().unwrap();
+            assert_eq!(own.semaphores, [first]);
+            assert_eq!(own.values, [11]);
+            assert!(signals.take().is_none());
+            done.send(()).unwrap();
+            other.join().unwrap();
+        });
+    }
+}

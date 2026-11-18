@@ -17,11 +17,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 moxcms = "0.8"
 fast_image_resize = "6"
 resvg = "0.47"
-wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 base64 = "0.22"
 anyhow = "1"
-serde_json = { version = "1", features = ["preserve_order"] }
 
 moda-scene = { path = "../moda-scene" }
 moda-shaders = { path = "../moda-shaders" }

@@ -133,7 +133,7 @@ impl Scene {
         descendants(&node.children, &mut inside);
         let clocked = node.has_clock() || ancestors.iter().any(|a| a.has_clock());
         // The movies its nodes show, and the images its image graph reads.
-        let mut media = self.media_sources(node);
+        let mut media = self.media_readers().media_sources(node);
         media.extend(self.compositor_image_reads(&composition.compositor));
         // What the part can read decides the material and image tracks it keeps. A world may read any material
         // or image, and so may a part with a world anywhere inside it: that world is extracted from this part
@@ -496,7 +496,7 @@ mod tests {
             let world = scene(doc.clone()).unwrap();
             let canvas = world.composition_scene("panel", [64,32]).unwrap();
             assert_eq!(canvas.animation.len(), 1);
-            assert_eq!(canvas.node_media(&canvas.nodes[0]), vec!["clip"]);
+            assert_eq!(canvas.media_readers().node_media(&canvas.nodes[0]), vec!["clip"]);
         }
     }
 

@@ -119,8 +119,6 @@ pub struct Executor {
     /// past it are cut, so a runaway scale can't allocate a giant texture.
     limit: std::cell::Cell<Domain>,
     frame: std::cell::Cell<(u32, u32)>,
-    /// The 3D layers' pipeline, made on the first solid.
-    solids: std::cell::OnceCell<crate::solid::SolidPipeline>,
     /// Agent shaders' time budget, ms per 1920×1080 output px.
     shader_budget: std::cell::Cell<f64>,
 }
@@ -147,7 +145,6 @@ impl Executor {
             captures: Default::default(),
             limit: std::cell::Cell::new(Domain::EMPTY),
             frame: std::cell::Cell::new((0, 0)),
-            solids: std::cell::OnceCell::new(),
             shader_budget: std::cell::Cell::new(super::agent_budget_per_1080p()),
         }
     }
@@ -316,20 +313,6 @@ impl Executor {
         self.run(kernels::project(), &[img], &params, out, img.tag())
     }
 
-    /// Solids (3D layers, `crate::solid`) drawn together over `out`, tagged `srgb`.
-    pub fn draw_solids(&self, scene: &crate::solid::SolidScene<'_>, out: Domain) -> Result<Image, PixelError> {
-        self.nodes.set(self.nodes.get() + 1);
-        let out = self.clip(out);
-        if out.is_empty() {
-            return self.draw_solids(scene, Domain::new(0, 0, 1, 1));
-        }
-        if self.solids.get().is_none() {
-            let p = crate::solid::SolidPipeline::new(self.passes.device(), self.passes.queue())?;
-            let _ = self.solids.set(p);
-        }
-        let tex = self.solids.get().expect("made above").draw(&self.pool, scene, out)?;
-        Ok(Image::rgba(out, ColorTag::Srgb, tex))
-    }
 
     /// Weighted looks of one image (newest first), combined by `mode` (`add`, `over`, `max`), four inputs a pass.
     pub fn accumulate(&self, looks: &[&Image], weights: &[f64], mode: &str) -> Result<Image, PixelError> {

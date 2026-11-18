@@ -267,7 +267,7 @@ fn tess_path(op: &VectorOp) -> Option<tiny_skia::Path> {
 /// segments in contour order).
 fn analytic_path(op: &VectorOp, curve_points: &[f32]) -> Option<tiny_skia::Path> {
     let mut pb = tiny_skia::PathBuilder::new();
-    for rec in &op.records {
+    for rec in op.records.iter() {
         let fs = rec.font_size_px;
         let (px, py) = (rec.pen_x, rec.baseline_y);
         let mut cur: Option<(f32, f32)> = None;

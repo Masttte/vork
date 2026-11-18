@@ -138,13 +138,27 @@ mock reference is never dereferenced. Real Metal/Vulkan descriptors are unchange
 Regression: GPU-free `scripts/prepare-shaders`; remove when upstream's no-op
 backend supplies equivalent native descriptor construction.
 
-Local patch: Metal `PipelineCache` is an `MTLBinaryArchive` (`src/metal/{mod,device,adapter}.rs`).
-`PIPELINE_CACHE` is advertised where binary archives are supported. Cache data is a
-serialized archive staged in a temporary file for Metal to load; the validation key
-hashes the GPU name and the OS build that supplies the Metal compiler. Pipeline
-creation first asks the archive with `FailOnBinaryArchiveMiss`; a miss compiles as
-without an archive and then records the pipeline. Mesh render pipelines are not
-archived. Data Metal cannot open is `PipelineCacheError::Rejected` (`src/lib.rs`),
+Local patch: Metal `PipelineCache` holds `MTLBinaryArchive` segments (`src/metal/{mod,device,adapter}.rs`).
+`PIPELINE_CACHE` is advertised where binary archives are supported. Loaded segments
+are staged in temporary files and remain read-only; one fresh writable archive
+receives this process's pipelines. Adding a render pipeline that shares a vertex
+function with a different stored fragment partner can make a file-loaded archive's
+serialization fail and empty it, losing earlier pipelines on the next save.
+Pipeline creation first asks all loaded segments and the writable archive with
+`FailOnBinaryArchiveMiss`; a miss compiles as without an archive and then records
+the pipeline in the writable archive. Mesh render pipelines are not archived.
+Cache data is an envelope: a little-endian u32 segment count, that many
+little-endian u64 byte lengths, then each segment's bytes in order. Saves preserve
+the loaded segments byte for byte and append the writable archive once it has
+gained pipelines. There is no merge, compaction or segment cap. The validation key
+hashes `wgpu-metal-binary-archives-v2`, the GPU name and the OS build that supplies
+the Metal compiler, invalidating the former single-archive format.
+An unchanged save reuses the writable archive's last serialized file rather than
+asking Metal to serialize it again; repeated unchanged serialization can move its
+backing file away. A serialization failure latches for the cache's lifetime:
+subsequent data requests return `None`, so a later partial archive cannot replace
+the persisted cache. Malformed envelopes and data Metal cannot open are
+`PipelineCacheError::Rejected` (`src/lib.rs`),
 a validation error, never device loss. Apple's shared shader cache evicts large
 pipelines, so it is not a dependable warm path. Regression:
 `metal::device::binary_archive_tests`. Remove when upstream persists Metal
@@ -192,3 +206,10 @@ uses `MTLAccelerationStructureInstanceOptions`; the no-op ABI mirrors Vulkan.
 Regression: renderer `opaque_material_sides_use_hardware_traversal` exercises an
 installed TLAS, both material sides and zero opaque candidate callbacks. Remove
 when upstream exposes equivalent native-descriptor instance traversal options.
+
+Local patch: Vulkan external-encoder signals can be reserved for the calling
+thread's next submission. Concurrent canvas submissions cannot consume the NVENC
+copy's completion signal. The ordinary queue-wide signal API is unchanged.
+Regression: `vulkan::semaphore_list::thread_signal_tests` checks concurrent
+producers without a GPU. Remove when upstream supports producer-scoped external
+completion signals.

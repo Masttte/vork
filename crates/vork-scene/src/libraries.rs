@@ -110,6 +110,14 @@ pub const LIBRARIES: &[Library] = &[
         images: &[],
     },
     Library {
+        name: "smoke",
+        help: include_str!("../../../libraries/smoke/HELP.txt"),
+        modules: modules!("smoke": "grid" false, "advect" false, "sources" false,
+            "forces" false, "divergence" false, "pressure" false, "project" false),
+        profiles: &[],
+        images: &[],
+    },
+    Library {
         name: "cloth",
         help: include_str!("../../../libraries/cloth/HELP.txt"),
         modules: modules!("cloth": "solver" false, "body" false, "self" false),

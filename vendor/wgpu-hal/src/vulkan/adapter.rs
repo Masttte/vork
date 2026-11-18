@@ -2803,6 +2803,7 @@ impl super::Adapter {
             relay_semaphores: Mutex::new(relay_semaphores),
             native_backlog: Mutex::new(super::native_backlog::NativeBacklog::default()),
             signal_semaphores: Mutex::new(SemaphoreList::new(SemaphoreListMode::Signal)),
+            thread_signals: Default::default(),
         };
 
         let allocation_sizes = AllocationSizes::from_memory_hints(memory_hints).into();

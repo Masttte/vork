@@ -45,6 +45,7 @@ pub mod cache;
 pub mod exec;
 pub mod plan;
 pub mod shadow;
+pub(crate) mod translation;
 
 pub use exec::LayerBlurRenderer;
 pub use plan::{

@@ -447,12 +447,12 @@ impl Session {
         let mut release = gpu.device.create_command_encoder(&Default::default());
         self.ownership(&mut release, true, slot);
         commands.push(release.finish());
-        // The renderer is the ordered producer on this queue: attach the signal
-        // immediately before submitting the copy that transfers this slot.
+        // Canvas workers may submit on this queue concurrently. Reserve the signal
+        // for this thread's copy, so another producer cannot release the slot early.
         if let Some(sync) = &self.sync {
             let queue =
                 unsafe { gpu.queue.as_hal::<Vulkan>() }.context("Vulkan queue unavailable")?;
-            queue.add_signal_semaphore(sync.semaphore, Some(index + 1));
+            queue.add_thread_signal_semaphore(sync.semaphore, Some(index + 1));
         }
         let submission = gpu.queue.submit(commands);
         if self.sync.is_none() {

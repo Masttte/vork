@@ -611,19 +611,9 @@ impl PreparedModules {
         let allowed: BTreeSet<_> = self.snapshot.files.keys().cloned().collect();
         ensure!(depfile_paths(&read_compiler_text(&depfile)?).iter().all(|p| allowed.contains(p)),
             "Slang code generation escaped its captured dependency closure; cannot cache the result");
-        let mut code = fs::read(output)?;
+        let code = fs::read(output)?;
         if metal {crate::metal_source::validate(std::str::from_utf8(&code)?)?;}
-        if metal
-            && self.args.windows(2).any(|a| {
-                matches!(a[0].as_str(), "-fp-mode" | "-floating-point-mode") && a[1] == "precise"
-            })
-        {
-            let mut prefix =
-                b"#pragma METAL fp math_mode(safe)\n#pragma METAL fp contract(off)\n".to_vec();
-            prefix.append(&mut code);
-            code = prefix;
-        }
-        Ok(code)
+        crate::metal_source::finalize(&self.args, code)
     }
 }
 

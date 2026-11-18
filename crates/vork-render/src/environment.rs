@@ -2,6 +2,9 @@
 use super::*;
 mod cache;
 mod evaluated;
+mod brdf;
+#[cfg(test)]
+mod brdf_tests;
 pub(crate) use evaluated::Validation;
 // Preserve float32 bits without a float-sampling capability or precision loss.
 #[cfg(test)]
@@ -61,7 +64,10 @@ struct Integral {
 }
 impl Integral {
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::ComputePipeline) {
-        let mut pass = encoder.begin_compute_pass(&Default::default());
+        self.encode_timed(encoder, pipeline, None);
+    }
+    fn encode_timed(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::ComputePipeline, timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {label: Some("environment integral"), timestamp_writes});
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
         pass.dispatch_workgroups(self.groups[0], self.groups[1], 1);
@@ -263,13 +269,14 @@ impl Environment {
         );
         let pipeline = Self::pipeline(r);
         let integrate =
-            |encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture, mode: u32, mip: u32| {
+            |encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture, mode: u32, mip: u32, rows: std::ops::Range<u32>, timestamps: Option<wgpu::ComputePassTimestampWrites<'_>>| {
                 let view = target.create_view(&wgpu::TextureViewDescriptor {
                     base_mip_level: mip,
                     mip_level_count: Some(1),
                     ..Default::default()
                 });
-                let parameters = filter_parameters(mip, mode, filter_scale, sh, [dw, dh]);
+                let mut parameters = filter_parameters(mip, mode, filter_scale, sh, [dw, dh]);
+                parameters[5][3] = rows.start as f32;
                 let params = init(
                     d,
                     "environment integral parameters",
@@ -291,32 +298,34 @@ impl Environment {
                     params,
                     groups: [
                         (target.width() >> mip).max(1).div_ceil(8),
-                        (target.height() >> mip).max(1).div_ceil(8),
+                        (rows.end - rows.start).div_ceil(8),
                     ],
                 };
                 if filtered.is_none() || mode == 2 {
-                    integral.encode(encoder, pipeline);
+                    integral.encode_timed(encoder, pipeline, timestamps);
                 }
                 integral
             };
-        // The LUT is device-owned and scene-independent. OnceLock serializes its
-        // initialization, including submission, before another install can use it.
-        let brdf = r.brdf.get_or_init(|| {
-            let mut encoder = d.create_command_encoder(&Default::default());
-            let lut = texture(
-                "BRDF moments and dielectric directional albedo",
-                crate::constants::BRDF_SIZE,
-                crate::constants::BRDF_HEIGHT,
-                1,
-                wgpu::TextureFormat::Rgba16Float,
-                usage,
-            );
-            integrate(&mut encoder, &lut, 2, 0);
-            // Submit inside initialization so concurrent installs observe GPU queue
-            // ordering as well as the completed CPU initialization.
-            crate::command_finish::Segments::submit(&r.queue, encoder);
-            lut.create_view(&Default::default())
-        });
+        // The LUT is device-owned and scene-independent. Serialize fallible GPU
+        // calibration and queue publication before another install can use it.
+        let brdf = {
+            let mut cached = r.brdf.lock().expect("BRDF initialization poisoned");
+            if cached.is_none() {
+                let lut = texture(
+                    "BRDF moments and dielectric directional albedo",
+                    crate::constants::BRDF_SIZE,
+                    crate::constants::BRDF_HEIGHT,
+                    1,
+                    wgpu::TextureFormat::Rgba16Float,
+                    usage,
+                );
+                brdf::initialize(r, |encoder, rows, timestamps| {
+                    integrate(encoder, &lut, 2, 0, rows, timestamps);
+                })?;
+                *cached = Some(lut.create_view(&Default::default()));
+            }
+            cached.as_ref().expect("initialized BRDF lookup").clone()
+        };
         let mut encoder = d.create_command_encoder(&Default::default());
         let mut integrals = Vec::new();
         if settings.is_some() && !primary.as_ref().is_some_and(|p|p.spatial) && (filtered.is_none() || program.is_some()) {
@@ -324,7 +333,7 @@ impl Environment {
                 .map(|m| (&specular, 0u32, m))
                 .chain([(&diffuse, 1, 0)])
             {
-                integrals.push(integrate(&mut encoder, target, mode, mip));
+                integrals.push(integrate(&mut encoder, target, mode, mip, 0..(target.height() >> mip).max(1), None));
             }
         }
         crate::command_finish::Segments::submit(&r.queue, encoder);

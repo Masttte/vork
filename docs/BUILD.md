@@ -164,10 +164,18 @@ scene therefore compiles its kernel at every covered case of both
 (`ProgramKernel::release_cases`): a single sun, area lights only and every kind
 (the key of no analytic light or any mix), and, where solids are installed, the
 camera proof held and not held. A scene with the same materials and one of those
-cases starts without compiling; one lit by points or spots alone compiles once.
+cases starts without compiling its own kernel. Points or spots alone use a covering
+kernel while their exact kernel compiles in the background.
 The bundle holds each artifact as one XZ stream (`<entry>.xz`), expanded when a
 render asks for it and checked against the entry's digest; a render reads only the
-few it needs. Shared portable artifacts deduplicate by their existing content keys; arbitrary
+few it needs. Each prepared path scene also contributes covering kernels with its
+material and resource family unchanged and refinement capabilities enabled.
+Hair, subsurface and null-connection unions retain their proofs; every prepared
+family supplies all eight combinations to preserve sampler arithmetic and speed.
+Scenes differing only in those refinements can use the stored covering code while their exact
+pipeline specializes in the background. Existing exact light/camera cases remain
+in the bundle so their current hits retain the same kernel.
+Shared portable artifacts deduplicate by their existing content keys; arbitrary
 authored programs and uncommon configurations still compile on demand. Preparation runs
 without opening a GPU driver, OIDN device or executing shaders. Denoiser
 preparation constructs only the renderer's pack/unpack pipelines. macOS emits Metal source;
@@ -245,3 +253,29 @@ Slang's build provenance at `slang/vork-build.json`. npm and native
 wheel assembly rechecks that inventory before copying the signed bytes. The
 helper is compiled with the same explicit deployment target. Run
 `python3 scripts/check-macos-runtime /path/to/extracted-runtime` to inspect it.
+
+## Reusing release shader compilation
+
+`python3 scripts/build-with-shader-cache --cache /path/to/fixed-cache -- cargo build --locked --release -p vork-cli`
+uses the selected pinned `VORK_SLANGC` through a temporary build-only proxy. It
+caches fixed-entry native code and reflection together. Its path is stable for an
+unchanged compiler, so Cargo can still skip a no-op build. Module validation still
+runs normally. Every lookup captures Slang's resolved inputs; source, compiler
+and library bytes, target, entry, defines and flags identify the result. Unsupported
+or path-sensitive requests compile normally. Cached output hashes are verified
+before either output is restored. The original compiler is never replaced or
+packaged with a proxy; use it for runtime preparation and release packaging.
+The filesystem companion uses the original toolchain headers, preserving the
+header paths in its debug information.
+
+`prepare-shaders --cache /path/to/preparation-store` retains portable assets
+between preparations. The store is partitioned by compiler bytes and platform.
+Each invocation stages a temporary executable layout, allowing the renderer's
+existing installed-asset reader to validate and materialize only the entries
+used by that run. Export reads its fresh mutable store, so obsolete entries do
+not accumulate in the shipped bundle. The manifest is regenerated for the actual
+packaged binary. Neither store contains driver caches. Dist jobs restore/save
+these stores with Actions cache; Greenlight retains them across commit builds.
+Each build-only store bounds completed shader payloads to 2 GiB, removing the
+oldest entries after a successful run; eviction only causes recompilation.
+Lock files and the fixed-compiler event log are separate metadata.

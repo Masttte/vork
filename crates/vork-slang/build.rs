@@ -1,8 +1,12 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=VORK_SLANGC");
+    println!("cargo:rerun-if-env-changed=VORK_BUILD_REAL_SLANGC");
     println!("cargo:rerun-if-changed=../../dist/macos-minimum.txt");
     println!("cargo:rerun-if-changed=src/filesystem.cpp");
-    let compiler = std::env::var_os("VORK_SLANGC")
+    // The build-only cache proxy must not change header paths in the shipped
+    // companion's debug information. Compile against the original toolchain.
+    let compiler = std::env::var_os("VORK_BUILD_REAL_SLANGC")
+        .or_else(|| std::env::var_os("VORK_SLANGC"))
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("PATH").and_then(|paths| {

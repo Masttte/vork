@@ -56,6 +56,8 @@ use crate::tess::{self, moda_engine_path_types as pt};
 pub struct PlanMasks {
     pub masks: Vec<MaskPlan>,
     owner_to_id: HashMap<String, Option<usize>>,
+    /// Actual mask reads made by the shared planner while recording retained units.
+    reads: Option<Vec<usize>>,
     /// Fail-closed mask refusals (`PlanWarnings::dropped`): a mask whose
     /// coverage geometry lyon refused. Such a mask is built with ZERO
     /// coverage — it clips everything — never the full-quad fallback, which
@@ -96,6 +98,7 @@ impl Default for PlanMasks {
         PlanMasks {
             masks: Vec::new(),
             owner_to_id: HashMap::new(),
+            reads: None,
             dropped: Vec::new(),
             skipped: Vec::new(),
             text_masks_available: true,
@@ -107,6 +110,10 @@ impl Default for PlanMasks {
 }
 
 impl PlanMasks {
+    pub(crate) fn record_reads(&mut self) { self.reads.get_or_insert_with(Vec::new); }
+
+    pub(crate) fn reads(&self) -> &[usize] { self.reads.as_deref().unwrap_or(&[]) }
+
     /// Explicit text-mask availability (`RenderOptions::text_masks_available`).
     pub fn with_text_masks(text_masks_available: bool) -> Self {
         PlanMasks {
@@ -198,7 +205,7 @@ impl PlanMasks {
         positions: Vec<f32>,
         affine: moda_scene::types::Affine,
     ) -> Option<MaskRef> {
-        if let Some(cached) = self.owner_to_id.get(owner_key) {
+        if let Some(cached) = self.owner_to_id.get(owner_key).copied() {
             return cached.map(|id| self.mask_ref_at(id));
         }
         self.owner_to_id.insert(owner_key.to_string(), None);
@@ -214,6 +221,7 @@ impl PlanMasks {
         let count = (positions.len() / 2) as u32;
         let id = self.masks.len();
         self.masks.push(MaskPlan {
+            source_node_id: node_id.to_string(),
             owner_node_id: owner_key.to_string(),
             origin: [x0, y0],
             size: [bw, bh],
@@ -254,7 +262,8 @@ impl PlanMasks {
     }
 
     /// The reference to mask `id` of this table.
-    fn mask_ref_at(&self, id: usize) -> MaskRef {
+    fn mask_ref_at(&mut self, id: usize) -> MaskRef {
+        if let Some(reads) = &mut self.reads { reads.push(id); }
         let m = &self.masks[id];
         MaskRef {
             mask_id: id as u64,
@@ -639,6 +648,7 @@ impl PlanMasks {
 
         let id = self.masks.len();
         self.masks.push(MaskPlan {
+            source_node_id: mask_node_id.to_string(),
             owner_node_id: owner_id.to_string(),
             origin: [bx, by],
             size: [bw, bh],
@@ -746,6 +756,7 @@ impl PlanMasks {
         let bh = (bottom - by).max(1.0);
         let id = self.masks.len();
         self.masks.push(MaskPlan {
+            source_node_id: mask_node_id.to_string(),
             owner_node_id: owner_id.to_string(),
             origin: [bx, by],
             size: [bw, bh],
@@ -760,13 +771,58 @@ impl PlanMasks {
                 rgba: Vec::new(), width: 1, height: 1, offset: [0.0; 2],
                 dims: [bw as f32, bh as f32], scale: [1.0; 2], rotation_rad: 0.0,
                 surface: Some(format!("rendered-mask:{owner_id}")),
-                rendered: Some(std::sync::Arc::new(crate::seams::RenderedMask { document: std::sync::Arc::new(document), node_id: mask_node_id.to_string(), shader_time_s: self.shader_time_s, source_fingerprint: rendered_mask_fingerprint(scene, mask_node_id) })),
+                rendered: Some(std::sync::Arc::new(crate::seams::RenderedMask { document: std::sync::Arc::new(document), node_id: mask_node_id.to_string(), shader_time_s: self.shader_time_s, source_fingerprint: rendered_mask_fingerprint(scene, mask_node_id), cache_key: rendered_mask_cache_key(scene, mask_node_id), shader_clock: Default::default() })),
             }),
             text: None,
             ancestor,
         });
         Some(id)
     }
+}
+
+/// Only self-contained canvas primitives: native text can read area/thread nodes and generated
+/// content can read arbitrary sources. Those keep the ordinary capture path.
+fn rendered_mask_cache_key(scene: &Scene, root: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut pending = vec![root.to_string()];
+    let mut sources = std::collections::BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !sources.insert(id.clone()) { continue; }
+        let node = scene.effective_node(&id)?;
+        match node.node_type() {
+            "group" | "container" | "path" | "rectangle" | "ellipse" => {},
+            "richtext" if node.json_field("vorkText").is_some() => {},
+            _ => return None,
+        }
+        if node.truthy("clipToBelow") { return None; }
+        if scene.transient_by_parent().contains_key(&id) { return None; }
+        if let Some(children) = scene.children_by_parent().get(&id) {
+            pending.extend(children.iter().cloned());
+        }
+    }
+    for id in &sources {
+        let node = scene.effective_node(id)?;
+        if let Some(mask) = node.json_field("clipMaskNodeId").and_then(|v| v.as_str()) {
+            if !sources.contains(mask) { return None; }
+        }
+    }
+    let mut h = rustc_hash::FxHasher::default();
+    h.write(b"rendered-mask");
+    rendered_mask_fingerprint(scene, root).hash(&mut h);
+    let doc = scene.doc();
+    h.write(&moda_scene::value::to_vec(&(
+        &doc.canvas_root_node_ids, &doc.layout_mode, &doc.grid_columns,
+        &doc.brush_hashes, &doc.pattern_hashes,
+    )).expect("mask capture document inputs"));
+    for page in &doc.pages {
+        h.write(&moda_scene::value::to_vec(&page.0).expect("mask capture page"));
+    }
+    // Visibility and ordering on ancestors also affect the isolated walk. Their opacity,
+    // effects and clipping are removed by build_rendered_mask; hashing them is conservative.
+    for id in scene.transform_parent_chain(root) {
+        crate::residency::node_hashes_in(scene, scene.effective_node(&id)?).full.hash(&mut h);
+    }
+    Some(h.finish())
 }
 
 pub(crate) fn rendered_mask_fingerprint(scene: &Scene, mask_node_id: &str) -> u64 {
@@ -842,22 +898,22 @@ fn next_mask_owner(scene: &Scene, start: &str, include_self: bool) -> Option<Mas
             return Some(MaskOwner::Below { clipped: start.to_string(), base: base.clone() });
         }
     }
-    let mut cursor = start.to_string();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cursor = start;
+    let mut visited = moda_scene::scene::SeenIds::default();
     while let Some(parent_id) = scene
-        .group_parent_of(&cursor)
-        .cloned()
-        .or_else(|| scene.transient_parent_of().get(&cursor).cloned())
+        .group_parent_of(cursor)
+        .or_else(|| scene.transient_parent_of().get(cursor))
+        .map(String::as_str)
     {
-        if !visited.insert(parent_id.clone()) {
+        if !visited.insert(parent_id) {
             break; // cycle guard
         }
         // Transient groups (an envelope's bent content, E8.17) own masks too.
-        if scene.canonical_or_transient(&parent_id).is_some_and(is_mask_owner) {
-            return Some(MaskOwner::Clip(parent_id));
+        if scene.canonical_or_transient(parent_id).is_some_and(is_mask_owner) {
+            return Some(MaskOwner::Clip(parent_id.to_string()));
         }
-        if let Some(base) = scene.clip_below_base(&parent_id) {
-            return Some(MaskOwner::Below { clipped: parent_id.clone(), base: base.clone() });
+        if let Some(base) = scene.clip_below_base(parent_id) {
+            return Some(MaskOwner::Below { clipped: parent_id.to_string(), base: base.clone() });
         }
         cursor = parent_id;
     }
@@ -1810,18 +1866,18 @@ pub fn effective_page_clip_until(
         base[2] as f64,
         base[3] as f64,
     ];
-    let mut cursor = node_id.to_string();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cursor = node_id;
+    let mut visited = moda_scene::scene::SeenIds::default();
     // Step THROUGH transient hosts (see mask_ref_for_node).
     while let Some(parent_id) = scene
-        .group_parent_of(&cursor)
-        .cloned()
-        .or_else(|| scene.transient_parent_of().get(&cursor).cloned())
+        .group_parent_of(cursor)
+        .or_else(|| scene.transient_parent_of().get(cursor))
+        .map(String::as_str)
     {
-        if !visited.insert(parent_id.clone()) {
+        if !visited.insert(parent_id) {
             break; // cycle guard — corrupt parent data must not hang the renderer
         }
-        let Some(parent) = scene.canonical_or_transient(&parent_id) else {
+        let Some(parent) = scene.canonical_or_transient(parent_id) else {
             cursor = parent_id;
             continue;
         };
@@ -1852,7 +1908,7 @@ pub fn effective_page_clip_until(
                 None => return None, // production: computeEffectivePageClip → null
             }
         }
-        if stop == Some(parent_id.as_str()) {
+        if stop == Some(parent_id) {
             break;
         }
         cursor = parent_id;
@@ -1903,18 +1959,18 @@ pub fn has_non_box_clip_mask(scene: &Scene, node_id: &str) -> bool {
             }
         }
     };
-    let mut cursor = node_id.to_string();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cursor = node_id;
+    let mut visited = moda_scene::scene::SeenIds::default();
     while let Some(parent_id) = scene
-        .group_parent_of(&cursor)
-        .cloned()
-        .or_else(|| scene.transient_parent_of().get(&cursor).cloned())
+        .group_parent_of(cursor)
+        .or_else(|| scene.transient_parent_of().get(cursor))
+        .map(String::as_str)
     {
-        if !visited.insert(parent_id.clone()) {
+        if !visited.insert(parent_id) {
             break; // cycle guard
         }
         if let Some(mid) = scene
-            .canonical_or_transient(&parent_id)
+            .canonical_or_transient(parent_id)
             .filter(|p| p.node_type() == "group" && p.truthy("clipMaskNodeId"))
             .and_then(|p| p.str("clipMaskNodeId"))
         {
@@ -1941,18 +1997,18 @@ pub fn clip_rounded_rect(scene: &Scene, node_id: &str) -> Option<crate::seams::C
 /// it holds is clipped as inside it, [`effective_page_clip_until`]'s twin).
 pub fn clip_rounded_rect_until(scene: &Scene, node_id: &str, stop: Option<&str>) -> Option<crate::seams::ClipRRect> {
     const EPS: f64 = 1e-6;
-    let mut cursor = node_id.to_string();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cursor = node_id;
+    let mut visited = moda_scene::scene::SeenIds::default();
     while let Some(parent_id) = scene
-        .group_parent_of(&cursor)
-        .cloned()
-        .or_else(|| scene.transient_parent_of().get(&cursor).cloned())
+        .group_parent_of(cursor)
+        .or_else(|| scene.transient_parent_of().get(cursor))
+        .map(String::as_str)
     {
-        if !visited.insert(parent_id.clone()) {
+        if !visited.insert(parent_id) {
             break;
         }
         if let Some(parent) = scene
-            .node(&parent_id)
+            .node(parent_id)
             .filter(|p| p.node_type() == "container" && p.truthy("clipContent"))
         {
             let w = parent.f64("width").unwrap_or(0.0);
@@ -1963,7 +2019,7 @@ pub fn clip_rounded_rect_until(scene: &Scene, node_id: &str, stop: Option<&str>)
                 parent.json_field("cornerRadius"),
             );
             if radii.iter().any(|r| *r > EPS) {
-                let a = scene.node_canvas_affine(&parent_id)?;
+                let a = scene.node_canvas_affine(parent_id)?;
                 if a.b.abs() > EPS || a.c.abs() > EPS {
                     return None;
                 }
@@ -1984,7 +2040,7 @@ pub fn clip_rounded_rect_until(scene: &Scene, node_id: &str, stop: Option<&str>)
                 });
             }
         }
-        if stop == Some(parent_id.as_str()) {
+        if stop == Some(parent_id) {
             break;
         }
         cursor = parent_id;
@@ -2303,6 +2359,8 @@ pub struct MaskCache {
 }
 
 struct CachedMask {
+    /// Placement of the retained consumption binding, independent of local texel identity.
+    origin: [f64; 2],
     /// `None` for a full-rect mask (binds the shared white texture).
     _texture: Option<wgpu::Texture>,
     view: wgpu::TextureView,
@@ -2460,8 +2518,29 @@ fn box_contains(outer: &MaskPlan, inner: &MaskPlan) -> bool {
         && outer.origin[1] + outer.size[1] >= inner.origin[1] + inner.size[1]
 }
 
-/// Cache key for a geometry mask: everything its texels and its consumption uniform
-/// depend on. `ancestor_key` is the ancestor's key (`None` = uncacheable ancestor).
+/// Local coverage has no canvas-space consumers while it is drawn. Only
+/// whole-pixel translations and integral coverage origins are normalized.
+fn local_coverage(m: &MaskPlan, p: &CoveragePlacement) -> bool {
+    m.mode == 0 && m.ancestor.is_none() && !m.invert && m.feather == 0.0
+        && crate::layer_blur::translation::pixel_translation(&m.model_matrix)
+        && p.scale >= 1.0
+        && p.origin.iter().all(|v| v.is_finite() && v.fract() == 0.0 && v.abs() < 8_388_608.0)
+        && m.draws.iter().all(|d| matches!(d.paint, MaskPaint::Solid(_)))
+}
+
+fn coverage_model(m: &MaskPlan, p: &CoveragePlacement) -> [f32; 16] {
+    let mut model = m.model_matrix;
+    if local_coverage(m, p) {
+        for axis in 0..2 {
+            model[12 + axis] = (model[12 + axis] as f64 - p.origin[axis]) as f32;
+        }
+    }
+    model
+}
+
+/// Cache key for a geometry mask's texels. Local coverage excludes absolute
+/// placement; its consumption uniform is rebound when that placement changes.
+/// `ancestor_key` includes ancestor placement (`None` = uncacheable ancestor).
 fn content_key(
     m: &MaskPlan,
     full_rect: bool,
@@ -2478,8 +2557,12 @@ fn content_key(
         m.invert.hash(&mut h);
         m.feather.to_bits().hash(&mut h);
     }
-    m.origin[0].to_bits().hash(&mut h);
-    m.origin[1].to_bits().hash(&mut h);
+    let local = !full_rect && local_coverage(m, placement);
+    local.hash(&mut h);
+    for axis in 0..2 {
+        let origin = m.origin[axis] - if local { placement.origin[axis] } else { 0.0 };
+        origin.to_bits().hash(&mut h);
+    }
     m.size[0].to_bits().hash(&mut h);
     m.size[1].to_bits().hash(&mut h);
     if !full_rect {
@@ -2493,9 +2576,11 @@ fn content_key(
         }
         placement.tex.hash(&mut h);
         placement.scale.to_bits().hash(&mut h);
-        placement.origin[0].to_bits().hash(&mut h);
-        placement.origin[1].to_bits().hash(&mut h);
-        for v in &m.model_matrix {
+        if !local {
+            placement.origin[0].to_bits().hash(&mut h);
+            placement.origin[1].to_bits().hash(&mut h);
+        }
+        for v in &coverage_model(m, placement) {
             v.to_bits().hash(&mut h);
         }
         m.positions.len().hash(&mut h);
@@ -2704,7 +2789,18 @@ impl MaskAtlas {
             // Without retention only full-rect masks are keyed (their white-view
             // entry lives in the frame-local cache); everything else renders.
             if retain || full_rect[i] {
-                let anc = m.ancestor.map(|a| if a < i { keys[a] } else { None });
+                let anc = m.ancestor.map(|a| {
+                    if a >= i { return None; }
+                    keys[a].map(|key| {
+                        // A parent's local texels may stay the same while its
+                        // coverage moves relative to this child.
+                        use std::hash::Hasher;
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        h.write_u64(key);
+                        for v in placements[a].origin { h.write_u64(v.to_bits()); }
+                        h.finish()
+                    })
+                });
                 keys[i] = content_key(m, full_rect[i], anc, &placement);
             }
         }
@@ -2754,6 +2850,7 @@ impl MaskAtlas {
                     cache.entries.insert(
                         k,
                         CachedMask {
+                            origin: placements[i].origin,
                             _texture: None,
                             view: cache.white_r8_view.clone(),
                             _uniforms: uniforms,
@@ -2928,12 +3025,13 @@ impl MaskAtlas {
                 let mut buf = [0u8; MASK_GLOBALS_BYTE_SIZE as usize];
                 let f = |b: &mut [u8], off: usize, v: f32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
                 let u = |b: &mut [u8], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
-                for (j, v) in m.model_matrix.iter().enumerate() {
+                for (j, v) in coverage_model(m, &placements[i]).iter().enumerate() {
                     f(&mut buf, j * 4, *v);
                 }
                 let pl = &placements[i];
-                f(&mut buf, 64, pl.origin[0] as f32);
-                f(&mut buf, 68, pl.origin[1] as f32);
+                let local = local_coverage(m, pl);
+                f(&mut buf, 64, if local { 0.0 } else { pl.origin[0] as f32 });
+                f(&mut buf, 68, if local { 0.0 } else { pl.origin[1] as f32 });
                 f(&mut buf, 72, inv_or_zero(pl.size[0]));
                 f(&mut buf, 76, inv_or_zero(pl.size[1]));
                 u(&mut buf, 80, m.mode);
@@ -3286,7 +3384,14 @@ impl MaskAtlas {
             match sources[i] {
                 Source::Cached => {
                     let e = &cache.entries[&keys[i].expect("cached masks are keyed")];
-                    bind_groups.push(e.bind_group.clone());
+                    if !full_rect[i] && local_coverage(&masks[i], &placements[i]) && e.origin != placements[i].origin {
+                        let (uniforms, group) = consumption_group(device, queue, mask_bgl, cache,
+                            &masks[i], &placements[i], &e.view);
+                        buffers.push(uniforms);
+                        bind_groups.push(group);
+                    } else {
+                        bind_groups.push(e.bind_group.clone());
+                    }
                 }
                 Source::Render(r) => {
                     let view = render_views[r].clone();
@@ -3309,6 +3414,7 @@ impl MaskAtlas {
                             if let Some(old) = cache.entries.insert(
                                 k,
                                 CachedMask {
+                                    origin: placements[i].origin,
                                     _texture: Some(texture),
                                     view,
                                     _uniforms: uniforms,
@@ -3645,10 +3751,86 @@ fn upload_texture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rendered_text_capture_key_tracks_its_sources_not_unrelated_glyphs() {
+        let document = moda_scene::value::json!({
+            "nodes": [
+                {"id":"parent", "type":"group", "children":["mask", "other"]},
+                {"id":"mask", "type":"group", "children":["text"]},
+                {"id":"text", "type":"richtext", "vorkText":[0,0,1], "width":100, "height":30},
+                {"id":"other", "type":"richtext", "vorkText":[1,0,1], "width":100, "height":30}
+            ],
+            "pages":[{"id":"page", "width":300, "height":200, "nodeIds":["parent"]}],
+            "config":{}, "canvasRootNodeIds":[], "layoutMode":"vertical"
+        });
+        let key = |value: &moda_scene::value::Value| {
+            let scene = Scene::load(value).unwrap();
+            super::rendered_mask_cache_key(&scene, "mask")
+        };
+        let original = key(&document);
+        assert!(original.is_some());
+        let mut changed = document.clone();
+        changed["nodes"][3]["vorkText"][2] = moda_scene::value::json!(2);
+        assert_eq!(key(&changed), original);
+        for (node, field, value) in [
+            (2, "vorkText", moda_scene::value::json!([0,0,2])),
+            (0, "x", moda_scene::value::json!(10)),
+            (1, "opacity", moda_scene::value::json!(0.5)),
+            (2, "visible", moda_scene::value::json!(false)),
+        ] {
+            let mut changed = document.clone();
+            changed["nodes"][node][field] = value;
+            assert_ne!(key(&changed), original, "{field}");
+        }
+        let mut page = document.clone();
+        page["pages"][0]["width"] = moda_scene::value::json!(400);
+        assert_ne!(key(&page), original, "page clipping/layout participates");
+        let mut outside = document.clone();
+        outside["nodes"][1]["clipMaskNodeId"] = moda_scene::value::json!("other");
+        assert!(key(&outside).is_none(), "external mask dependencies are not eligible");
+        let mut native_text = document;
+        native_text["nodes"][2].as_object_mut().unwrap().remove("vorkText");
+        assert!(key(&native_text).is_none(), "native layout can read area/thread sources");
+    }
+
     use super::*;
 
     fn scene(json: moda_scene::value::Value) -> Scene {
         Scene::load(&json).unwrap()
+    }
+
+    #[test]
+    fn local_mask_key_preserves_phase_and_content() {
+        let s = scene(moda_scene::value::json!({
+            "nodes":[
+                {"id":"g","type":"group","x":40,"y":30,"children":["m","c"],"clipMaskNodeId":"m"},
+                {"id":"m","type":"ellipse","width":60,"height":40,
+                 "fills":[{"id":"f","paint":{"type":"solid","color":"#ffffff"}}]},
+                {"id":"c","type":"rectangle","width":80,"height":80}
+            ],
+            "pages":[{"id":"p","width":300,"height":200,"nodeIds":["g"]}]
+        }));
+        let mut masks = PlanMasks::default();
+        let r = masks.mask_ref_for_node(&s, "c").unwrap();
+        let mut m = masks.masks[r.mask_id as usize].clone();
+        let key = |m: &MaskPlan| {
+            let p = coverage_placement(m.origin, m.size, 1., 8192);
+            content_key(m, false, None, &p).unwrap()
+        };
+        assert!(local_coverage(&m, &coverage_placement(m.origin, m.size, 1., 8192)));
+        let initial = key(&m);
+        m.origin[0] += 23.;
+        m.model_matrix[12] += 23.;
+        assert_eq!(key(&m), initial);
+        m.origin[0] += 0.25;
+        m.model_matrix[12] += 0.25;
+        assert_ne!(key(&m), initial, "fractional translation redraws");
+        m.origin[0] -= 0.25;
+        m.model_matrix[12] -= 0.25;
+        m.positions[0] += 0.5;
+        assert_ne!(key(&m), initial, "geometry changes redraw");
+        m.ancestor = Some(0);
+        assert!(!local_coverage(&m, &coverage_placement(m.origin, m.size, 1., 8192)));
     }
 
     #[test]

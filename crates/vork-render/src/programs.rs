@@ -212,6 +212,7 @@ impl Programs {
         let key = instance_key(p);
         let mut capabilities = self.compiled[self.instances[&key]].capabilities;
         if let Some(bound) = self.bound.get(&key) {
+            capabilities.scattering &= bound.scattering;
             capabilities.opacity &= bound.opacity;
             capabilities.transmission &= bound.transmission;
             capabilities.spatial_subsurface &= bound.spatial_subsurface;
@@ -303,8 +304,12 @@ pub(crate) fn pack_inputs(
         }
         let grid = crate::vdb::Grid::load(buffer, base)?;
         let offset = u32::try_from(layout.words + grids.len())?;
+        // Sparse descriptor: payload length, the NanoVDB words, then the stored
+        // range. Readers address the payload by its length; the range is for
+        // the extinction certificate.
         grids.push(u32::try_from(grid.words.len())?);
         grids.extend(grid.words);
+        grids.extend([grid.range.0.to_bits(),grid.range.1.to_bits()]);
         Ok(offset)
     })?;
     for field in &layout.fields {
@@ -755,7 +760,7 @@ pub(crate) fn compile(
 
 /// The key `compile` stores a program under; its tests probe the store with it.
 fn compile_key(abi: &Abi, identity: &vork_slang::InputIdentity) -> Result<blake3::Hash> {
-    Ok(input_key(b"program-v8", abi, &identity.identity)?.finalize())
+    Ok(input_key(b"program-v9", abi, &identity.identity)?.finalize())
 }
 
 // Launch preanalysis defers visible-loss diagnostics to the consuming traversal.
@@ -1711,7 +1716,7 @@ fn bind_input_words(
             crate::animation::Sample::String(tokens[words[field.offset] as usize].clone().into())
         } else if field.ty == vork_slang::Type::Bool {
             crate::animation::Sample::Bool(words[field.offset] != 0)
-        } else { crate::animation::Sample::Numeric(value) };
+        } else { crate::animation::Sample::numeric(value) };
         words[index / 32] |= 1 << (index % 32);
         plan.bind_material(&(name, input), vec![crate::animation::MaterialBinding {
             slot: base + field.offset, parameter: usize::MAX, storage: Some(field.ty),

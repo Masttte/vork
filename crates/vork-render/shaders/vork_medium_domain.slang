@@ -36,30 +36,33 @@ bool volume_node_hit(float3 lo,float3 hi,float3 o,float3 d,float after) {
     }
     return far>=near;
 }
-// Signed area of edge (p,q) about the sheared ray, always evaluated with its
-// endpoints in one canonical order: both triangles sharing the edge compute the
-// same rounded value with opposite signs, whatever the compiler contracts.
-// An exactly-zero edge belongs to the triangle traversing it in canonical order.
-float volume_edge(float2 p,float2 q,float facing) {
+// Canonical endpoint order preserves antisymmetry even when products contract.
+// At an exact zero use one symbolic sheared origin e=(epsilon^2,epsilon)
+// for every face: cross(p-e,q-e)=area+epsilon*(q.x-p.x)+epsilon^2*(p.y-q.y).
+// In canonical order the first coefficient is positive for unequal x; otherwise
+// the second is negative for unequal y. Coincident projected endpoints stay zero.
+float volume_edge(float2 p,float2 q) {
     let forward=p.x<q.x || (p.x==q.x && p.y<q.y);
     let lo=forward ? p : q;let hi=forward ? q : p;
     let area=lo.x*hi.y-lo.y*hi.x;
-    return area!=0. ? (forward ? area : -area) : (forward ? facing : -facing);
+    let tie=p.x!=q.x ? 1. : (p.y!=q.y ? -1. : 0.);
+    let canonical=area!=0. ? area : tie;
+    return forward ? canonical : -canonical;
 }
 // Watertight crossing test (Woop, Benthin and Wald 2013): a ray through an edge
 // shared by two consistently wound triangles crosses exactly one of them, so
 // winding never loses or doubles a crossing. Vertices are sheared into the ray
 // frame, where the ray is the origin; the test is in that 2D projection.
-bool volume_crosses(float3 a,float3 b,float3 c,float3 o,float3 d,float facing) {
+public bool volume_crosses(float3 a,float3 b,float3 c,float3 o,float3 d) {
     let z=abs(d.x)>abs(d.y) ? (abs(d.x)>abs(d.z) ? 0u : 2u) : (abs(d.y)>abs(d.z) ? 1u : 2u);
     var x=(z+1u)%3u;var y=(x+1u)%3u;
     if(d[z]<0.) {let swap=x;x=y;y=swap;}
     let shear=float2(d[x],d[y])/d[z];
     float3 vertices[3]={a-o,b-o,c-o};float2 projected[3];
     for(uint i=0u;i<3u;i++) {let v=vertices[i];projected[i]=float2(v[x],v[y])-shear*v[z];}
-    let u=volume_edge(projected[1],projected[2],facing);
-    let v=volume_edge(projected[2],projected[0],facing);
-    let w=volume_edge(projected[0],projected[1],facing);
+    let u=volume_edge(projected[1],projected[2]);
+    let v=volume_edge(projected[2],projected[0]);
+    let w=volume_edge(projected[0],projected[1]);
     return (u>0. && v>0. && w>0.) || (u<0. && v<0. && w<0.);
 }
 public float2 volume_boundary(uint at,float3 o,float3 d,float after,float limit,bool camera_ray=true) {
@@ -112,7 +115,7 @@ public float2 volume_boundary(uint at,float3 o,float3 d,float after,float limit,
             let edge1=b-a;let edge2=c-a;
             let cross_direction=cross(direction,edge2);let determinant=dot(edge1,cross_direction);
             if (abs(determinant)<=REG_POSITIVE_EPSILON) {continue;}
-            if (!volume_crosses(a,b,c,origin,direction,sign(determinant))) {continue;}
+            if (!volume_crosses(a,b,c,origin,direction)) {continue;}
             let delta=origin-a;let q=cross(delta,edge1);
             let t=dot(edge2,q)/determinant;
             if (t>after) {nearest=min(nearest,t);winding+=sign(determinant);}

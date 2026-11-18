@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from metal_compile import compile_all
+from metal_compile import compile_all, uninitialised_locals
 
 
 def file_scope_acceleration_structures(source):
@@ -77,6 +77,11 @@ def main():
             bad = file_scope_acceleration_structures(source)
             if bad:
                 print(f'::error file={shader}::file-scope acceleration structure: {bad}', file=sys.stderr)
+                failed += 1
+            bad = uninitialised_locals(source)
+            if bad:
+                print(f'::error file={shader}::{len(bad)} uninitialised locals, first at line {bad[0][0]}: {bad[0][1]}',
+                      file=sys.stderr)
                 failed += 1
         if args.apple:
             failed += compile_all(shaders)

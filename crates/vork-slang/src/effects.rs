@@ -1327,6 +1327,13 @@ fn evaluate_mode(
         };
         return (value,State {dependency,words,live,arguments:args.to_vec(),..Default::default()});
     }
+    // The compiler-owned medium proof module renames its private grid sampler
+    // to this reserved name. Both its eight-term dense loop and sparse reads
+    // through the installation-validated root table have bounded work. Count
+    // the call, not the walk; other analyses still follow the original body.
+    if work.is_some() && function.name.as_deref().is_some_and(|n| n.starts_with("vork_grid_sample")) {
+        return (Value::Unknown,State {work,words,arguments:args.to_vec(),..Default::default()});
+    }
     // Dense sampling is a convex interpolant clamped to the reduced finite
     // range. These words are renderer-owned publication metadata, never an
     // authored maximum. Exterior samples are exactly zero.
@@ -1839,6 +1846,7 @@ impl EffectProbe {
             coat: active(11) || active(14),
             fuzz: active(12) || active(15),
             tint: active(13) || active(16),
+            scattering: active(5) || if lit {active(4)} else {active(registry::EFFECT_SURFACE_SCATTERING as usize)},
             weighted_ior: active(registry::EFFECT_SURFACE_WEIGHTED_IOR as usize) || active(registry::EFFECT_LIT_WEIGHTED_IOR as usize),
             lobes: active(3),
             blend_lobes: match state.effects.get(&6) {
@@ -2397,6 +2405,42 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    #[ignore = "requires pinned Slang"]
+    fn final_scattering_proofs_preserve_surface_lit_and_blend_semantics() -> Result<()> {
+        let abi=Abi {aov_count:0,context:Abi::spec_context(),closure:openpbr_fields()};
+        for (result,body,lit,expected) in [
+            ("Closure","return unlit(float3(1.));","",false),
+            ("Closure","Closure c={};return c;","",true),
+            ("Closure","Closure c={};return c;","Closure lit(ShadingContext ctx,Inputs i,Lighting light) {return unlit(light.color);}",false),
+            ("Closure","return unlit(float3(1.));","Closure lit(ShadingContext ctx,Inputs i,Lighting light) {Closure c={};return c;}",true),
+            ("Blend","return add(unlit(float3(1.)),unlit(float3(2.)));","",false),
+            ("Blend","Closure c={};return blend(unlit(float3(1.)),c,i.weight);","",true),
+            ("Closure","Closure c=unlit(float3(1.));c.base_weight=1e-30;return c;","",true),
+            ("Closure","Closure c=unlit(float3(1.));c.base_weight=-1.;c.specular_weight=1.;return c;","",true),
+            ("Closure","Closure c=unlit(float3(1.));c.coat_weight=ctx.POSITION.x;return c;","",true),
+            ("Hair","Hair h={};return h;","",true),
+            ("Hair","Hair h={};return h;","Closure lit(ShadingContext ctx,Inputs i,Lighting light) {return unlit(light.color);}",true),
+        ] {
+            let source=format!("struct Inputs {{float weight=0.;}}; {result} surface(ShadingContext ctx,Inputs i) {{{body}}} {lit}");
+            let c=Compiler::discover().compile_surface(&abi,&source,Path::new("scatter.slang"),"scatter")?.capabilities;
+            assert_eq!(c.scattering,expected,"{source}");
+        }
+        let textured="struct Inputs {Image map;}; Closure surface(ShadingContext ctx,Inputs i) {Closure c=unlit(float3(1.));c.fuzz_weight=sample(i.map,ctx.TEXCOORD_0,ctx).r;return c;}";
+        assert!(Compiler::discover().compile_surface(&abi,textured,Path::new("textured_scatter.slang"),"texturedscatter")?.capabilities.scattering);
+        for lit in [false,true] {
+            let body="Closure c=unlit(float3(1.));c.base_weight=i.weight;return c;";
+            let stages=if lit {format!("Closure surface(ShadingContext ctx,Inputs i) {{Closure c={{}};return c;}} Closure lit(ShadingContext ctx,Inputs i,Lighting light) {{{body}}}")} else {format!("Closure surface(ShadingContext ctx,Inputs i) {{{body}}}")};
+            let source=format!("struct Inputs {{float weight=0.;}}; {stages}");
+            let program=Compiler::discover().compile_surface(&abi,&source,Path::new("bound_scatter.slang"),"boundscatter")?;
+            for (weight,dynamic,expected) in [(0.,false,false),(0.,true,true),(1e-30,false,true),(-1.,false,true)] {
+                let c=instance_capabilities(&program,serde_json::json!({"weight":weight}),if dynamic {&["weight"]} else {&[]})?;
+                assert_eq!(c.scattering,expected,"lit {lit}, weight {weight}, dynamic {dynamic}");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires pinned Slang"]
     fn coat_anisotropy_and_weighted_ior_proofs_are_independent() -> Result<()> {

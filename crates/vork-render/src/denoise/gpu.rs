@@ -542,7 +542,8 @@ mod tests {
             for (i,pixel) in data.chunks_exact(16).enumerate() {
                 let actual:[f32;4]=std::array::from_fn(|c| f32::from_ne_bytes(pixel[c*4..c*4+4].try_into().unwrap()));
                 let mut expected=associated[i].map(|x|x/samples as f32);
-                if guides[2*i][3]>0. {for c in 0..3 {expected[c]=color[i][c]*expected[3];}}
+                // Production installs the filtered associated colour as it is.
+                if guides[2*i][3]>0. {for c in 0..3 {expected[c]=color[i][c];}}
                 for c in 0..4 {assert!((actual[c]-expected[c]).abs()*(if c<3 {scale} else {1.})<2e-4,"{size:?} guided={guided} pixel {i}: {actual:?} != {expected:?}");}
             }
             drop(data);readback.unmap();

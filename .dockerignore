@@ -2,3 +2,6 @@
 target
 node_modules
 packages
+
+# Preparation runs outside Docker; only the fixed compiler store is an input.
+shader-reuse/preparation

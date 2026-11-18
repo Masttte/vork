@@ -44,6 +44,8 @@ pub(crate) struct SlangScene {
     pub(crate) unit_ior: bool,
     /// All possible transmitting closures have unit weight; opaque weights do not occupy media.
     pub(crate) unit_boundary_ior: bool,
+    /// Every possible mesh source has constant builtin emission and coverage.
+    pub(crate) constant_mesh_emission: bool,
     /// No installed record uses glTF boundary tint semantics.
     pub(crate) no_gltf_tint: bool,
     /// No installed material can produce film, including secondary ray hits.
@@ -136,8 +138,8 @@ impl SlangScene {
             }
         }
         if !self.field_controls && !matches!(kernel,Some(ProgramKernel::Path {..})) {kernel_defines.push("-DVORK_NO_IMPLICIT".into());}
-        // A scene's own path kernel also states two absences its installed key
-        // proves (forward_variant: the union of everything the scene installs)
+        // Exact and covering path kernels retain the material-family facts
+        // proving absent film and implicit geometry. State those absences
         // as source, where the key's constants reach too late: without them
         // Slang instantiates and inlines the implicit-field traversal and the
         // thin-film spectra into the transport loop before anything folds, and
@@ -145,15 +147,28 @@ impl SlangScene {
         // The kernel's identity already holds the key, so these defines add no
         // kernel: equal keys compile equal sources.
         if let Some(ProgramKernel::Path {features,..})=kernel {
-            use crate::forward_variant::{FEATURE_FILM,FEATURE_IMPLICIT_GEOMETRY,FEATURE_INSTALLED};
-            if features&FEATURE_INSTALLED!=0 {
+            use crate::forward_variant::{FEATURE_FILM,FEATURE_IMPLICIT_GEOMETRY,FEATURE_SPECIALIZED};
+            if features&FEATURE_SPECIALIZED!=0 {
                 if features&FEATURE_IMPLICIT_GEOMETRY==0 {kernel_defines.push("-DVORK_NO_IMPLICIT".into());}
                 if features&FEATURE_FILM==0 {kernel_defines.push("-DVORK_NO_FILM".into());}
             }
         }
-        if self.unit_ior {kernel_defines.push("-DVORK_UNIT_IOR".into());}
-        if self.unit_boundary_ior {kernel_defines.push("-DVORK_UNIT_BOUNDARY_IOR".into());}
-        if self.no_gltf_tint {kernel_defines.push("-DVORK_NO_GLTF_TINT".into());}
+        // A covering path key (forward_variant::covering_features) draws scenes
+        // without these proofs too, so it is compiled without them.
+        let proofs=!matches!(kernel,Some(ProgramKernel::Path {features,..})
+            if features & crate::forward_variant::FEATURE_SPECIALIZED!=0 && features & crate::forward_variant::FEATURE_INSTALLED==0);
+        if self.unit_ior && proofs {kernel_defines.push("-DVORK_UNIT_IOR".into());}
+        if self.unit_boundary_ior && proofs {kernel_defines.push("-DVORK_UNIT_BOUNDARY_IOR".into());}
+        if self.no_gltf_tint && proofs {kernel_defines.push("-DVORK_NO_GLTF_TINT".into());}
+        // Only the exact installed path kernel owns this source-domain proof.
+        // Covering kernels and the prebuilt engine retain general evaluation.
+        // Compiler arguments participate in the ordinary input/cache identity.
+        // Media kernels retain the general source evaluator: this shortcut
+        // currently fails paired transport qualification with installed media.
+        if self.constant_mesh_emission && !self.gaussians && matches!(kernel,
+            Some(ProgramKernel::Path {features,media:None,..}) if features & crate::forward_variant::FEATURE_INSTALLED != 0) {
+            kernel_defines.push("-DVORK_CONSTANT_MESH_EMISSION".into());
+        }
         if self.no_points {kernel_defines.push("-DVORK_NO_POINTS".into());}
         if !self.gaussians {kernel_defines.push("-DVORK_NO_GAUSSIANS".into());}
         if self.no_shadow_containment {kernel_defines.push("-DVORK_NO_SHADOW_CONTAINMENT".into());}
@@ -171,11 +186,14 @@ impl SlangScene {
         }
         if let Some(ProgramKernel::Path {media:Some(count),..})=kernel {
             let native=path_medium.expect("installed path medium");
+            if native.opaque_views {kernel_defines.push("-DVORK_OPAQUE_MEDIA_VIEWS".to_owned());}
             if native.convex {
                 kernel_defines.push("-DVORK_MEDIUM_CONVEX".to_owned());
             }
             if let Some(limit)=native.work_limit {kernel_defines.push(format!("-DVORK_MEDIUM_WORK_LIMIT={limit}"));}
-            if !native.homogeneous && native.scattering_free && native.emission_free {kernel_defines.push("-DVORK_MEDIUM_ABSORPTION_ONLY".to_owned());}
+            if native.dense_grids_only {kernel_defines.push("-DVORK_DENSE_GRIDS_ONLY=1".to_owned());}
+            if !native.homogeneous && !native.emission_free {kernel_defines.push("-DVORK_MEDIUM_EMISSION".to_owned());}
+            if !native.homogeneous && native.finite_homogeneous && native.scattering_free && native.emission_free {kernel_defines.push("-DVORK_MEDIUM_ABSORPTION_ONLY".to_owned());}
             kernel_defines.extend(["-DVORK_PATH_MEDIA".to_owned(),format!("-DVORK_PATH_MEDIUM_BOUNDS={count}"),format!("-DVORK_PATH_HETEROGENEOUS={}",u8::from(!native.homogeneous))]);
         }
         // Secondary hits can reach every installed material. The same union
@@ -342,7 +360,9 @@ impl SlangScene {
         let inputs=(if secondary {all_programs} else {programs}).map(|p|p.inputs.as_slice()).unwrap_or(&[]);
         consume(&modules,&args,&identities,inputs,EntryTransforms {
             localize_blends:transport_outlining && !metal,
-            inline_metal:metal && matches!(kernel,Some(ProgramKernel::Decoupled {stage:ShadeStage::Evaluate,..})),
+            // Keep the native optimizer from re-expanding large authored path graphs.
+            // The limit counts optimized SPIR-V instructions, including declarations.
+            driver_inline_limit: (!metal && programs.is_some() && matches!(kernel, Some(ProgramKernel::Path {..}))).then_some(100_000),
             driver_inline:(self.field_controls || surface_outlining || transport_outlining || camera_surface_outlining) && !metal && (!camera_outlining || camera_surface_outlining),
         })
     }
@@ -404,14 +424,18 @@ struct Entry {
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EntryTransforms {
     pub(crate) localize_blends:bool,
-    pub(crate) inline_metal:bool,
     pub(crate) driver_inline:bool,
+    pub(crate) driver_inline_limit:Option<u32>,
 }
 impl EntryTransforms {
     pub(crate) fn prefix(self,threads:(u32,u32,u32))->blake3::Hasher {
         let mut hash=blake3::Hasher::new();
-        hash.update(b"native-entry-transforms-v1");
-        hash.update(&[u8::from(self.localize_blends),u8::from(self.inline_metal),u8::from(self.driver_inline)]);
+        hash.update(b"native-entry-transforms-v2");
+        hash.update(&[u8::from(self.localize_blends),u8::from(self.driver_inline)]);
+        if let Some(limit)=self.driver_inline_limit {
+            hash.update(b"driver-inline-budget-v1");
+            hash.update(&limit.to_le_bytes());
+        }
         for size in [threads.0,threads.1,threads.2] {hash.update(&size.to_le_bytes());}
         hash
     }
@@ -611,10 +635,9 @@ impl SlangForward {
                 code=compiler.localize_native_blends(&code)?;
                 crate::timing::creation(&self.device,label,"SPIR-V optimization",start.elapsed().as_secs_f64()*1000.,0.);
             }
-            if transforms.inline_metal {
-                code=crate::camera_native::inline_metal_functions(&code);
+            if transforms.driver_inline {
+                vork_slang::spirv::allow_driver_inlining_below(&mut code, transforms.driver_inline_limit.unwrap_or(u32::MAX) as usize)?;
             }
-            if transforms.driver_inline { allow_driver_inlining(&mut code)?; }
             Ok(code)
         })?;
         Ok(Lookup::Built(if self.metal {
@@ -1285,8 +1308,8 @@ mod tests {
         for receipt in pending {
             assert!(take_prepared(&prepared,&receipt,&[]).is_none(),"an imported edit invalidates retained snapshots as well as disk receipts");
         }
-        let ordinary=EntryTransforms {localize_blends:false,inline_metal:false,driver_inline:false}.prefix((1,1,1)).finalize();
-        for transform in [EntryTransforms {localize_blends:true,inline_metal:false,driver_inline:false},EntryTransforms {localize_blends:false,inline_metal:true,driver_inline:false},EntryTransforms {localize_blends:false,inline_metal:false,driver_inline:true}] {
+        let ordinary=EntryTransforms {driver_inline_limit:None,localize_blends:false,driver_inline:false}.prefix((1,1,1)).finalize();
+        for transform in [EntryTransforms {driver_inline_limit:None,localize_blends:true,driver_inline:false},EntryTransforms {driver_inline_limit:None,localize_blends:false,driver_inline:true},EntryTransforms {driver_inline_limit:Some(100_000),localize_blends:false,driver_inline:false}] {
             assert_ne!(ordinary,transform.prefix((1,1,1)).finalize());
         }
         std::fs::remove_dir_all(root)?;
@@ -1387,6 +1410,37 @@ mod tests {
             for changed in [SlangScene {field_controls:true,..base.clone()},SlangScene {connection_transmission:true,..base.clone()}] {
                 assert_ne!(ordinary,changed.test_entry_inputs(main,entry,kernel).1,"{main}: consumed code/outlining input");
             }
+        }
+        // A covering path key draws scenes without the unit-IOR and tint proofs,
+        // so it is compiled without them and is the same kernel whichever scene asks.
+        use crate::forward_variant::{FEATURE_SPECIALIZED,FEATURE_INSTALLED};
+        let scene_key=ProgramKernel::Path {adaptive:false,catchers:false,random_walk:false,features:FEATURE_SPECIALIZED|FEATURE_INSTALLED,boundaries:0,emitter_profiles:false,media:None};
+        let covering=scene_key.covering().unwrap();
+        let proven=SlangScene {unit_ior:true,unit_boundary_ior:true,no_gltf_tint:true,constant_mesh_emission:true,..base.clone()};
+        let request=|scene:&SlangScene,kernel|scene.test_entry_inputs("path_programs_fixed",("path_programs_fixed","compute"),Some(kernel));
+        for define in ["-DVORK_UNIT_IOR","-DVORK_UNIT_BOUNDARY_IOR","-DVORK_NO_GLTF_TINT","-DVORK_CONSTANT_MESH_EMISSION"] {
+            assert!(request(&proven,scene_key).0.iter().any(|arg|arg==define),"{define}: a scene key keeps its proofs");
+            assert!(!request(&proven,covering).0.iter().any(|arg|arg==define),"{define}: a covering key carries none");
+        }
+        assert_eq!(request(&proven,covering),request(&base,covering),"one covering kernel for both scenes");
+        let constant=SlangScene {constant_mesh_emission:true,..base.clone()};
+        assert_ne!(request(&constant,scene_key),request(&base,scene_key),"source proof participates in compiler/cache identity");
+        let engine=scene_key.path_engine().unwrap();
+        assert_eq!(request(&constant,engine),request(&base,engine),"first-picture engine keeps the general evaluator");
+        let gaussian=SlangScene {gaussians:true,..constant};
+        assert!(!request(&gaussian,scene_key).0.iter().any(|arg|arg=="-DVORK_CONSTANT_MESH_EMISSION"),"Gaussian coverage is not record-constant");
+        let media=SlangScene {constant_mesh_emission:true,medium:Some(Arc::new(crate::medium::Native::default())),..base.clone()};
+        let media_key=ProgramKernel::Path {adaptive:false,catchers:false,random_walk:false,features:FEATURE_SPECIALIZED|FEATURE_INSTALLED,boundaries:0,emitter_profiles:false,media:Some(0)};
+        assert!(!request(&media,media_key).0.iter().any(|arg|arg=="-DVORK_CONSTANT_MESH_EMISSION"),"installed media retain qualified source evaluation");
+        for define in ["-DVORK_NO_FILM", "-DVORK_NO_IMPLICIT"] {
+            assert!(request(&base,covering).0.iter().any(|arg|arg==define),
+                "covering retains material-family proof: {define}");
+        }
+        let present=ProgramKernel::Path {features:FEATURE_SPECIALIZED|FEATURE_INSTALLED
+            |crate::forward_variant::FEATURE_FILM|crate::forward_variant::FEATURE_IMPLICIT_GEOMETRY,
+            adaptive:false,catchers:false,random_walk:false,boundaries:0,emitter_profiles:false,media:None};
+        for define in ["-DVORK_NO_FILM", "-DVORK_NO_IMPLICIT"] {
+            assert!(!request(&base,present.covering().unwrap()).0.iter().any(|arg|arg==define));
         }
     }
 

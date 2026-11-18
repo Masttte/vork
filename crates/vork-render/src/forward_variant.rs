@@ -71,10 +71,23 @@ pub const FEATURE_SUBSURFACE: FeatureMask = 1 << 76;
 pub const FEATURE_HAIR: FeatureMask = 1 << 77;
 /// The key is the union of every installed material (materials.rs
 /// `installed_features`), so a capability it lacks is absent from the whole scene.
-/// Only such a key may state the scene-wide proofs (surface.slang
-/// `installed_surface`): a raster or hit key without this bit never carries the
-/// unions above, and reading them as proofs would drop a lobe.
+/// Such a key may state the scene-wide proofs (surface.slang
+/// `installed_surface`). Ordinary raster/hit keys never carry these unions;
+/// reading their missing bits as proofs would drop a lobe. Covering keys retain
+/// the three scene unions and state them through their explicit tag below.
 pub const FEATURE_INSTALLED: FeatureMask = 1 << 79;
+/// A covering key retains the material unions but not the scene's source-level
+/// IOR/tint proofs. All combinations of these unions are prepared, so retaining
+/// their arithmetic does not turn a changed union into a bundle miss.
+pub const FEATURE_COVERING: FeatureMask = 1 << 80;
+/// Some final installed closure scatters. Only exact installed keys consume
+/// its absence; covering kernels retain scattering independently of pre-lit work.
+pub const FEATURE_SCATTERING: FeatureMask = 1 << 81;
+/// Some installed material evaluates scalar surface coverage. Absence is a
+/// proof only in a scene-union key; covering kernels retain the reader.
+/// Transmission alone does not imply partial coverage.
+pub const FEATURE_SURFACE_COVERAGE: FeatureMask = 1 << 82;
+pub const FEATURE_SCENE_UNIONS: FeatureMask = FEATURE_NULL_CONNECTION | FEATURE_SUBSURFACE | FEATURE_HAIR;
 /// Hashed (dithered) camera coverage: the entry declares SV_PrimitiveID.
 /// Declaring that input costs every draw of the pipeline, measured +8% of a
 /// motion-blurred car's controls pass on L4, so table entries declare it only
@@ -184,6 +197,27 @@ impl Capability {
     fn literal(self) -> String { match self { Self::Bool(value)=>value.to_string(), Self::Uint(value)=>format!("{value}u") } }
 }
 
+/// A scene's path key at the value of every refinement fact that is correct for
+/// any scene with the same materials and retained unions: its covering kernel.
+///
+/// A path key states two kinds of fact. Which closures, textures and geometry
+/// the materials install decides most of the kernel's code. The refinement facts
+/// each remove a little: the light kinds installed, the proof that no camera
+/// starts inside a solid, scalar coverage, weighted IOR, glTF tint, coat anisotropy,
+/// and the scene proofs passed as compile definitions (unit IOR, unit boundary
+/// IOR, no glTF tint; slang_forward.rs withholds them from this key). They vary
+/// independently. Hair, subsurface and null connections retain their scene-union
+/// facts: weakening those proofs changes sampler arithmetic and GPU cost. Every
+/// prepared family supplies all eight combinations. The covering tag permits
+/// these unions in the shader while withholding the source-level IOR/tint proofs.
+/// Final scattering presence is an exact-key refinement: covers retain scattering
+/// and erase its bit, so it adds no prepared combination.
+pub fn covering_features(f: FeatureMask) -> FeatureMask {
+    f & !(FEATURE_INSTALLED | FEATURE_CAMERA_EXTERIOR | FEATURE_SCATTERING)
+        | FEATURE_COVERING
+        | FEATURE_LIGHT_TYPES | FEATURE_WEIGHTED_IOR | FEATURE_GLTF_TINT | FEATURE_COAT_ANISOTROPY | FEATURE_SURFACE_COVERAGE
+}
+
 // Field order is the internal SPIR-V SpecId ABI. Both the shipped declarations
 // and per-scene values come from this list, including texture masks and light kinds.
 pub fn variant_capabilities(f: FeatureMask, ray_shadows: bool, subsurface: bool, emitter_profiles: bool) -> Vec<(&'static str, Capability)> {
@@ -192,7 +226,8 @@ pub fn variant_capabilities(f: FeatureMask, ray_shadows: bool, subsurface: bool,
     let record = |b: FeatureMask| if f & FEATURE_EXACT_RECORD != 0 {f & b != 0} else {bit(b)};
     // A scene union is a proof only in a key that is one. Every other key, the
     // specialized raster and hit keys included, keeps the capability.
-    let scene = |b: FeatureMask| f & FEATURE_INSTALLED == 0 || f & b != 0;
+    let installed = f & (FEATURE_INSTALLED | FEATURE_COVERING) != 0;
+    let scene = |b: FeatureMask| !installed || f & b != 0;
     let textures = (f >> 2) & ((1 << TEXTURE_FEATURES) - 1);
     let (lo, hi, light_types) = if specialized {
         (
@@ -240,7 +275,9 @@ pub fn variant_capabilities(f: FeatureMask, ray_shadows: bool, subsurface: bool,
         ("has_camera_interior", Capability::Bool(!specialized || f & FEATURE_CAMERA_EXTERIOR == 0)),
         ("has_subsurface", Capability::Bool(scene(FEATURE_SUBSURFACE))),
         ("has_hair", Capability::Bool(scene(FEATURE_HAIR))),
-        ("installed", Capability::Bool(f & FEATURE_INSTALLED != 0)),
+        ("has_scattering", Capability::Bool(f & FEATURE_INSTALLED == 0 || f & FEATURE_SCATTERING != 0)),
+        ("installed", Capability::Bool(installed)),
+        ("has_surface_coverage", Capability::Bool(scene(FEATURE_SURFACE_COVERAGE))),
     ]
 }
 
@@ -401,13 +438,29 @@ mod capability_tests {
         assert!(variant_module(FEATURE_SPECIALIZED,false,false,false,None,"").contains("static const bool has_camera_interior = true;"));
     }
 
+    #[test]
+    fn full_coverage_requires_an_installed_scene_proof() {
+        let coverage=|features| variant_capabilities(features,false,false,false).into_iter()
+            .find(|(name,_)|*name=="has_surface_coverage").unwrap().1;
+        for features in [0, FEATURE_SPECIALIZED, FEATURE_SPECIALIZED|FEATURE_SURFACE_COVERAGE] {
+            assert_eq!(coverage(features),Capability::Bool(true),"a material key proves nothing about other candidates");
+        }
+        let scene=FEATURE_SPECIALIZED|FEATURE_INSTALLED|FEATURE_TRANSMISSION|FEATURE_SOLID_TRANSMISSION;
+        assert_eq!(coverage(scene),Capability::Bool(false),"glass may have full scalar coverage");
+        assert_eq!(coverage(scene|FEATURE_SURFACE_COVERAGE),Capability::Bool(true));
+        assert_eq!(coverage(covering_features(scene)),Capability::Bool(true));
+        assert_eq!(covering_features(scene),covering_features(scene|FEATURE_SURFACE_COVERAGE));
+        assert_ne!(variant_module(scene,false,false,false,None,""),
+            variant_module(scene|FEATURE_SURFACE_COVERAGE,false,false,false,None,""));
+    }
+
     /// The generated key module is compiler input, so the compiled-shader cache
     /// identity follows the feature set: one key, one text, and any capability
     /// added or removed is a different kernel.
     #[test]
     fn a_kernel_key_names_its_scene_unions() {
         let module=|features| variant_module(FEATURE_SPECIALIZED|FEATURE_INSTALLED|features,false,false,false,None,"");
-        for (name,bit) in [("has_null_connection",FEATURE_NULL_CONNECTION),("has_subsurface",FEATURE_SUBSURFACE),("has_hair",FEATURE_HAIR)] {
+        for (name,bit) in [("has_null_connection",FEATURE_NULL_CONNECTION),("has_subsurface",FEATURE_SUBSURFACE),("has_hair",FEATURE_HAIR),("has_scattering",FEATURE_SCATTERING)] {
             assert!(module(0).contains(&format!("static const bool {name} = false;")),"{name}");
             assert!(module(bit).contains(&format!("static const bool {name} = true;")),"{name}");
             assert_ne!(module(0),module(bit),"{name}");
@@ -417,19 +470,27 @@ mod capability_tests {
 
     /// A scene union is absent from a raster or hit key because that key is not the
     /// scene's, not because the scene lacks it. Only a key that says it is the
-    /// union turns the absence into a proof; every other key keeps the capability.
+    /// union turns the absence into a proof. Covering keys retain those unions;
+    /// ordinary raster/hit keys keep every capability.
     #[test]
-    fn scene_unions_are_proofs_only_in_a_scene_key() {
+    fn scene_proofs_require_a_scene_or_covering_key() {
         let value=|features,field:&str| variant_capabilities(features,false,false,false).into_iter().find(|(name,_)|*name==field).unwrap().1;
-        for (field,bit) in [("has_null_connection",FEATURE_NULL_CONNECTION),("has_subsurface",FEATURE_SUBSURFACE),("has_hair",FEATURE_HAIR)] {
+        for (field,bit) in [("has_null_connection",FEATURE_NULL_CONNECTION),("has_subsurface",FEATURE_SUBSURFACE),("has_hair",FEATURE_HAIR),("has_scattering",FEATURE_SCATTERING)] {
             for other in [0,FEATURE_SPECIALIZED,FEATURE_SPECIALIZED|FEATURE_COAT|FEATURE_TRANSMISSION,(SHADING_LAYERS|SHADING_METAL) as FeatureMask] {
                 assert_eq!(value(other,field),Capability::Bool(true),"{field}: {other:#x} is not a scene key");
             }
             assert_eq!(value(FEATURE_SPECIALIZED|FEATURE_INSTALLED,field),Capability::Bool(false),"{field}");
             assert_eq!(value(FEATURE_SPECIALIZED|FEATURE_INSTALLED|bit,field),Capability::Bool(true),"{field}");
         }
-        for (features,installed) in [(0,false),(FEATURE_SPECIALIZED,false),(u128::MAX & !FEATURE_INSTALLED,false),(FEATURE_SPECIALIZED|FEATURE_INSTALLED,true)] {
+        for (features,installed) in [(0,false),(FEATURE_SPECIALIZED,false),(u128::MAX & !(FEATURE_INSTALLED|FEATURE_COVERING),false),
+            (FEATURE_SPECIALIZED|FEATURE_INSTALLED,true),(FEATURE_SPECIALIZED|FEATURE_COVERING,true)] {
             assert_eq!(value(features,"installed"),Capability::Bool(installed),"{features:#x}");
+        }
+        for tag in [FEATURE_INSTALLED,FEATURE_COVERING] {
+            for (field,bit) in [("has_null_connection",FEATURE_NULL_CONNECTION),("has_subsurface",FEATURE_SUBSURFACE),("has_hair",FEATURE_HAIR)] {
+                assert_eq!(value(FEATURE_SPECIALIZED|tag,field),Capability::Bool(false));
+                assert_eq!(value(FEATURE_SPECIALIZED|tag|bit,field),Capability::Bool(true));
+            }
         }
     }
 

@@ -866,7 +866,7 @@ pub(crate) fn set_item_mask_id(item: &mut DrawItem, id: u64) {
 /// is `linear_depth` of its z, and its z moves exactly — an integer or quarter
 /// z always does; another fraction (a copy's or a placed brush's share of a
 /// slot) only within one binade, where `(z + f) + dz` rounds as `(z + dz) + f`.
-fn z_shiftable(item: &DrawItem, dz: i64) -> bool {
+pub(crate) fn z_shiftable(item: &DrawItem, dz: i64) -> bool {
     let z_ok = |z: f64| {
         let a = z.floor();
         if (z * 4.0).fract() == 0.0 {
@@ -900,12 +900,12 @@ fn z_shiftable(item: &DrawItem, dz: i64) -> bool {
                 && group.items.iter().all(|i| z_shiftable(i, dz))
                 && group.coverage.iter().all(|i| z_shiftable(i, dz))
         }
-        DrawItem::BackdropSplit(_) | DrawItem::PageFill { .. } => true,
+        DrawItem::Vacant | DrawItem::BackdropSplit(_) | DrawItem::PageFill { .. } => true,
     }
 }
 
 /// Move `item` by `dz` in render-z ([`z_shiftable`] must hold).
-fn shift_item_z(item: &mut DrawItem, dz: i64) {
+pub(crate) fn shift_item_z(item: &mut DrawItem, dz: i64) {
     let d = dz as f64;
     let depth = |z: f64| crate::depth::linear_depth(z) as f32;
     match item {
@@ -943,7 +943,7 @@ fn shift_item_z(item: &mut DrawItem, dz: i64) {
                 shift_item_z(i, dz);
             }
         }
-        DrawItem::BackdropSplit(_) | DrawItem::PageFill { .. } => {}
+        DrawItem::Vacant | DrawItem::BackdropSplit(_) | DrawItem::PageFill { .. } => {}
     }
 }
 

@@ -20,6 +20,9 @@ pub const PREVIS_SAMPLES: u32 = 4;
 pub const OUTPUT_CHANNELS: &[&str] = &["color", "depth", "object_index", "view_normal", "motion", "camera", "shadow_catcher"];
 /// OpenPBR Surface 1.1.1 parameters, generated from `openpbr-params.md` (the spec's reference table).
 pub const OPENPBR: &[OpenPbrParam] = include!(concat!(env!("OUT_DIR"), "/openpbr.rs"));
+/// Inputs consumed by the GPU table. Approximation-only metadata cannot change
+/// material layouts, shader identities or installed transport capabilities.
+pub const OPENPBR_TABLE: &[OpenPbrParam] = include!(concat!(env!("OUT_DIR"), "/openpbr_table.rs"));
 
 /// Blender 5.2.1 render defaults: 1920 x 1080 at 24 fps.
 pub(super) const RESOLUTION: [u32; 2] = [1920, 1080];

@@ -121,7 +121,7 @@ mod tests {
     #[ignore = "requires pinned Slang; compile in code-only phase"]
     fn compute_imports_bundled_library_modules() -> Result<()> {
         // Simulation templates require caller-owned buffers/configuration; covered below.
-        for module in library_modules().filter(|module| !module.material && !module.name.starts_with("fluid/") && !module.name.starts_with("cloth/")) {
+        for module in library_modules().filter(|module| !module.material && !module.name.starts_with("fluid/") && !module.name.starts_with("cloth/") && !module.name.starts_with("smoke/")) {
             let source = format!(
                 "import {}; {} void compute(ComputeContext ctx, Inputs inputs) {{ uint3 id=ctx.id; uint frame=ctx.frame; float time=ctx.time; float dt=ctx.dt; }}",
                 module.name.replace('/', "."),
@@ -141,6 +141,62 @@ mod tests {
                 program.dependencies.is_empty(),
                 "embedded module workspaces must not enter dependency paths"
             );
+        }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires pinned Slang"]
+    fn compute_includes_smoke_templates() -> Result<()> {
+        // Smoke is an inclusion template, like fluid and cloth: module imports
+        // cannot see the caller's domain constants, typed bindings or callbacks.
+        let mut bindings = String::from(
+            "struct Tick {uint frame;float time;float dt;uint reserved;};
+             [[vk::binding(0,0)]] ConstantBuffer<Tick> vork_tick;
+             struct Offset {uint4 value;};
+             [[vk::binding(1,0)]] ConstantBuffer<Offset> vork_offset;");
+        for (slot, (name, ty)) in [
+            ("d", "float"), ("t", "float"), ("fuel", "float"),
+            ("d1", "float"), ("t1", "float"), ("fuel1", "float"),
+            ("v", "float3"), ("v1", "float3"), ("v2", "float3"),
+            ("rhs", "float"), ("pressure", "float"),
+        ].into_iter().enumerate() {
+            bindings += &format!(
+                "[[vk::binding({},0)]] RWStructuredBuffer<{ty}> {name}_buffer;
+                 {ty} {name}_load(uint i) {{return {name}_buffer[i];}}
+                 void {name}_store(uint i,{ty} value) {{{name}_buffer[i]=value;}}",
+                slot + 2);
+        }
+        for module in library_modules().filter(|module| module.name.starts_with("smoke/")) {
+            let entry = match module.name {
+                "smoke/grid" => "d_store(ctx.id.x, smoke_position(float3(smoke_cell(ctx.id.x))).x);",
+                "smoke/advect" => "smoke_advect(ctx);",
+                "smoke/sources" => "smoke_sources(ctx, inputs);",
+                "smoke/forces" => "smoke_forces(ctx, inputs);",
+                "smoke/divergence" => "smoke_divergence(ctx);",
+                "smoke/pressure" => "smoke_pressure(ctx, inputs.colour, 1.5);",
+                "smoke/project" => "smoke_project(ctx);",
+                other => panic!("add a configured smoke entry for {other}"),
+            };
+            let source = format!(r#"
+                static const int3 SMOKE_DIMS=int3(8,10,12);
+                static const float3 SMOKE_CELL=float3(.15,.2,.25), SMOKE_ORIGIN=float3(-1.,2.,-3.);
+                struct Inputs {{int colour=0; float strength=1.;}};
+                float3 smoke_source(float3 p,float time,float dt,float3 value,Inputs inputs) {{
+                    return value + dt * inputs.strength * float3(p.x,time,0.);
+                }}
+                float3 smoke_force(float3 p,float time,float3 value,Inputs inputs) {{
+                    return float3(0.,value.y * inputs.strength,0.);
+                }}
+                #include "{}.slang"
+                void compute(ComputeContext ctx,Inputs inputs) {{{entry}}}
+            "#, module.name);
+            let program = Compiler::discover().compile_compute(
+                &source, Path::new("smoke-include.slang"), &bindings, 64, [960,1,1])
+                .with_context(|| format!("include {}", module.name))?;
+            ensure!(program.dependencies.is_empty(),
+                "bundled smoke includes must not depend on checkout paths");
+            assert_eq!(program.inputs.fields.len(), 2);
+            assert!(program.wgsl.contains("storage"), "the entry must retain real buffer work");
         }
         Ok(())
     }

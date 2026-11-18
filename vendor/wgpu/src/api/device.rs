@@ -278,10 +278,14 @@ impl Device {
     pub fn create_buffer(&self, desc: &BufferDescriptor<'_>) -> Buffer {
         let map_context = MapContext::new(desc.mapped_at_creation.then_some(0..desc.size));
 
+        #[cfg(std)]
+        let admission = crate::optional_allocations::admit(desc.size);
         let buffer = self.inner.create_buffer(desc);
 
         Buffer {
             inner: buffer,
+            #[cfg(std)]
+            _reservation: admission.lease,
             map_context: Arc::new(Mutex::new(map_context)),
             size: desc.size,
             usage: desc.usage,
@@ -293,10 +297,14 @@ impl Device {
     /// `desc` specifies the general format of the texture.
     #[must_use]
     pub fn create_texture(&self, desc: &TextureDescriptor<'_>) -> Texture {
+        #[cfg(std)]
+        let admission = crate::optional_allocations::admit(crate::optional_allocations::texture_bytes(desc));
         let texture = self.inner.create_texture(desc);
 
         Texture {
             inner: texture,
+            #[cfg(std)]
+            _reservation: admission.lease,
             descriptor: TextureDescriptor {
                 label: None,
                 view_formats: &[],
@@ -336,6 +344,8 @@ impl Device {
         };
         Texture {
             inner: texture.into(),
+            #[cfg(std)]
+            _reservation: None,
             descriptor: TextureDescriptor {
                 label: None,
                 view_formats: &[],
@@ -393,6 +403,8 @@ impl Device {
 
         Buffer {
             inner: buffer.into(),
+            #[cfg(std)]
+            _reservation: None,
             map_context: Arc::new(Mutex::new(map_context)),
             size: desc.size,
             usage: desc.usage,

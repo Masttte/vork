@@ -619,6 +619,7 @@ pub struct Queue {
     family_index: u32,
     relay_semaphores: Mutex<RelaySemaphores>,
     signal_semaphores: Mutex<SemaphoreList>,
+    thread_signals: semaphore_list::ThreadSignals,
     native_backlog: Mutex<native_backlog::NativeBacklog>,
 }
 
@@ -1300,6 +1301,10 @@ impl crate::Queue for Queue {
             signal_semaphores.append(&mut guard);
         }
 
+        if let Some(mut own) = self.thread_signals.take() {
+            signal_semaphores.append(&mut own);
+        }
+
         // We need to signal our wgpu::Fence if we have one, this adds it to the signal list.
         signal_fence.maintain(&self.device.raw)?;
         match *signal_fence {
@@ -1396,6 +1401,16 @@ impl crate::Queue for Queue {
 impl Queue {
     pub fn raw_device(&self) -> &ash::Device {
         &self.device.raw
+    }
+
+    /// Reserve a signal for the next submission made by this calling thread.
+    /// Unlike `add_signal_semaphore`, another producer cannot consume it. The
+    /// producer must keep the semaphore alive and submit on this thread.
+    pub fn add_thread_signal_semaphore(&self, semaphore: vk::Semaphore, semaphore_value: Option<u64>) {
+        self.thread_signals.push(match semaphore_value {
+            Some(value) => SemaphoreType::Timeline(semaphore, value),
+            None => SemaphoreType::Binary(semaphore),
+        });
     }
 
     pub fn add_signal_semaphore(&self, semaphore: vk::Semaphore, semaphore_value: Option<u64>) {

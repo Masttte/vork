@@ -4,7 +4,16 @@ Instance attributes are equal-length columns in node.instances.attributes;
 material attribute bindings select a column by name.
 Constant, image and attribute bindings share the shipped evaluator. Custom logic
 needs a surface program; constant OpenPBR parameters do not.
-emission_luminance is cd/m²; emission_color is linear RGB.
+OpenPBR defines emission_luminance in cd/m²; currently vork uses its value
+directly as scene-linear radiance. emission_color is linear RGB.
+coat_color tints light beneath the coat, including emission; coat_darkening reduces
+reflected base light. Coat absorption follows the refracted path through the layer.
+std/previs renders emissive-lit scenes using low-sample raster ray lighting and
+warns when material-emitter lighting is approximated. A fast GPU denoiser cleans
+up this preview unless denoise=false was requested. Indirect light, reflections
+and transmission may be noisy or incomplete; use std/final or std/path for exact
+lighting. Proven unlit displays and null thin transmission need no warning.
+Emission alone does not make a surface unlit.
 base_color is linear RGB; base_metalness=1
 makes metal; specular_roughness controls highlight width. Inputs and defaults:
 vork help field material.inputs
@@ -14,6 +23,11 @@ For glass panes use transmission_weight: 1 and geometry_thin_walled: true.
 Use transmission_color for glass tint and subsurface_color for scattering colour.
 Use std/path when refraction or indirect lighting is important.
 Profile coverage, emissive lighting and transport selection: vork help profiles.
+OpenPBR diffuse roughness uses Lambert diffuse. Transmission scatter and its
+anisotropy use Beer-only transmission without interior scattering. Zero values
+are neutral; nonzero values or varying bindings/tracks render with one
+approximation warning per material. Use a volume material for interior scattering.
+
 <!-- all -->
 MATERIAL REFERENCE
 Solid glass requires closed mesh boundaries; model hollow vessels with a shell.

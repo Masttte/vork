@@ -576,12 +576,15 @@ mod release_case_tests {
     /// same cases: its materials decide everything else in the key.
     #[test]
     fn a_prepared_path_scene_covers_the_same_light_and_camera_cases_whatever_its_own() {
-        let materials = FEATURE_SPECIALIZED | FEATURE_INSTALLED | FEATURE_COAT | FEATURE_SUBSURFACE;
+        let materials = FEATURE_SPECIALIZED | FEATURE_INSTALLED | FEATURE_COAT | FEATURE_SUBSURFACE | FEATURE_TRANSMISSION;
         let lights = [SUN, AREA, FEATURE_LIGHT_TYPES];
         // No solids: three light cases, the camera fact as installed.
         for camera in [0, FEATURE_CAMERA_EXTERIOR] {
             for own in [SUN, POINT, AREA, FEATURE_LIGHT_TYPES] {
-                let cases = path(materials | own | camera, 0).release_cases();
+                let scene = path(materials | own | camera, 0);
+                let cases = scene.release_cases();
+                let (cases, covers) = cases.split_at(cases.len() - 8);
+                assert!(covers.contains(&scene.covering().unwrap()));
                 assert_eq!(cases.iter().map(|&case| features(case)).collect::<Vec<_>>(),
                     lights.iter().map(|light| materials | light | camera).collect::<Vec<_>>());
             }
@@ -589,10 +592,13 @@ mod release_case_tests {
         // Solids: both camera cases for each light case, from either starting point.
         let expected: Vec<_> = lights.iter().flat_map(|light| [FEATURE_CAMERA_EXTERIOR, 0].map(|camera| materials | light | camera)).collect();
         for camera in [0, FEATURE_CAMERA_EXTERIOR] {
-            let cases = path(materials | folded_light_kinds(POINT) | camera, 2).release_cases();
+            let scene = path(materials | folded_light_kinds(POINT) | camera, 2);
+            let cases = scene.release_cases();
+            let (cases, covers) = cases.split_at(cases.len() - 8);
+            assert!(covers.contains(&scene.covering().unwrap()));
             assert_eq!(cases.iter().map(|&case| features(case)).collect::<Vec<_>>(), expected);
             // Only the two facts vary: every other field of the kernel is the scene's.
-            for case in cases {
+            for &case in cases {
                 assert_eq!(path(features(case), 2), case);
                 assert_eq!(features(case) & !(FEATURE_LIGHT_TYPES | FEATURE_CAMERA_EXTERIOR), materials);
             }
@@ -604,11 +610,79 @@ mod release_case_tests {
     #[test]
     fn release_light_cases_are_installable_keys() {
         for case in path(FEATURE_SPECIALIZED | FEATURE_INSTALLED | POINT, 0).release_cases() {
+            if features(case) & FEATURE_INSTALLED == 0 { continue; } // the covering key is no scene's own
             let lights = features(case) & FEATURE_LIGHT_TYPES;
             assert_eq!(folded_light_kinds(lights), lights);
         }
         assert_eq!(folded_light_kinds(0), FEATURE_LIGHT_TYPES, "no analytic light is the every-kind case");
         assert_eq!(folded_light_kinds(SUN | AREA), FEATURE_LIGHT_TYPES, "a mix is the every-kind case");
+    }
+
+    /// Refinements share a cover; material unions retain their arithmetic, with
+    /// every combination prepared regardless of the original scene's facts.
+    #[test]
+    fn prepared_families_cover_every_material_union_and_refinement() {
+        assert_eq!(FEATURE_SCATTERING & FEATURE_COVERING, 0);
+        let materials = FEATURE_SPECIALIZED | FEATURE_INSTALLED | FEATURE_COAT | FEATURE_TRANSMISSION;
+        let refinements = [SUN, AREA, SUN | POINT, FEATURE_CAMERA_EXTERIOR,
+            FEATURE_WEIGHTED_IOR, FEATURE_GLTF_TINT, FEATURE_COAT_ANISOTROPY, FEATURE_SCATTERING, FEATURE_SURFACE_COVERAGE];
+        let covering = path(materials, 1).covering().unwrap();
+        for refinement in refinements {
+            assert_eq!(path(materials | refinement, 1).covering(), Some(covering), "{refinement:#x}");
+        }
+        assert_eq!(covering.covering(), None, "a covering key is not an exact scene key");
+        assert_ne!(path(materials | FEATURE_FUZZ, 1).covering(), Some(covering));
+        assert_ne!(path(materials, 2).covering(), Some(covering));
+        let capabilities = variant_capabilities(features(covering), false, false, false);
+        let value = |name: &str| capabilities.iter().find(|(field, _)| *field == name).unwrap().1;
+        for present in ["installed", "has_camera_interior", "has_weighted_ior", "has_gltf_tint", "has_coat_anisotropy", "has_scattering", "has_surface_coverage"] {
+            assert_eq!(value(present), Capability::Bool(true), "{present}");
+        }
+        for absent in ["has_null_connection", "has_subsurface", "has_hair", "has_fuzz"] {
+            assert_eq!(value(absent), Capability::Bool(false), "{absent}");
+        }
+        assert_eq!(value("light_types"), Capability::Uint(15));
+        assert_eq!(value("has_coat"), Capability::Bool(true));
+        let unions: Vec<_> = [0, FEATURE_NULL_CONNECTION].into_iter().flat_map(|null|
+            [0, FEATURE_SUBSURFACE].into_iter().flat_map(move |sss|
+                [0, FEATURE_HAIR].into_iter().map(move |hair| null | sss | hair))).collect();
+        for transmission in [0, FEATURE_TRANSMISSION] {
+            let family = materials & !FEATURE_TRANSMISSION | transmission;
+            for &own in &unions {
+                let cases = path(family | own, 1).release_cases();
+                let covers: Vec<_> = cases.iter().copied().filter(|case| features(*case) & FEATURE_COVERING != 0).collect();
+                assert_eq!(covers.len(), 8);
+                for &facts in &unions {
+                    let cover = path(family | facts, 1).covering().unwrap();
+                    assert!(covers.contains(&cover), "{own:#x} prepares {facts:#x}");
+                    assert_eq!(features(cover) & FEATURE_SCENE_UNIONS, facts);
+                }
+            }
+        }
+        let open = path(materials | FEATURE_CAMERA_EXTERIOR, 0).covering().unwrap();
+        assert_ne!(features(open) & FEATURE_CAMERA_EXTERIOR, 0);
+    }
+
+    #[test]
+    fn ready_path_selection_does_not_wait_for_an_unfinished_exact_pipeline() {
+        let exact = path(FEATURE_SPECIALIZED | FEATURE_INSTALLED, 0);
+        let covering = exact.covering().unwrap();
+        let engine = exact.path_engine().unwrap();
+        for (warm, stored, expected) in [
+            (vec![], vec![covering], covering),
+            (vec![covering], vec![covering], covering),
+            // Worker has published Slang output, but no completed driver cache.
+            (vec![covering], vec![covering, exact], covering),
+            (vec![engine], vec![covering, exact], engine),
+            (vec![exact, engine, covering], vec![covering, exact], exact),
+            // Preserve an existing exact bundle hit when all driver paths are cold.
+            (vec![], vec![covering, exact], exact),
+            (vec![], vec![], exact),
+        ] {
+            assert_eq!(ready_path_kernel(exact, Some(engine), |k| warm.contains(&k), |k| stored.contains(&k)), expected);
+        }
+        assert_eq!(ready_path_kernel(exact, None, |k| k == covering, |k| k == exact), covering,
+            "covering readiness also works for scenes the prebuilt engine refuses");
     }
 
     /// Engine and test keys are not scene unions; other kernels have no cases.
@@ -835,6 +909,19 @@ pub(crate) enum ProgramKernel {
     /// Fixed camera stages and the scene's authored-program evaluation.
     Decoupled { stage: ShadeStage, features: FeatureMask, subsurface: bool, emitter_profiles: bool, boundaries: u32 },
 }
+/// Stored exact code can be published while its driver pipeline is still
+/// compiling. A completed fallback must continue drawing in that interval.
+fn ready_path_kernel(
+    kernel: ProgramKernel, engine: Option<ProgramKernel>,
+    warm: impl Fn(ProgramKernel) -> bool, stored: impl Fn(ProgramKernel) -> bool,
+) -> ProgramKernel {
+    if warm(kernel) { return kernel; }
+    if let Some(engine) = engine.filter(|&engine| warm(engine)) { return engine; }
+    if let Some(covering) = kernel.covering().filter(|&covering| warm(covering)) { return covering; }
+    if stored(kernel) { return kernel; }
+    kernel.covering().filter(|&covering| stored(covering)).unwrap_or(kernel)
+}
+
 impl ProgramKernel {
     /// The prebuilt path engine's key for this path kernel: the same family
     /// (sampling, boundary capacity) with every capability, or why the engine has
@@ -856,18 +943,38 @@ impl ProgramKernel {
         let all = (crate::forward_variant::SHADING_LAYERS | crate::forward_variant::SHADING_METAL) as FeatureMask;
         Ok(Self::Path { adaptive, catchers, random_walk, features: all, boundaries, emitter_profiles: true, media })
     }
+    /// The covering kernel of a scene's path key: the same kernel with every
+    /// refinement fact present, retaining its material unions
+    /// (forward_variant::covering_features). It draws any
+    /// scene that differs from this one only in those facts, so a release bundle
+    /// that holds it serves each of them without a Slang compile. A key that is
+    /// not a scene union has no refinements to drop. Without solids no camera can
+    /// start inside one (passes::path::camera_exterior), so that proof is no
+    /// refinement there and stays.
+    pub(crate) fn covering(self) -> Option<Self> {
+        use crate::forward_variant::{FEATURE_CAMERA_EXTERIOR, FEATURE_INSTALLED};
+        let Self::Path { features: own, boundaries, .. } = self else { return None };
+        if own & FEATURE_INSTALLED == 0 { return None; }
+        let mut covering = self;
+        if let Self::Path { features, .. } = &mut covering {
+            *features = crate::forward_variant::covering_features(own)
+                | if boundaries == 0 { own & FEATURE_CAMERA_EXTERIOR } else { 0 };
+        }
+        Some(covering)
+    }
     /// The keys a release bundle holds for one prepared path scene: the scene's
     /// materials, programs and resources at each covered case of the two key
-    /// facts that come from elsewhere in a scene.
+    /// facts that come from elsewhere in a scene, and covering kernels for every
+    /// other refinement difference (all eight material-union combinations).
     /// - Lights: a single sun, area lights only, and every kind (which is also the
-    ///   key of a scene with no analytic light or with several kinds). A scene lit
-    ///   by points or spots alone compiles its kernel on first use.
+    ///   key of a scene with no analytic light or with several kinds). Points or
+    ///   spots alone can use the covering key instead of adding more exact cases.
     /// - Camera: with solids installed, both the proof that no camera starts
     ///   inside one and its absence. Without solids the proof always holds
     ///   (passes::path::camera_exterior), so the scene's own value is the only one.
     /// A key that is not a scene union has neither fact and is its only case.
     pub(crate) fn release_cases(self) -> Vec<Self> {
-        use crate::forward_variant::{FEATURE_CAMERA_EXTERIOR, FEATURE_INSTALLED, FEATURE_LIGHT_SHIFT, FEATURE_LIGHT_TYPES};
+        use crate::forward_variant::{FEATURE_CAMERA_EXTERIOR, FEATURE_HAIR, FEATURE_SUBSURFACE, FEATURE_NULL_CONNECTION, FEATURE_SCENE_UNIONS, FEATURE_INSTALLED, FEATURE_LIGHT_SHIFT, FEATURE_LIGHT_TYPES};
         let Self::Path { features, boundaries, .. } = self else { return vec![self] };
         if features & FEATURE_INSTALLED == 0 { return vec![self]; }
         let sun: FeatureMask = 1 << FEATURE_LIGHT_SHIFT;
@@ -881,6 +988,19 @@ impl ProgramKernel {
                     *features = *features & !(FEATURE_LIGHT_TYPES | FEATURE_CAMERA_EXTERIOR) | lights | camera;
                 }
                 cases.push(case);
+            }
+        }
+        // Retain the shader's material proofs without losing coverage when any
+        // one of them changes. These are facts, not scene-specific exceptions.
+        for null in [0, FEATURE_NULL_CONNECTION] {
+            for subsurface in [0, FEATURE_SUBSURFACE] {
+                for hair in [0, FEATURE_HAIR] {
+                    let mut case = self;
+                    if let Self::Path { features, .. } = &mut case {
+                        *features = *features & !FEATURE_SCENE_UNIONS | null | subsurface | hair;
+                    }
+                    cases.extend(case.covering());
+                }
             }
         }
         cases
@@ -1449,22 +1569,22 @@ impl CachedPipelines {
     /// prefer a remembered device superset before consulting artifact presence.
     /// Hit consumers retain a Drawn slot so multi-frame installs can promote
     /// this fallback after their exact pipeline compiles in the background.
-    /// Path transport has a prebuilt engine instead of a superset to compile: it
-    /// needs no Slang, and its driver pipeline is the same for every scene, so
-    /// setup and earlier renders leave it warm. A path kernel whose own pipeline
-    /// is not warm draws the engine when the engine's is, and compiles behind it
-    /// (install_behind_engine); a longer render takes its kernel at an exposure
-    /// boundary. A cold engine is never waited for: building its driver pipeline
-    /// costs as much as the scene's own kernel, so the scene compiles that, as it
-    /// always did. Setup is what builds the engine.
+    /// Path renders first use a completed exact pipeline, then a warm engine or
+    /// covering pipeline, then stored exact or covering code. Stored code still
+    /// needs a driver pipeline; a ready covering pipeline must therefore outrank
+    /// exact code published by a detached worker whose driver build is unfinished.
+    /// Setup warms the engine. Inline installation explicitly requests the exact
+    /// kernel. With no ready or stored fallback the exact kernel compiles inline.
     pub(crate) fn drawn_kernel(&self, kernel: ProgramKernel, mode: &VariantCompile, compiler: &Compiler) -> ProgramKernel {
-        if let Ok(engine) = self.shader.path_engine(kernel) {
+        if matches!(kernel, ProgramKernel::Path { .. }) {
+            let engine = self.shader.path_engine(kernel).ok();
             let warm = |kernel| compiler.is_known_input(self.kernel_content_key(kernel));
+            let stored = |kernel| self.shader.kernel_stored(kernel).unwrap_or(false);
             return match mode {
                 VariantCompile::Inline => kernel,
-                VariantCompile::Setup | VariantCompile::SetupPlain | VariantCompile::Gated(_) => engine,
+                VariantCompile::Setup | VariantCompile::SetupPlain | VariantCompile::Gated(_) => engine.unwrap_or(kernel),
                 VariantCompile::Background | VariantCompile::Fallback =>
-                    if !warm(kernel) && warm(engine) { engine } else { kernel },
+                    ready_path_kernel(kernel, engine, warm, stored),
             };
         }
         if matches!(mode, VariantCompile::Background | VariantCompile::Fallback | VariantCompile::Gated(_))
@@ -1518,14 +1638,20 @@ impl CachedPipelines {
             let selected = self.drawn_kernel(requested, mode, &r.compiler);
             if selected != requested {
                 let ProgramKernel::Path {adaptive,..} = requested else {unreachable!()};
-                let source = self.shader.detached_request(requested)?;
-                let groups = path_groups(passes::path::layout_entries(adaptive), self.material_entries.clone(), crate::rt::hit_buffers_entry(0,wgpu::ShaderStages::COMPUTE));
-                if let Some(ended) = crate::specialization::start(key, path.clone(), source, groups)? {
+                let ended = if let Some(ended) = crate::specialization::join(key, &path) {
+                    Some(ended)
+                } else {
+                    let source = self.shader.detached_request(requested)?;
+                    let groups = path_groups(passes::path::layout_entries(adaptive), self.material_entries.clone(), crate::rt::hit_buffers_entry(0,wgpu::ShaderStages::COMPUTE));
+                    crate::specialization::start(key, path.clone(), source, groups)?
+                };
+                if let Some(ended) = ended {
                     let (module, entry) = self.program_kernel(selected)?;
                     let engine = r.compiler.compute(&wgpu::ComputePipelineDescriptor {
                         label: Some(label), layout: Some(&layout), module: &module, entry_point: Some(entry),
                         compilation_options: Default::default(), cache: r.compiler.cache.as_ref(),
                     });
+                    r.compiler.remember(self.kernel_content_key(selected));
                     let pipelines = self.clone();
                     let drawn = r.compiler.install_behind_engine(mode, self.camera_slot(requested), engine, move |compiler| {
                         let cache = crate::specialization::wait(&compiler.device, &path, &ended)?;
@@ -1564,11 +1690,11 @@ impl CachedPipelines {
             compiler.remember(pipelines.kernel_content_key(requested));
             Ok(pipeline)
         };
-        // A render's kernel behind its prebuilt engine always compiles, a still's
+        // A render's kernel behind a ready path fallback always compiles, a still's
         // too: otherwise repeats of the scene would stay at the engine's speed.
         // Setup keeps the engine alone; it has no scene to come back to.
         let behind_engine = selected != requested && !matches!(mode, VariantCompile::Setup | VariantCompile::SetupPlain)
-            && self.shader.path_engine(requested).ok() == Some(selected);
+            && matches!(requested, ProgramKernel::Path {..});
         let drawn = match fallback {
             Some(engine) if behind_engine => r.compiler.install_behind_engine(mode, self.camera_slot(requested), engine, own),
             fallback => r.compiler.install_variant(mode, self.camera_slot(requested), fallback, own)?,
@@ -2567,7 +2693,7 @@ mod registry_identity_tests {
         }).collect()
     }
     fn identity_geometry(attributes:u32)->GeometryKey {
-        (crate::geometry::VertexLayout {points:false,deform:false,tangent:false,uv:[crate::constants::VERTEX_DEFAULT_UV;2],color:false,custom:attributes as u8},Role::Controls(0))
+        (crate::geometry::VertexLayout {points:false,deform:false,tangent:false,uv:[crate::constants::VERTEX_DEFAULT_UV;2],color:false,custom:attributes as u8,stored_custom:attributes as u8},Role::Controls(0))
     }
     #[test]
     fn release_inline_preparation_keeps_exact_movie_variants() -> Result<()> {

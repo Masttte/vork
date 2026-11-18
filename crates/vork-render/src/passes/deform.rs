@@ -252,12 +252,19 @@ pub(crate) fn resources(s: &InstalledScene, r: &Renderer, inputs: &[Option<Evalu
 
 /// An explicitly ordered deformation consumes its predecessor before dispatch.
 /// The legacy fused prefix keeps the original dispatch path below.
-pub(crate) fn dispatch_chained(encoder:&mut wgpu::CommandEncoder,s:&InstalledScene,skin:&[Option<FrameDeform>]) {
+pub(crate) fn dispatch_chained(encoder:&mut wgpu::CommandEncoder,s:&InstalledScene,skin:&[Option<FrameDeform>],queries:Option<&wgpu::QuerySet>) {
     for (index,frame) in skin.iter().enumerate().filter_map(|(i,f)|f.as_ref().map(|f|(i,f))) {
         if frame.leader==index {if let Some(chained)=&frame.chained {chained.source.encode(encoder);}}
     }
     let Some(default)=s.pipelines.deform_pipeline.get() else {return;};
-    let mut pass=encoder.begin_compute_pass(&Default::default());
+    let mut pass=encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("ordered current and previous skinning + morphs"),
+        timestamp_writes: queries.map(|queries|wgpu::ComputePassTimestampWrites {
+            query_set: queries,
+            beginning_of_pass_write_index: Some(timing::query("deform")),
+            end_of_pass_write_index: Some(timing::query("deform") + 1),
+        }),
+    });
     for (index,(draw,frame)) in s.draws.iter().zip(skin).enumerate() {
         if let (Some(deform),Some(frame))=(&draw.deform,frame) {
             if frame.leader!=index {continue;}

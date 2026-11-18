@@ -25,7 +25,7 @@ pub use animation::*;
 pub use canvas::{AspectRatio, Composition, DashArray, FillRule, Fit, ImagePaint, LineCap, LineJoin, NoDash, NoPaint, Paint, PaintLayer, PaintOrder, Space};
 pub use text::{Content, Direction, FontFiles, FontStyle, FontWeight, FontWeightKeyword, LineBreak, LineHeight, LineHeightNormal, Run, TextAlign, TextUnit, UnitProperty, WhiteSpace, WordBreak, laid_out_runs, laid_out_text, transform_origin, unit_ranges};
 use anyhow::{Context, Result, bail, ensure};
-pub use constants::OPENPBR;
+pub use constants::{OPENPBR, OPENPBR_TABLE};
 pub use geometry::*;
 pub use light::*;
 pub use material::*;
@@ -34,7 +34,7 @@ pub use profile::*;
 pub use render::*;
 pub use time::*;
 pub use schema::{api_field, documents, lookup_only_field, schema};
-pub use validate::validate_openpbr_input;
+pub use validate::{validate_openpbr_input, MediaReaders};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -139,8 +139,27 @@ pub struct Propagation {
     /// World-space minimum and maximum in metres; rays leaving continue straight.
     pub bounds: [[f32; 3]; 2],
 }
-/// The deepest nesting of arrays and objects a scene document may have (the JSON reader's admission limit).
-pub const MAX_JSON_DEPTH: usize = 127;
+/// The deepest a node hierarchy is promised to load and draw: a node, its child, and so on down.
+pub const MAX_NODE_DEPTH: usize = 1000;
+/// The deepest nesting of arrays and objects a scene document may have. Each level of node children is two (the
+/// node's object and its `children` array), so this holds a hierarchy [`MAX_NODE_DEPTH`] deep and, beside it,
+/// the 127 levels a document had for everything else before nodes had their own. A deeper document is refused
+/// when it is read ([`diagnostics::too_deep`]).
+pub const MAX_JSON_DEPTH: usize = 2 * MAX_NODE_DEPTH + 127;
+/// The stack a thread needs to read, check, build and draw a document nested [`MAX_JSON_DEPTH`] deep. The
+/// loader and the walks over a scene's nodes recurse once per level; the deepest of them, the typed read of a
+/// node's children, was measured at between 4.2 and 8.4 KB a level in a release build (2,000 levels overflow
+/// 8 MiB, 1,000 do not) and takes several times that unoptimised. The stack is reserved, not committed: a
+/// shallow document touches a few pages of it.
+pub const LOAD_STACK_BYTES: usize = 256 << 20;
+/// The builder for a thread that reads, walks, hashes, installs or drops a scene: it has the stack a scene nested
+/// to its limit needs ([`LOAD_STACK_BYTES`]). Scene-owning workers start here (`.spawn(..)` or
+/// `.spawn_scoped(scope, ..)`): the 3D install worker and the worker that hashes a canvas's scene. CLI commands
+/// use the same budget for an independent command stack. This goes when a scene holds its nodes as a table
+/// and no walk recurses.
+pub fn scene_thread() -> std::thread::Builder {
+    std::thread::Builder::new().stack_size(LOAD_STACK_BYTES)
+}
 
 impl Scene {
     pub fn load(path: &Path) -> Result<Self> {
@@ -170,8 +189,8 @@ impl Scene {
     #[doc(hidden)]
     pub fn parse_json_with_source(bytes:&[u8],authored:&[u8],file:Option<&Path>)->Result<Self> {
         let bytes = diagnostics::without_bom(bytes);
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|error| diagnostics::nesting_error(&error, "scene").unwrap_or_else(|| diagnostics::decode_error(bytes, error)))?;
+        if let Some(refusal) = diagnostics::too_deep(bytes, MAX_JSON_DEPTH, "scene") { return Err(refusal); }
+        let value = diagnostics::read_value(bytes).map_err(|error| diagnostics::decode_error(bytes, error))?;
         Self::parse_value(value, authored, file, |error| diagnostics::decode_error(bytes, error))
     }
     /// Admit an expanded document without encoding and parsing it again. The document is consumed. When a
@@ -180,10 +199,9 @@ impl Scene {
     #[doc(hidden)]
     pub fn parse_value_with_source(value: serde_json::Value, authored: &[u8], file: Option<&Path>,
         pre_lowering: impl FnOnce() -> Result<serde_json::Value>) -> Result<Self> {
-        // serde_json's byte parser rejects the 128th nested array/object. Expansion
-        // can add nesting to otherwise admitted input. Bound this walk and retain
-        // byte admission's exact error and precedence for those exceptional values.
-        fn reaches_input_limit(value: &serde_json::Value, remaining: u8) -> bool {
+        // Expansion can add nesting to input that was admitted as bytes: the expanded document keeps the same
+        // limit, with the refusal byte admission gives. The walk stops at the limit.
+        fn reaches_input_limit(value: &serde_json::Value, remaining: usize) -> bool {
             match value {
                 serde_json::Value::Array(values) => remaining == 1
                     || values.iter().any(|value| reaches_input_limit(value, remaining - 1)),
@@ -192,8 +210,8 @@ impl Scene {
                 _ => false,
             }
         }
-        if reaches_input_limit(&value, MAX_JSON_DEPTH as u8 + 1) {
-            return Self::parse_json_with_source(&serde_json::to_vec(&value)?, authored, file);
+        if reaches_input_limit(&value, MAX_JSON_DEPTH + 1) {
+            return Err(diagnostics::nesting_refusal(MAX_JSON_DEPTH, "scene"));
         }
         Self::parse_value(value, authored, file, |error| {
             match pre_lowering().and_then(|value| Ok(serde_json::to_vec(&value)?)) {
@@ -465,27 +483,80 @@ mod tests {
         }
     }
 
+    /// A test body on a thread with the stack a document at the nesting limit needs, as `vork`'s commands run.
+    fn on_load_stack(body: impl FnOnce() + Send + 'static) {
+        scene_thread().spawn(body).unwrap().join().unwrap();
+    }
+    /// JSON text nested `depth` arrays and objects deep under a scene's `expanded` key, written without a value
+    /// tree: the scene object is the first level.
+    fn nested_text(depth: usize) -> Vec<u8> {
+        let mut text = String::from(r#"{"version":2,"render":{"settings":{}},"expanded":"#);
+        for level in 1..depth { text.push_str(if level % 2 == 0 { r#"{"nested":"# } else { "[" }); }
+        text.push_str("null");
+        for level in (1..depth).rev() { text.push(if level % 2 == 0 { '}' } else { ']' }); }
+        text.push('}');
+        text.into_bytes()
+    }
+
     #[test]
     fn expanded_value_admission_preserves_input_depth_and_error_precedence() {
-        let authored = br#"{"version":2,"nodes":[]}"#;
-        let file = Some(Path::new("project/scene.json"));
-        for depth in [127, 128, 129, 256] {
-            let mut nested = serde_json::Value::Null;
-            // The scene object contributes the final container level. Alternate
-            // arrays and objects to exercise both branches of the bounded walk.
-            for level in 1..depth {
-                nested = if level % 2 == 0 { serde_json::json!({"nested":nested}) }
-                    else { serde_json::Value::Array(vec![nested]) };
+        on_load_stack(|| {
+            let authored = br#"{"version":2,"nodes":[]}"#;
+            let file = Some(Path::new("project/scene.json"));
+            for depth in [127, 128, MAX_JSON_DEPTH, MAX_JSON_DEPTH + 1, MAX_JSON_DEPTH + 2, 2 * MAX_JSON_DEPTH] {
+                let bytes = nested_text(depth);
+                let expected = Scene::parse_json_with_source(&bytes, authored, file).unwrap_err();
+                let refused = expected.to_string().contains("nests arrays and objects more than");
+                assert_eq!(refused, depth > MAX_JSON_DEPTH, "depth {depth}: {expected:#}");
+                if refused {
+                    assert!(expected.to_string().contains(&format!("more than {MAX_JSON_DEPTH} deep (a node hierarchy about {MAX_NODE_DEPTH} deep)")), "{expected:#}");
+                    // Bytes past the limit are refused before a value is made; a value one level past it, as
+                    // expansion can make from admitted bytes, is refused in the same words.
+                    if depth == MAX_JSON_DEPTH + 1 {
+                        let mut value = diagnostics::read_value(&nested_text(MAX_JSON_DEPTH)).unwrap();
+                        value["expanded"] = serde_json::Value::Array(vec![value["expanded"].take()]);
+                        let again = value.clone();
+                        let actual = Scene::parse_value_with_source(value, authored, file, || Ok(again)).unwrap_err();
+                        assert_eq!(format!("{actual:#}"), format!("{expected:#}"));
+                    }
+                } else {
+                    assert!(expected.to_string().contains("render.settings"), "depth {depth}: {expected:#}");
+                    let value = diagnostics::read_value(&bytes).unwrap();
+                    let again = value.clone();
+                    let actual = Scene::parse_value_with_source(value, authored, file, || Ok(again)).unwrap_err();
+                    assert_eq!(format!("{actual:#}"), format!("{expected:#}"), "depth {depth}");
+                }
             }
-            let value = serde_json::json!({"version":2,"render":{"settings":{}},"expanded":nested});
-            let bytes = serde_json::to_vec(&value).unwrap();
-            let expected = Scene::parse_json_with_source(&bytes, authored, file).unwrap_err();
-            let again = value.clone();
-            let actual = Scene::parse_value_with_source(value, authored, file, || Ok(again)).unwrap_err();
-            assert_eq!(format!("{actual:#}"), format!("{expected:#}"), "depth {depth}");
-            assert_eq!(actual.to_string().contains("recursion limit exceeded"), depth >= 128);
-            if depth < 128 { assert!(actual.to_string().contains("render.settings")); }
-        }
+        });
+    }
+
+    #[test]
+    fn a_node_hierarchy_at_the_stated_depth_loads_and_one_past_the_document_limit_is_refused() {
+        on_load_stack(|| {
+            // `groups` nested groups over a path, as text: each group is its object and its children array.
+            let chain = |groups: usize| {
+                let mut text = String::from(r#"{"version":2,"composition":{"space":"2d"},"nodes":["#);
+                for depth in 0..groups { text.push_str(&format!(r#"{{"name":"g{depth}","children":["#)); }
+                text.push_str(r##"{"type":"path","name":"leaf","d":"M0 0H16V16H0Z","fill":"#38bdf8","translation":[1,2,0]}"##);
+                for _ in 0..groups { text.push_str("]}"); }
+                text.push_str("]}");
+                text.into_bytes()
+            };
+            for groups in [64, MAX_NODE_DEPTH] {
+                let scene = Scene::from_json(&chain(groups)).unwrap_or_else(|error| panic!("{groups} groups: {error:#}"));
+                let mut depth = 0;
+                let mut node = &scene.nodes[0];
+                while let Some(child) = node.children.first() { depth += 1; node = child; }
+                assert_eq!(depth, groups);
+                assert_eq!(node.name, "leaf");
+                assert!(scene.origins.contains_key("nodes.leaf"));
+            }
+            // The leaf's translation array is the deepest container: 2 + 2 * groups + 2 levels.
+            let past = (MAX_JSON_DEPTH - 4) / 2 + 1;
+            assert!(Scene::from_json(&chain(past - 1)).is_ok());
+            let error = Scene::from_json(&chain(past)).unwrap_err().to_string();
+            assert!(error.contains(&format!("nests arrays and objects more than {MAX_JSON_DEPTH} deep")) && error.contains("flatten the hierarchy"), "{error}");
+        });
     }
 
     #[test]
@@ -769,10 +840,12 @@ mod tests {
 
     #[test]
     fn openpbr_inputs_are_exactly_the_specification_table() {
-        assert_eq!(OPENPBR.len(), 39);
+        assert_eq!(OPENPBR.len(), 42);
+        assert_eq!(OPENPBR_TABLE.len(), 39);
+        assert!(OPENPBR_TABLE.iter().all(|p| !p.approximated));
         let line = include_str!("reference.txt").lines()
-            .find(|l| l.starts_with("material.inputs (std/openpbr): OpenPBR Surface; shaded inputs:")).unwrap();
-        let listed = line.split("shaded inputs: ").nth(1).unwrap().split_whitespace().collect::<Vec<_>>();
+            .find(|l| l.starts_with("material.inputs (std/openpbr): OpenPBR Surface; accepted inputs:")).unwrap();
+        let listed = line.split("accepted inputs: ").nth(1).unwrap().split_whitespace().collect::<Vec<_>>();
         assert_eq!(listed, OpenPbrParam::supported().map(|p| p.name).collect::<Vec<_>>());
         for param in OPENPBR {
             let path = format!("material.inputs.{}: ", param.name);
@@ -794,6 +867,7 @@ mod tests {
                 "images":{"n":{"file":"n.png"}},"materials":{"m":{"inputs":inputs}}}))
         };
         for valid in [
+            serde_json::json!({"base_diffuse_roughness":0.8,"transmission_scatter":[0.1,0.2,0.3],"transmission_scatter_anisotropy":-0.5}),
             serde_json::json!({"geometry_coat_normal":{"image":"n"}}),
             serde_json::json!({"fuzz_weight":1,"base_color":[1,0,0],"geometry_thin_walled":true}),
             serde_json::json!({"geometry_normal":{"image":"n"},"emission_luminance":{"image":"n"}}),
@@ -801,6 +875,9 @@ mod tests {
             scene(valid.clone()).unwrap_or_else(|e| panic!("{valid}: {e}"));
         }
         for invalid in [
+            serde_json::json!({"base_diffuse_roughness":1.01}),
+            serde_json::json!({"transmission_scatter":[0,-0.1,0]}),
+            serde_json::json!({"transmission_scatter_anisotropy":-1.01}),
             serde_json::json!({"sheen_color":[1,1,1]}),
             serde_json::json!({"geometry_thickness":0.1}),
             serde_json::json!({"specular_anisotropy":0.5}),

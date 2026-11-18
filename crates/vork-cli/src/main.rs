@@ -185,7 +185,18 @@ fn main() -> std::process::ExitCode {
     }
     vork_render::specialization::enable();
     if update_notice::worker_entry() { return std::process::ExitCode::SUCCESS; }
-    let result = run();
+    // Reading, planning and dropping a scene still recurse. Give the entire command
+    // an independent stack before it reads input, regardless of inherited limits.
+    // Stay on this OS thread on Unix: a separate command thread delayed startup.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let result = stacker::grow(vork_scene::LOAD_STACK_BYTES, run);
+    // stacker's Windows fiber commits the whole budget up front. A scene thread
+    // reserves it instead, preserving the shallow-command memory cost.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result = match vork_scene::scene_thread().name("vork".into()).spawn(run) {
+        Ok(command) => command.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        Err(error) => Err(anyhow::Error::new(error).context("start the command thread")),
+    };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) if output::broken_pipe(&error) => std::process::ExitCode::SUCCESS,
@@ -218,11 +229,11 @@ fn run_command(command: Command, entry: std::time::SystemTime, start: std::time:
         return args.run();
     }
     if matches!(command, Command::Render { diagnostics: true, .. }) {
-        eprintln!(
+        vork_slang::progress::line(format!(
             "cli_entry_unix_ns: {}; cli_parse_ms: {:.3}",
             entry.duration_since(std::time::UNIX_EPOCH)?.as_nanos(),
             start.elapsed().as_secs_f64() * 1000.
-        );
+        ));
     }
     if let Command::Setup { gpu: Some(index), .. } | Command::Render { gpu: Some(index), .. } = &command {
         vork_render::select_gpu(*index);
@@ -310,8 +321,8 @@ fn run_command(command: Command, entry: std::time::SystemTime, start: std::time:
     let progress = progress::Monitor::start("Render: loading scene");
     let diagnostics = matches!(command, Command::Render { diagnostics: true, .. });
     // This command owns the process and its stderr: with --diagnostics every
-    // shader compile and driver pipeline is written there as it begins and ends.
-    vork_slang::progress::events(diagnostics);
+    // shader compile and driver pipeline is queued there as it begins and ends.
+    let _creation_events = vork_slang::progress::events(diagnostics);
     let (rendered, out) = match command {
         Command::Render {
             scene: scene_path, outputs, out, exr_codec, png_depth, at, frame_start, frame_end,
@@ -337,10 +348,10 @@ fn run_command(command: Command, entry: std::time::SystemTime, start: std::time:
         _ => unreachable!(),
     };
     if diagnostics {
-        eprintln!(
+        vork_slang::progress::line(format!(
             "cli_render_return_ms: {:.3}",
             start.elapsed().as_secs_f64() * 1000.
-        );
+        ));
     }
     progress.finish();
     let report = &rendered.report;
@@ -361,9 +372,9 @@ fn run_command(command: Command, entry: std::time::SystemTime, start: std::time:
         let line = exposure_line(&row["exposure"]);
         if exposures.len() == 1 { output!("{line}"); } else { output!("{}: {line}", row["output"].as_str().unwrap_or_default()); }
     }
-    // The marker warning already carries its count and location in one final line.
+    // These warnings already carry their complete guidance in one visible line.
     let warnings: Vec<_> = report["warnings"].as_array().into_iter().flatten()
-        .filter(|warning| warning["code"] != "nonfinite_samples").collect();
+        .filter(|warning| warning["code"] != "nonfinite_samples" && warning["code"] != "previs_material_emission").collect();
     if !warnings.is_empty() {
         eprintln!("\nWARNING: {} RENDER WARNING(S): {}. Review the detailed warnings above and in render metadata before accepting this render.",
             warnings.len(), warnings.iter().filter_map(|warning| warning["code"].as_str()).collect::<Vec<_>>().join(", "));

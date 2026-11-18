@@ -18,6 +18,7 @@ fn main() {
     println!("cargo:rerun-if-changed={source}");
     let text = fs::read_to_string(source).expect("read openpbr-params.md");
     let mut out = String::from("&[\n");
+    let mut table = String::from("&[\n");
     // The renderer's evaluated surface: the same parameters, same names, as WGSL.
     let mut fields = String::new();
     let mut defaults = Vec::new();
@@ -37,7 +38,8 @@ fn main() {
         let unit = cells[6];
         let meaning = cells[7];
         let default_text = default;
-        let closure = cells.get(8).copied() != Some("Input only");
+        let approximated = cells.get(8).copied() == Some("Approximation only");
+        let closure = !approximated && cells.get(8).copied() != Some("Input only");
         let supported = cells.get(8).copied().unwrap_or("") != "Closure only";
         let kind = match kind {
             "float" => "Float",
@@ -103,23 +105,28 @@ fn main() {
             slang_defaults.push(value.replace("vec3(", "float3("));
             defaults.push(value);
         }
+        let mut descriptor = String::new();
         writeln!(
-            out,
-            "    OpenPbrParam {{ name: {name:?}, kind: OpenPbrKind::{kind}, default: &{default:?}, unit: {unit:?}, meaning: {meaning:?}, default_text: {default_text:?}, supported: {supported}, closure: {closure}, \
+            descriptor,
+            "    OpenPbrParam {{ name: {name:?}, kind: OpenPbrKind::{kind}, default: &{default:?}, unit: {unit:?}, meaning: {meaning:?}, default_text: {default_text:?}, supported: {supported}, closure: {closure}, approximated: {approximated}, \
              min: {}, max: {}, open_min: {open_min}, open_max: {open_max} }},",
             f(min),
             f(max),
         )
         .unwrap();
+        out.push_str(&descriptor);
+        if !approximated { table.push_str(&descriptor); }
     }
     out.push(']');
+    table.push(']');
     let count = out.matches("OpenPbrParam {").count();
     assert_eq!(
-        count, 39,
-        "38 OpenPBR parameters plus std cutoff, table has {count}"
+        count, 42,
+        "41 OpenPBR parameters plus std cutoff, table has {count}"
     );
     let dir = Path::new(&env::var("OUT_DIR").unwrap()).to_path_buf();
     fs::write(dir.join("openpbr.rs"), out).unwrap();
+    fs::write(dir.join("openpbr_table.rs"), table).unwrap();
     // Renderer-only optical preparation; this is absent from the authored Slang ABI.
     // Zero denotes an unresolved interface (every physical IOR is positive).
     fields.push_str("    optical_ior:f32,\n");

@@ -144,7 +144,7 @@ pub(crate) fn plan(
         .iter()
         .map(|name| {
             let source = input.images[name].render.as_ref().unwrap();
-            let settings = input.images[name].resolved_render(&input.render).expect("a rendered image");
+            let settings = input.images[name].resolved_render(&s.render).expect("a rendered image");
             ensure!(
                 settings
                     .resolution
@@ -365,7 +365,13 @@ impl CaptureView {
             // and animated path seeds do; keep the actual uniforms unchanged.
             for uniform in &self.sampled_uniforms {
                 let mut input = *uniform;
-                if !image.time_dependent { input.scene[..3].fill(0.); input.composite_shutter.fill(0.); }
+                if !image.time_dependent {
+                    input.scene[..3].fill(0.);
+                    input.composite_shutter.fill(0.);
+                    // Display programs receive nominal frame time separately
+                    // from scene time. It is not an input to a static capture.
+                    input.post[1] = 0.;
+                }
                 inputs.extend_from_slice(bytemuck::bytes_of(&input));
             }
             // Ray hits can see casters outside the image

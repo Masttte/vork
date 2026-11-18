@@ -190,16 +190,30 @@ mod tests {
             "materials":{"m":{"program":"medium","inputs":{"d":{"grid":"d"},"v":{"grid":"v"}}}},
             "simulation":{"t0":0,"dt":0.125,"seed":7,"state":["d","v"],"init":["init"],"steps":["step"]},
             "nodes":[{"type":"camera","name":"camera","translation":[0,0,4],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":2.5,"clip_end":10}}},{"type":"mesh","name":"volume","geometry":"box","materials":["m"],"scale":[1.2,0.8,0.5]}]});
-        // Stage-1 medium admission has no bounded work proof for resource
-        // inputs, so a dense-grid medium is refused before publication under
-        // either camera owner.
+        // A dense-grid medium installs under either requested camera owner:
+        // media select complete-camera path transport.
         for path in [false,true] {
             let mut scene:Scene=vork_scene::v2::from_test_value(value.clone())?;
             if path {scene.render.settings=v2::Settings::with_integrator(v2::Integrator::Path(Default::default()));}
-            let error=r.install(scene,Path::new(".")).err().context("dense-grid medium installed")?;
-            let error=format!("{error:#}");
-            assert!(error.contains("has no bounded callback work proof") && error.contains("medium work proof does not yet admit resource inputs"),"{error}");
+            let installed=r.install(scene,Path::new(".")).context("dense-grid medium refused")?;
+            assert!(installed.render().settings.integrator.is_path());
         }
+        // The medium itself consumes the published cells: each publication
+        // re-certifies its majorant, the picture follows the cells, and a seek
+        // back replays the earlier frame.
+        let mut medium:Scene=vork_scene::v2::from_test_value(value.clone())?;
+        medium.render.settings=v2::Settings::with_integrator(v2::Integrator::Path(Default::default()));
+        medium.render.settings.samples=4;medium.render.settings.disable_denoiser();
+        let installed=r.install(medium,Path::new("."))?;
+        assert!(installed.dense.is_some(),"a grid medium needs publication");
+        let mut slot=installed.create_frame_slot(&r,crate::ReadbackPrecision::Float)?;
+        // The scalar stays in [0.1,0.67] over these times, where d(1-d) is a
+        // valid absorption; by time 1 it has passed one and turned negative.
+        slot.submit(&installed,&r,0.)?;let first=slot.collect(&r)?.linear_rgba.unwrap();
+        assert!(first.iter().flatten().all(|v|v.is_finite()) && first.iter().any(|v|v[0]>0.),"the medium must emit");
+        slot.submit(&installed,&r,0.5)?;let later=slot.collect(&r)?.linear_rgba.unwrap();
+        assert_ne!(first,later,"published cells must change the medium's picture");
+        slot.submit(&installed,&r,0.)?;crate::test_linear::assert_linear_eq(&first,&slot.collect(&r)?.linear_rgba.unwrap());
         // The same compute-written scalar and vector grids publish to a surface
         // consumer, the supported owner of dense snapshots.
         let mut surface=value;

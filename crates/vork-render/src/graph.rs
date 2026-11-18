@@ -624,7 +624,8 @@ pub(crate) struct Dispatch {
 }
 impl Dispatch {
     pub(crate) fn encode_packet(&self,encoder:&mut wgpu::CommandEncoder,specialized:bool) {
-        let mut pass=encoder.begin_compute_pass(&Default::default());
+        let timestamps = moda_engine::gpu_profile::pass_timestamps();
+        let mut pass=encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: moda_engine::gpu_profile::compute_writes(&timestamps) });
         pass.set_pipeline(self.variant.as_ref().map_or(&self.pipeline,|p|p.current(specialized)));
         pass.set_bind_group(0,&self.bind,self.dynamic_offset.as_slice());
         if let Some(bind)=&self.material {pass.set_bind_group(1,bind,&[]);}

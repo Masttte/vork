@@ -323,7 +323,7 @@ mod tests {
         let moda_text::vector::ops::VectorEngineDecision::Vector(ops) =
             moda_text::vector::ops::build_vector_node_ops(&spec, &store, &host.catalog, 1., moda_text::vector::VectorPlacement::VectorParity)
             else { panic!("oblique must draw outlined glyphs"); };
-        let records: Vec<_> = ops.ops.iter().flat_map(|op| &op.records).collect();
+        let records: Vec<_> = ops.ops.iter().flat_map(|op| op.records.iter()).collect();
         assert_eq!(records.len(), 3);
         assert!(records.iter().all(|record| record.glyph_lin[1] != 0.), "oblique must slant every glyph");
     }

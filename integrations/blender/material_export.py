@@ -45,7 +45,8 @@ class MaterialWriter:
     """Accumulate v2 scene fragments; bind returned IDs on an asset's materials.
 
     Export geometry with geometry.export_gltf to retain active/named UV aliases.
-    Object/Normal coordinates need no UVs. Generated coordinates fail explicitly.
+    Object/Normal coordinates need no UVs. Generated coordinates require their
+    qualified source field; other meshes retain an explicit coordinate loss.
     """
 
     def __init__(self, directory, *, best_effort=False, curve_lookups=False):
@@ -229,12 +230,12 @@ class MaterialWriter:
         self.image_keys[cache] = result
         return result
 
-    def write(self, material, *, bake_object=None, bake_resolution=None, available_attributes=None):
+    def write(self, material, *, bake_object=None, bake_resolution=None, available_attributes=None, attribute_images=None):
         return self._write(f'blender_material_{len(self.materials)}', material,
                            bake_object=bake_object, bake_resolution=bake_resolution,
-                           available_attributes=available_attributes)
+                           available_attributes=available_attributes, attribute_images=attribute_images)
 
-    def _write(self, key, material, *, bake_object=None, bake_resolution=None, available_attributes=None):
+    def _write(self, key, material, *, bake_object=None, bake_resolution=None, available_attributes=None, attribute_images=None):
         engine = bpy.context.scene.render.engine
         target = 'CYCLES' if engine == 'CYCLES' else 'EEVEE'
         output = material.node_tree.get_output_node(target) if material.use_nodes else None
@@ -283,7 +284,7 @@ class MaterialWriter:
                             best_effort=self.best_effort,
                             bake_input=bake if bake_object is not None else None,
                             curve_input=self.curve_image if self.curve_lookups else None,
-                            available_attributes=available_attributes)
+                            available_attributes=available_attributes, attribute_images=attribute_images)
         source, inputs = compiler.compile()
         self.reports[key] = dict(material=material.name,
                                  status='partial' if compiler.substitutions else 'translated',
@@ -366,7 +367,7 @@ class MaterialWriter:
                 if material is None:
                     self.asset_reports.append(dict(file=str(path), material=source.get('name'), reason='source Blender material unavailable', replacement='retain emitted glTF material'))
                     continue  # Retain the emitted glTF material when source is unavailable.
-                attributes = frozenset(k for k in primitive.get('attributes', {}) if k.startswith('_VORK_UV_'))
+                attributes = frozenset(k for k in primitive.get('attributes', {}) if k.startswith(('_VORK_UV_', '_VORK_COLOR_', '_VORK_1_GENERATED')))
                 shared_identity = index, attributes
                 own_identity = index, attributes, bake_object
                 identity = shared_identity if bake_resolution is None or shared_identity in variants else own_identity

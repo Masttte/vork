@@ -468,7 +468,7 @@ impl MediumProgram {
     /// Conservative callback instruction count, separate from coefficient bounds.
     pub fn bounded_work_for_inputs(&self,abi:&Abi,words:&[Option<u32>])->Result<u32> {
         ensure!(self.work_source_stable,"medium work proof refuses target-dependent preprocessing or unreadable imports");
-        ensure!(self.inputs.fields.iter().all(|field|!matches!(field.ty,Type::Geometry|Type::Image|Type::FloatGrid|Type::VectorGrid)),"medium work proof does not yet admit resource inputs");
+        ensure!(self.inputs.fields.iter().all(|field|!matches!(field.ty,Type::Geometry|Type::Image)),"medium work proof does not yet admit geometry or image inputs");
         let module=validated_module(&self.wgsl,abi)?;
         effects::medium_work(&module,&self.coefficient_entry,words)
     }

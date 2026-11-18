@@ -35,7 +35,29 @@ float2 quadrature_rotation(uint j,uint sample,uint count) {
 // OpenPBR layering (formulas from the specification's MaterialX reference graph,
 // open_pbr_surface.mtlx): fuzz over coat over the base substrate. Evaluated once per
 // shaded sample; zero-weight layers leave `base` as the material's own closure.
-struct Layers { Closure base; float3 scale; float3 transmittance; float throughput; float coat_f0; float coat_fresnel; float fuzz_albedo; float3x3 fuzz_basis; float3x3 fuzz_matrix; bool coat_albedo; };
+// The coat multiplies the base three ways. `scale` serves reflected light
+// integrated over the hemisphere: the darkening and both crossings, the incident
+// one at the mean path. `crossing` serves light from under the base: it crosses
+// the coat once, toward the viewer, and none of it returns to the base, so it
+// takes no darkening. coat_scale gives either product for one incident direction
+// from the retained interface energy, darkening and outgoing path.
+struct Layers { Closure base; float3 scale; float3 crossing; float3 darkening; float coat_energy; float coat_path; float transmittance; float throughput; float coat_f0; float coat_fresnel; float fuzz_albedo; float3x3 fuzz_basis; float3x3 fuzz_matrix; bool coat_albedo; };
+// OpenPBR 1.1.1 darkening estimates for the whole base under the coat. Its
+// albedo is the normal-incidence albedos of its slabs blended by their mix
+// weights; a transmitting slab returns none. Its roughness is
+// lerp(r_d,r,metalness): an opaque dielectric is the rough substrate under its
+// weighted normal reflectance ξF, r_d = lerp(1,r,ξF), and a transmitting one
+// has only its interface, r.
+float3 coat_base_darkening(Closure c,float exit_fresnel) {
+    let amount=c.coat_weight*c.coat_darkening;
+    if (amount<=0.) {return float3(1.);}
+    let dielectric=(1.-c.transmission_weight)*substrate_color(c);
+    let albedo=lerp(dielectric,c.specular_weight*c.base_weight*c.base_color,c.base_metalness);
+    let reflectance=clamp(fresnel(1.,dielectric_ior(c)),0.,1.);
+    let opaque=lerp(1.,c.specular_roughness,reflectance);
+    let roughness=lerp(lerp(opaque,c.specular_roughness,c.transmission_weight),c.specular_roughness,c.base_metalness);
+    return coat_darkening(albedo,roughness,exit_fresnel,c.coat_ior,amount);
+}
 float coat_directional_albedo<V:IVariant=Unspecialized>(Closure c,float3 view) {
     if(!V.has_coat_anisotropy || c.coat_roughness_anisotropy==0.) return dielectric_albedo(max(dot(c.geometry_coat_normal,view),.0001),c.coat_roughness,c.coat_ior);
     let coat=transport_coat_closure(c);
@@ -45,15 +67,20 @@ float coat_directional_albedo<V:IVariant=Unspecialized>(Closure c,float3 view) {
 // (V.layered); dielectric variants compile without the F82 metal path (V.metal).
 Layers layers<V:IVariant>(Closure c, float3 view, float coat_albedo=-1.) {
     let identity=float3x3(float3(1.,0.,0.),float3(0.,1.,0.),float3(0.,0.,1.));
-    var l=Layers(c,float3(1.),float3(1.),1.,0.,0.,0.,identity,identity,coat_albedo>=0.);
+    var l=Layers(c,float3(1.),float3(1.),float3(1.),1.,0.,1.,1.,0.,0.,0.,identity,identity,coat_albedo>=0.);
     if (V.layered && V.has_coat && c.coat_weight>0.) {
         // Independent std GGX coat: keep the base roughness and IOR unchanged.
         l.coat_f0=fresnel(1.,c.coat_ior);
         let n=c.geometry_coat_normal;let nv=max(dot(n,view),.0001);
-        l.transmittance=float3(coat_transmission(c.coat_weight,nv,c.coat_ior));
+        let exit_fresnel=fresnel(nv,c.coat_ior);
+        l.transmittance=1.-c.coat_weight*exit_fresnel;
         // Reserve the coat's integrated reflected energy before the substrate.
         // The retained independent method attenuates both external directions.
-        l.scale=coat_albedo>=0. ? float3(1.-coat_albedo) : l.transmittance;
+        l.coat_energy=coat_albedo>=0. ? 1.-coat_albedo : l.transmittance;
+        l.coat_path=coat_path(nv,c.coat_ior);
+        l.darkening=coat_base_darkening(c,exit_fresnel);
+        l.crossing=l.coat_energy*coat_absorption(c.coat_color,c.coat_weight,l.coat_path);
+        l.scale=l.coat_energy*l.darkening*coat_absorption(c.coat_color,c.coat_weight,l.coat_path+coat_mean_path(c.coat_ior));
         let coat_roughness=specular_roughness(c.coat_roughness);
         let uv=ltc_uv(float2(coat_roughness,sqrt(1.-min(nv,1.))));
         let amplitude=ltc_amplitude.SampleLevel(env_sampler,uv,0.);
@@ -72,9 +99,32 @@ Layers layers<V:IVariant>(Closure c, float3 view, float coat_albedo=-1.) {
     }
     return l;
 }
-// OpenPBR emitted radiance, shared by visible surfaces and light samples.
+// The base response multiplier for light arriving from `direction`. The base
+// event decides the product: reflected light is `scale` with the incident
+// crossing's own path, `transmitted` light (from under the base) is `crossing`.
+// The coat normal only measures the path; it may disagree with the base normal
+// about which side a direction is on.
+float3 coat_scale(Layers l,Closure c,float3 direction,bool transmitted) {
+    if (c.coat_weight<=0.) {return float3(1.);}
+    let ni=dot(c.geometry_coat_normal,direction);
+    let energy=l.coat_albedo ? l.coat_energy : l.coat_energy*coat_transmission(c.coat_weight,ni,c.coat_ior);
+    if (transmitted) {return energy*coat_absorption(c.coat_color,c.coat_weight,l.coat_path);}
+    return energy*l.darkening*coat_absorption(c.coat_color,c.coat_weight,l.coat_path+coat_path(max(ni,0.),c.coat_ior));
+}
+// OpenPBR emitted radiance, shared by visible surfaces and light samples. The
+// reference graph tints emission under the coat by coat_color at normal
+// incidence; the outgoing path carries that tint to other angles.
 float3 surface_emission(Closure c,Layers l) {
-    return c.emission_color*c.emission_luminance*l.transmittance*l.throughput;
+    if (c.coat_weight>0. && c.coat_weight<1. && any(c.coat_color!=float3(1.))) {
+        // Emission is a coverage mix: uncovered radiance plus covered radiance
+        // after Fresnel loss and absorption. Multiplying two weighted factors
+        // would charge the uncovered part for absorption as well.
+        let uncovered=1.-c.coat_weight;
+        let tint=coat_absorption(c.coat_color,1.,2.*l.coat_path);
+        let transmission=uncovered+(l.transmittance-uncovered)*tint;
+        return c.emission_color*c.emission_luminance*l.throughput*transmission;
+    }
+    return c.emission_color*c.emission_luminance*l.transmittance*l.throughput*coat_absorption(c.coat_color,c.coat_weight,2.*l.coat_path);
 }
 // Zeltner, Burley & Chiang 2022 LTC fit data, shared with Cycles (see
 // src/ltc/README.md). Three 32² planes in the amplitude texture's blue channel.
@@ -112,10 +162,12 @@ float3 layer_direct<V:IVariant>(Layers l, Closure c, float3 view, float3 light, 
     }
     return result;
 }
-// Fuzz over (coat over base): base·scale·throughput + coat·throughput + fuzz,
-// where `layer` already holds coat·throughput + fuzz.
-float3 layered(Layers l, float3 base, float3 layer) {
-    return l.throughput*l.scale*base+layer;
+// Fuzz over (coat over base) for light from `direction`: base·scale·throughput
+// + coat·throughput + fuzz, where `layer` already holds coat·throughput + fuzz.
+// For a base response whose lobes share the shading normal (direct_brdf):
+// below it the response is a thin sheet's transmitted diffuse light.
+float3 layered(Layers l, Closure c, float3 direction, float3 base, float3 layer) {
+    return l.throughput*coat_scale(l,c,direction,dot(c.geometry_normal,direction)<=0.)*base+layer;
 }
 
 // Transport interface shared by ray integrators. Values include the projected
@@ -295,7 +347,7 @@ TransmissionResponse transport_transmission(Closure c, float3 view, float3 direc
     }
     let tint=transmission_scale*surface_transmission_tint(c);
     let base=l.throughput*tint*c.transmission_weight*(1.-c.base_metalness)*f*abs(dot(n,direction));
-    result.value=l.coat_albedo ? l.scale*base : compose_coat(base,float3(0.),c.coat_weight,dot(c.geometry_coat_normal,view),dot(c.geometry_coat_normal,direction),c.coat_ior);
+    result.value=coat_scale(l,c,direction,true)*base;
     return result;
 }
 TransmissionResponse transport_transmission(Closure c, float3 view, float3 direction) {
@@ -309,13 +361,17 @@ float3 transport_eval_mask(Closure c, float3 view, float3 direction, uint mask, 
     // A delta coat has mass only in continuation, never in an NEE density.
     var layer_c=c;if (c.coat_roughness==0. || dot(c.geometry_coat_normal,view)<=0.) {layer_c.coat_weight=0.;}
     let bump=transport_bump_shadow(c,direction,prepared);
-    var base=direct_brdf_prepared(base_c,view,direction,mask&REG_RAY_SPECULAR,float3(0.),prepared.metal_compensation);
-    if ((mask&REG_RAY_DIFFUSE)!=0u) {base+=dot(c.geometry_normal,direction)>0. ? prepared.diffuse*bump*dot(c.geometry_normal,direction) : thin_diffuse(c,view)*transport_bump_shadow(c,-direction,prepared)*(-dot(c.geometry_normal,direction));}
+    // Each lobe names its own event. The specular lobe reflects about the
+    // corrected interface; the diffuse lobe keeps the authored normal, and
+    // below it is a thin sheet's transmitted light.
+    let specular=direct_brdf_prepared(base_c,view,direction,mask&REG_RAY_SPECULAR,float3(0.),prepared.metal_compensation);
+    let behind=dot(c.geometry_normal,direction)<=0.;
+    var diffuse=float3(0.);
+    if ((mask&REG_RAY_DIFFUSE)!=0u) {diffuse=behind ? thin_diffuse(c,view)*transport_bump_shadow(c,-direction,prepared)*(-dot(c.geometry_normal,direction)) : prepared.diffuse*bump*dot(c.geometry_normal,direction);}
     let diffuse_mask=dot(c.geometry_normal,direction)>0. ? mask&REG_RAY_DIFFUSE : 0u;
     let layer=layer_direct<Unspecialized>(l,layer_c,view,direction,mask&REG_RAY_SPECULAR)
         +bump*layer_direct<Unspecialized>(l,layer_c,view,direction,diffuse_mask);
-    return transmitted+(l.coat_albedo ? layered(l,base,layer) : compose_coat(l.throughput*base,layer,c.coat_weight,
-        dot(c.geometry_coat_normal,view),dot(c.geometry_coat_normal,direction),c.coat_ior));
+    return transmitted+l.throughput*(coat_scale(l,c,direction,false)*specular+coat_scale(l,c,direction,behind)*diffuse)+layer;
 }
 float3 transport_eval_mask(Closure c, float3 view, float3 direction, uint mask) {
     return transport_eval_mask(c,view,direction,mask,transport_prepare(c,view));
@@ -340,7 +396,7 @@ float3 transport_delta_transmittance(Closure c,float3 view,TransportPreparation 
     }
     let l=layers<Unspecialized>(c,view,prepared.coat_albedo);
     return surface_transmission_tint(base)
-        *base.transmission_weight*(1.-base.base_metalness)*transmitted*l.scale*l.throughput;
+        *base.transmission_weight*(1.-base.base_metalness)*transmitted*l.crossing*l.throughput;
 }
 // Final's straight light connection transports the directional transmission
 // integral, not the null-event mass. A rough sheet has no null delta, but its
@@ -460,7 +516,5 @@ BsdfSample transport_sample(Closure c, float3 view, float3 random) {
 // Path albedo composition spends coat reflection once; the independent
 // method retains the incoming/outgoing Fresnel product shared with std.
 float3 layered_direct<V:IVariant>(Layers l, Closure c, float3 base, float3 view, float3 light, uint mask) {
-    let coat=layer_direct<V>(l,c,view,light,mask);
-    return l.coat_albedo ? layered(l,base,coat) : compose_coat(l.throughput*base,coat,c.coat_weight,
-        dot(c.geometry_coat_normal,view),dot(c.geometry_coat_normal,light),c.coat_ior);
+    return layered(l,c,light,base,layer_direct<V>(l,c,view,light,mask));
 }

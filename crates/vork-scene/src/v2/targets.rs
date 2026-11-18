@@ -301,8 +301,8 @@ fn bad_segment<'a>(
 }
 
 impl Scene {
-    /// Images referenced by a node's paint/content keys, including ancestor-owned tracks.
-    pub(super) fn keyed_images(&self, node: &Node) -> BTreeSet<String> {
+    /// Images referenced by paint/content keys, indexed once by target node (including ancestor-owned tracks).
+    pub(super) fn keyed_images(&self) -> BTreeMap<String, BTreeSet<String>> {
         fn images(value: &serde_json::Value, out: &mut BTreeSet<String>) {
             match value {
                 serde_json::Value::Object(fields) => {
@@ -313,15 +313,19 @@ impl Scene {
                 _ => {}
             }
         }
-        let mut out = BTreeSet::new();
+        let mut out = BTreeMap::new();
         let mut collect = |track: &Track, target: &TrackTarget| {
-            let matches = match target {
-                TrackTarget::Node { node: name, property } => name == &node.name &&
-                    (matches!(property, NodeProperty::Fill | NodeProperty::Stroke) || matches!(property, NodeProperty::Style(p) if p.name() == "content")),
-                TrackTarget::Text { node: name, property, .. } => name == &node.name && matches!(property, UnitProperty::Fill | UnitProperty::Stroke),
-                _ => false,
+            let node = match target {
+                TrackTarget::Node { node, property } if matches!(property, NodeProperty::Fill | NodeProperty::Stroke)
+                    || matches!(property, NodeProperty::Style(p) if p.name() == "content") => node,
+                TrackTarget::Text { node, property, .. } if matches!(property, UnitProperty::Fill | UnitProperty::Stroke) => node,
+                _ => return,
             };
-            if matches { if let Values::Inline(values) = &track.values { for value in values { images(value, &mut out); } } }
+            if let Values::Inline(values) = &track.values {
+                let mut found = BTreeSet::new();
+                for value in values { images(value, &mut found); }
+                if !found.is_empty() { out.entry(node.clone()).or_insert_with(BTreeSet::new).extend(found); }
+            }
         };
         if let Ok(targets) = self.track_targets() {
             for (layer, targets) in self.animation.iter().zip(targets) {
@@ -1188,7 +1192,7 @@ mod tests {
     fn scene() -> Scene {
         crate::v2::from_test_value(serde_json::json!({"version":2,
             "nodes":[{"type":"camera","name":"cam","material":{"program":"std/camera","inputs":{"projection":"persp"}}},{"type":"asset","name":"actor","file":"a.glb"},
-                {"type":"light","name":"key","shape":"spot","spot_size":0.7853981633974483,"spot_blend":0.14999999999999986}],
+                {"type":"light","name":"key","shape":"spot","spot_size":std::f64::consts::FRAC_PI_4,"spot_blend":0.14999999999999986}],
             "materials":{"paint":{}},
             "animation":[{"name":"walk","tracks":[]}]}))
         .unwrap()
@@ -1243,8 +1247,9 @@ mod tests {
             "animation":[{"tracks":[{"path":["nodes","text","content"],
                 "keys":[[0,"A"],[1,[{"content":"B","fill":{"image":"clip"}}]]]}]}]
         })).unwrap();
-        assert_eq!(doc.node_media(&doc.nodes[0].children[0]), vec!["clip"]);
-        assert_eq!(doc.node_media(&doc.nodes[1]), vec!["clip"]);
+        let media = doc.media_readers();
+        assert_eq!(media.node_media(&doc.nodes[0].children[0]), vec!["clip"]);
+        assert_eq!(media.node_media(&doc.nodes[1]), vec!["clip"]);
     }
 
     #[test]

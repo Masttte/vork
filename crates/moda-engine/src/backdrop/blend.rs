@@ -160,12 +160,17 @@ pub fn page_splits_are_stacks_only(scene: &Scene, page_id: &str, transparent: bo
     !scene
         .flattened_z_order_for_page(page_id)
         .iter()
-        .filter_map(|id| scene.effective_node(id).map(|n| (id, n)))
-        .any(|(id, n)| {
-            moda_scene::scene::is_opacity_group(n)
-                || split_blend_mode_over(n, transparent).is_some()
-                || composite_blend_split_in(scene, id, transparent).is_some()
-        })
+        .any(|id| node_precludes_shape_sdf(scene, id, transparent))
+}
+
+/// Source contribution to the page's analytic-body eligibility. Shared by cold planning and its
+/// retained derived-input proof; the target's eligibility changes when the last contribution leaves.
+pub(crate) fn node_precludes_shape_sdf(scene: &Scene, id: &str, transparent: bool) -> bool {
+    scene.effective_node(id).is_some_and(|node| {
+        moda_scene::scene::is_opacity_group(node)
+            || split_blend_mode_over(node, transparent).is_some()
+            || composite_blend_split_in(scene, id, transparent).is_some()
+    })
 }
 
 pub fn canvas_root_has_split_blend(scene: &Scene) -> bool {
@@ -413,7 +418,7 @@ fn split_pair_in(
 }
 
 /// One split of an isolation pair over the whole-pixel target rect `[x0, y0, x1, y1]`.
-fn isolation_split(node_id: &str, op: BackdropOp, [x0, y0, x1, y1]: [f64; 4]) -> BackdropSplit {
+pub(crate) fn isolation_split(node_id: &str, op: BackdropOp, [x0, y0, x1, y1]: [f64; 4]) -> BackdropSplit {
     let region_px = [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32];
     let rect = [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32];
     BackdropSplit {
@@ -466,17 +471,16 @@ pub(crate) fn retarget_isolation_splits(
     width_px: u32,
     height_px: u32,
 ) {
+    retarget_isolation_splits_record(items, region_canvas, width_px, height_px, |_, _| {});
+}
+
+/// Record the exact bounds reduction used by capture-local composition, while executing it.
+pub(crate) fn retarget_isolation_splits_record(
+    items: &mut [crate::seams::DrawItem], region_canvas: [f64; 4], width_px: u32, height_px: u32,
+    mut record: impl FnMut([usize; 2], Option<Rect>),
+) {
     use crate::seams::DrawItem;
-    let [rx, ry, rw, rh] = region_canvas;
-    let (zx, zy) = (width_px as f64 / rw.max(1e-9), height_px as f64 / rh.max(1e-9));
-    let union = |a: Option<Rect>, b: Option<Rect>| match (a, b) {
-        (Some(a), Some(b)) => {
-            let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
-            let (x1, y1) = ((a.x + a.w).max(b.x + b.w), (a.y + a.h).max(b.y + b.h));
-            Some(Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
-        }
-        (a, b) => a.or(b),
-    };
+    use crate::layer_blur::shadow::union_canvas_bounds as union;
     // The open pairs, outermost first: each begin's index and the canvas bounds drawn inside it so far.
     let mut open: Vec<(usize, Option<Rect>)> = Vec::new();
     for index in 0..items.len() {
@@ -501,22 +505,30 @@ pub(crate) fn retarget_isolation_splits(
         if let Some((_, outer)) = open.last_mut() {
             *outer = union(*outer, bounds);
         }
-        // Nothing measurable between the pair: an empty region, which the executor skips.
-        let rect = bounds
-            .and_then(|b| {
-                let x0 = ((b.x - rx) * zx - 2.0).floor().max(0.0);
-                let y0 = ((b.y - ry) * zy - 2.0).floor().max(0.0);
-                let x1 = ((b.x + b.w - rx) * zx + 2.0).ceil().min(width_px as f64);
-                let y1 = ((b.y + b.h - ry) * zy + 2.0).ceil().min(height_px as f64);
-                (x1 > x0 && y1 > y0).then_some([x0, y0, x1, y1])
-            })
-            .unwrap_or([0.0; 4]);
+        record([begin, index], bounds);
+        let rect = isolation_rect(bounds, region_canvas, width_px, height_px);
         for at in [begin, index] {
             if let DrawItem::BackdropSplit(split) = &mut items[at] {
                 **split = isolation_split(&split.node_id, split.op.clone(), rect);
             }
         }
     }
+}
+
+/// The ordinary capture-local pixel rectangle executor, shared by cold and retained outputs.
+pub(crate) fn isolation_rect(bounds: Option<Rect>, region_canvas: [f64; 4], width_px: u32, height_px: u32) -> [f64; 4] {
+    let [rx, ry, rw, rh] = region_canvas;
+    let (zx, zy) = (width_px as f64 / rw.max(1e-9), height_px as f64 / rh.max(1e-9));
+    // Nothing measurable between the pair: an empty region, which the executor skips.
+    bounds
+        .and_then(|b| {
+            let x0 = ((b.x - rx) * zx - 2.0).floor().max(0.0);
+            let y0 = ((b.y - ry) * zy - 2.0).floor().max(0.0);
+            let x1 = ((b.x + b.w - rx) * zx + 2.0).ceil().min(width_px as f64);
+            let y1 = ((b.y + b.h - ry) * zy + 2.0).ceil().min(height_px as f64);
+            (x1 > x0 && y1 > y0).then_some([x0, y0, x1, y1])
+        })
+        .unwrap_or([0.0; 4])
 }
 
 // ---------------------------------------------------------------------------

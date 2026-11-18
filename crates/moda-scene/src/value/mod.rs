@@ -507,10 +507,27 @@ impl Number {
     /// the other way (`2^-12` as an `f32` is `0.00024414062` here and `0.00024414063` from Rust's `Display`), which
     /// would move a placement by one unit in the last place. `None` for a non-finite value.
     pub fn from_f32_shortest(f: f32) -> Option<Number> {
-        match serde_json::Value::from(f) {
-            serde_json::Value::Number(n) => Some(Number::from(&n)),
-            _ => None,
+        if !f.is_finite() { return None; }
+        // Up to 2^24, integral f32s have exact integer decimals: the spacing is at most
+        // one, so a shorter decimal cannot round to a different integer. This also
+        // preserves signed zero and needs no formatter in either serde_json mode.
+        if f.abs() <= 16_777_216. && f.trunc() == f {
+            return Self::from_f64(f64::from(f));
         }
+        // Feature unification can select serde_json's text-number representation. Detect that
+        // once, retaining the widened-f32 contract when moda-scene is built on its own.
+        static TEXT_NUMBERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*TEXT_NUMBERS.get_or_init(|| serde_json::Value::from(0.1f32).as_f64() == Some(0.1)) {
+            return Self::from_f64(f64::from(f));
+        }
+        // Use serde_json's own f32 formatter, without constructing its allocated number token.
+        // Even a signed subnormal's decimal fits in this buffer.
+        let mut buffer = [0u8; 64];
+        let mut remaining = &mut buffer[..];
+        serde_json::to_writer(&mut remaining, &f).expect("f32 decimal fits in the buffer");
+        let len = 64 - remaining.len();
+        let token = std::str::from_utf8(&buffer[..len]).expect("JSON number is ASCII");
+        Self::from_f64(token.parse().expect("finite f32 decimal fits in f64"))
     }
 
     /// The number as an `f64`; `None` for a token outside `f64`'s range.
@@ -1800,7 +1817,7 @@ mod tests {
         let mut bits = 0x9E37_79B9u32;
         // 2^-12 has two equally close shortest decimals; formatters break the tie differently.
         let tie = f32::from_bits(0x3980_0000);
-        let mut samples = vec![0.0f32, -0.0, 1.0, 0.1, 0.3, 1.0e-7, 16777216.0, 1.0e21, f32::MIN_POSITIVE, f32::MAX, f32::MIN,
+        let mut samples = vec![0.0f32, -0.0, 1.0, -1.0, 0.1, 0.3, 1.0e-7, 16777215.0, -16777215.0, 16777216.0, -16777216.0, 16777218.0, 1.0e21, f32::MIN_POSITIVE, f32::MAX, f32::MIN,
             f32::from_bits(1), 123456.79, 0.333_333_34, tie, -tie];
         samples.extend((0..32).flat_map(|e| [2f32.powi(-e), -(2f32.powi(-e)), 2f32.powi(e)]));
         for _ in 0..20_000 {

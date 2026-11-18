@@ -715,15 +715,15 @@ pub(super) fn scene_tables(scene: &v2::Scene, base: &std::path::Path, opened: &c
     let mut samplers: std::collections::BTreeMap<String, Vec<Vec<usize>>> = Default::default();
     let mut lengths = std::collections::BTreeMap::new();
     let with_time: std::collections::BTreeSet<String> = scene.images.iter().filter(|(_, image)| image.time.is_some()).map(|(name, _)| name.clone()).collect();
-    fn visit(scene: &v2::Scene, base: &std::path::Path, list: &[v2::Node], path: &mut Vec<usize>, samplers: &mut std::collections::BTreeMap<String, Vec<Vec<usize>>>, lengths: &mut std::collections::BTreeMap<Vec<usize>, Rational>, opened: &crate::footage::Opened) -> Result<()> {
+    fn visit(scene: &v2::Scene, media: &v2::MediaReaders<'_>, base: &std::path::Path, list: &[v2::Node], path: &mut Vec<usize>, samplers: &mut std::collections::BTreeMap<String, Vec<Vec<usize>>>, lengths: &mut std::collections::BTreeMap<Vec<usize>, Rational>, opened: &crate::footage::Opened) -> Result<()> {
         for (index, node) in list.iter().enumerate() {
             path.push(index);
-            for image in scene.node_media(node) {
+            for image in media.node_media(node) {
                 let entry = samplers.entry(image).or_default();
                 if !entry.contains(path) { entry.push(path.clone()); }
             }
             if node.has_clock() && node.time.as_ref().is_none_or(|time| time.duration.is_none()) {
-                let sources = scene.media_sources(node);
+                let sources = media.media_sources(node);
                 if sources.len() == 1 && scene.audio_sources(node).is_empty() {
                     let name = sources.into_iter().next().unwrap();
                     let file = base.join(scene.images[&name].file.as_deref().unwrap());
@@ -735,7 +735,7 @@ pub(super) fn scene_tables(scene: &v2::Scene, base: &std::path::Path, opened: &c
                     .time
                     .as_ref()
                     .is_none_or(|time| time.duration.is_none())
-                && scene.media_sources(node).is_empty()
+                && media.media_sources(node).is_empty()
             {
                 let sources = scene.audio_sources(node);
                 if sources.len() == 1 {
@@ -746,12 +746,12 @@ pub(super) fn scene_tables(scene: &v2::Scene, base: &std::path::Path, opened: &c
                     );
                 }
             }
-            visit(scene, base, &node.children, path, samplers, lengths, opened)?;
+            visit(scene, media, base, &node.children, path, samplers, lengths, opened)?;
             path.pop();
         }
         Ok(())
     }
-    visit(scene, base, &scene.nodes, &mut Vec::new(), &mut samplers, &mut lengths, opened)?;
+    visit(scene, &scene.media_readers(), base, &scene.nodes, &mut Vec::new(), &mut samplers, &mut lengths, opened)?;
     Ok((samplers, with_time, lengths))
 }
 /// The one source's length, from the source as this document open read it

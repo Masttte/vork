@@ -388,3 +388,87 @@ fn canvas_text_stroke_is_centred_and_paints_over_fill() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+#[ignore = "renders images; requires a real GPU and pinned Slang"]
+fn previs_emitter_approximation_renders_and_warns_once() {
+    let dir = std::env::temp_dir().join(format!("vork-previs-emission-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scene = dir.join("scene.json");
+    let mut value=serde_json::json!({"version":2,
+        "materials":{"source":{"inputs":{"base_weight":0,"specular_weight":0,"emission_luminance":683}},
+            "receiver":{"inputs":{"specular_weight":0}}},
+        "nodes":[{"type":"camera","translation":[0,0,5]},
+            {"name":"source","type":"mesh","geometry":{"std":"rounded_box","size":[1,1,1],"radius":0},"materials":["source"],"translation":[0,0,2]},
+            {"name":"receiver","type":"mesh","geometry":{"std":"rounded_box","size":[4,4,1],"radius":0},"materials":["receiver"]}],
+        "render":{"resolution":[32,32]}});
+    for (lit,raw) in [(true,false),(false,false),(true,true)] {
+        value["materials"]["receiver"]["inputs"]["base_weight"]=i32::from(lit).into();
+        std::fs::write(&scene,value.to_string()).unwrap();
+        let image=dir.join(if raw {"raw.png"} else if lit {"lit.png"} else {"unlit.png"});
+        let mut command=Command::new(env!("CARGO_BIN_EXE_vork"));
+        command.arg("render").arg(&scene).args(["--profile","std/previs","--out"]).arg(&image);
+        if raw {command.args(["--set","denoise=false"]);}
+        let output=command.output().unwrap();
+        let stderr=String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success() && image.exists(),"{stderr}");
+        assert_eq!(stderr.matches("WARNING: std/previs approximates material-emitter lighting").count(),usize::from(lit),"{stderr}");
+        assert_eq!(stderr.matches("WARNING:").count(),usize::from(lit),"{stderr}");
+        if lit {
+            assert!(stderr.contains("std/final or std/path for exact lighting"),"{stderr}");
+            let pixels=decode_rgba(&image);
+            // Away from the directly visible source, a receiver with no analytic
+            // or environment lights must receive material emission.
+            assert!((10..22).any(|y| (3..8).any(|x| pixels[(y*32+x)*4]>5)),"emitter-lit receiver remained black");
+        }
+        let metadata:serde_json::Value=serde_json::from_slice(&std::fs::read(dir.join(format!("{}.meta.json",image.file_name().unwrap().to_str().unwrap()))).unwrap()).unwrap();
+        if raw {assert_eq!(metadata["render_settings"]["denoise"],false,"explicit denoise=false must win: {metadata}");}
+        let notices=metadata["warnings"].as_array().unwrap();
+        assert_eq!(notices.iter().filter(|w|w["code"]=="previs_material_emission").count(),usize::from(lit));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "renders images; requires a real GPU and pinned Slang"]
+fn openpbr_approximations_render_identically_and_warn_per_material() {
+    let dir = std::env::temp_dir().join(format!("vork-openpbr-approximation-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scene = dir.join("scene.json");
+    let mut value = serde_json::json!({"version":2,
+        "materials":{"paint":{"inputs":{"base_color":[0.6,0.2,0.1],"transmission_weight":0.3,"transmission_depth":1}}},
+        "nodes":[{"type":"camera","translation":[0,0,5]},
+            {"type":"light","shape":"environment"},
+            {"name":"box","type":"mesh","geometry":{"std":"rounded_box","size":[2,2,2],"radius":0.2},"materials":["paint"]}],
+        "render":{"resolution":[32,32]}});
+    for profile in ["std/previs", "std/draft", "std/final", "std/path"] {
+        let mut reference = None;
+        for (case, additions, warn) in [
+            ("absent", serde_json::json!({}), false),
+            ("neutral", serde_json::json!({"base_diffuse_roughness":0,"transmission_scatter":[0,0,0],"transmission_scatter_anisotropy":0}), false),
+            ("rough", serde_json::json!({"base_diffuse_roughness":0.5}), true),
+            ("scatter", serde_json::json!({"transmission_scatter":[0.2,0.4,0.6]}), true),
+            ("anisotropy", serde_json::json!({"transmission_scatter_anisotropy":-0.5}), true),
+            ("combined", serde_json::json!({"base_diffuse_roughness":1,"transmission_scatter":[0.2,0.4,0.6],"transmission_scatter_anisotropy":1}), true),
+        ] {
+            value["materials"]["paint"]["inputs"] = serde_json::json!({"base_color":[0.6,0.2,0.1],"transmission_weight":0.3,"transmission_depth":1});
+            value["materials"]["paint"]["inputs"].as_object_mut().unwrap().extend(additions.as_object().unwrap().clone());
+            std::fs::write(&scene, value.to_string()).unwrap();
+            let image = dir.join(format!("{}-{case}.png", profile.replace('/', "-")));
+            let output = Command::new(std::env::var("VORK_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_vork").into()))
+                .arg("render").arg(&scene).args(["--profile", profile, "--at", "0", "--set", "samples=4", "--set", "seed=42", "--set", "denoise=false", "--out"])
+                .arg(&image).output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success() && image.exists(), "{profile} {case}: {stderr}");
+            assert_eq!(stderr.matches("WARNING: material paint: OpenPBR approximation").count(), usize::from(warn), "{stderr}");
+            let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(format!("{}.meta.json", image.file_name().unwrap().to_str().unwrap()))).unwrap()).unwrap();
+            let warnings: Vec<_> = metadata["warnings"].as_array().unwrap().iter().filter(|w| w["code"] == "openpbr_approximation").collect();
+            assert_eq!(warnings.len(), usize::from(warn));
+            if warn { assert_eq!(warnings[0]["requested"]["material"], "paint"); }
+            let pixels = decode_rgba(&image);
+            if let Some(reference) = &reference { assert_eq!(&pixels, reference, "{profile} {case}"); }
+            else { assert!(pixels.chunks_exact(4).any(|p| p[0] > 0), "empty fixture"); reference = Some(pixels); }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

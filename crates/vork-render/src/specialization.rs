@@ -47,6 +47,34 @@ pub(crate) fn load(device: &wgpu::Device, path: &Path) -> Option<wgpu::PipelineC
     Some(cache)
 }
 
+/// An existing detached worker owns this stripe until it publishes or exits.
+/// Repeats can wait for that publication without recapturing and serializing
+/// the shader or starting another process. A race only creates a redundant
+/// worker: the worker's blocking lock remains the publication authority.
+fn in_progress(key: blake3::Hash, path: &Path) -> bool {
+    let Some(root) = path.parent() else { return false };
+    let Ok(mut lock) = std::fs::OpenOptions::new().read(true).write(true)
+        .open(root.join(format!("specialization-{:02x}.lock", key.as_bytes()[0]))) else { return false };
+    if !matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)) { return false; }
+    use std::io::Read;
+    let mut owner = [0u8; 32];
+    lock.read_exact(&mut owner).is_ok() && owner == *key.as_bytes()
+}
+
+pub(crate) fn join(key: blake3::Hash, path: &Path) -> Option<std::sync::Arc<AtomicBool>> {
+    if !in_progress(key, path) { return None; }
+    let ended = std::sync::Arc::new(AtomicBool::new(false));
+    let done = ended.clone();
+    let path = path.to_owned();
+    std::thread::spawn(move || {
+        while in_progress(key, &path) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        done.store(true, Ordering::Release);
+    });
+    Some(ended)
+}
+
 pub(crate) fn start(key: blake3::Hash, path: PathBuf, source: Source,
     groups: Vec<Option<Vec<wgpu::BindGroupLayoutEntry>>>) -> Result<Option<std::sync::Arc<AtomicBool>>> {
     use std::process::{Command, Stdio};
@@ -98,9 +126,11 @@ fn worker() -> Result<()> {
     std::fs::create_dir_all(root)?;
     // Fixed striped locks bound metadata; never unlink a lock inode while another
     // process may have opened it. Kernel locks release on every exit, including kill.
-    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+    let mut lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(root.join(format!("specialization-{:02x}.lock",request.key[0])))?;
     lock.lock()?;
+    lock.write_all(&request.key)?;
+    lock.set_len(32)?;
     if disk_cache::read_pipeline(&request.path).is_some() {return Ok(());}
     // One private scratch directory per lock stripe. A killed worker's files
     // are reclaimed by its next lock owner; successful/error exits remove them.
@@ -131,7 +161,6 @@ fn worker() -> Result<()> {
     let code = if let Some(code)=disk_cache::read(&source.artifact) {code} else {
         let mut code = prepared.compile()?;
         if source.transforms.localize_blends {code=compiler.localize_native_blends(&code)?;}
-        if source.transforms.inline_metal {code=crate::camera_native::inline_metal_functions(&code);}
         if source.transforms.driver_inline {crate::slang_forward::allow_driver_inlining(&mut code)?;}
         disk_cache::write_entry(&source.artifact,&code)?;
         code
@@ -171,4 +200,32 @@ fn worker() -> Result<()> {
 struct Scratch(PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Unix advisory locks permit reading the owner while locked. Platforms
+    // with mandatory locking may conservatively decline this optimization.
+    #[cfg(unix)]
+    #[test]
+    fn repeats_join_only_the_worker_for_their_exact_key() {
+        let dir = std::env::temp_dir().join(format!("vork-worker-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = blake3::hash(b"one shader");
+        let path = dir.join("result.entry");
+        assert!(!in_progress(key, &path));
+        let mut lock = std::fs::OpenOptions::new().read(true).write(true).create_new(true)
+            .open(dir.join(format!("specialization-{:02x}.lock", key.as_bytes()[0]))).unwrap();
+        lock.lock().unwrap();
+        lock.write_all(key.as_bytes()).unwrap();
+        assert!(in_progress(key, &path));
+        let mut other = *key.as_bytes();
+        other[1] ^= 1;
+        assert!(!in_progress(other.into(), &path), "a stripe collision is not our worker");
+        drop(lock);
+        assert!(!in_progress(key, &path), "exited workers allow a retry");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

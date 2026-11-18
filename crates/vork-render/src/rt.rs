@@ -445,13 +445,29 @@ pub(crate) fn may_refract(scene: &Scene) -> bool {
 /// possible solid SSS or RGB connections; installation refines unknown programs.
 pub(crate) fn possible_transport_queries(scene: &Scene) -> bool {
     let Ok(animated)=materials::animated_inputs(scene) else {return true;};
+    // Native emission can request raster ray lighting after installation. Keep
+    // pure unlit displays on the device without a ray runtime; imports/programs
+    // already reserve queries conservatively above/below.
+    fn default_receiver(nodes: &[Node]) -> bool {
+        nodes.iter().any(|node| matches!(&node.kind, NodeKind::Mesh {materials,..} if materials.is_empty())
+            || default_receiver(&node.children))
+    }
+    let mut source = false;
+    let mut receiver = scene.render.settings.previs && default_receiver(&scene.nodes);
     for (name,material) in &scene.materials {
         if material.program!="std/openpbr" {return true;}
         let inputs=animated.get(name).cloned().unwrap_or_default();
         let Ok(record)=materials::openpbr_values(scene,Some(name),&inputs,|_|Ok(0)) else {return true;};
         if record.spatial_subsurface() {return true;}
+        if scene.render.settings.previs {
+            let record=materials::openpbr_pending(scene,Some(name),&inputs,record);
+            if !record.zero_opacity() {
+                source |= record.emits();
+                receiver |= record.emission_receiver_mask() != 0;
+            }
+        }
     }
-    may_refract(scene)
+    may_refract(scene) || (scene.render.settings.previs && source && receiver && surface_transport_required(scene))
 }
 
 /// Thin and solid camera interfaces both need scene boundary transport.
@@ -1603,6 +1619,26 @@ mod transport_owner_tests {
             "animation":[{"tracks":[{"path":["materials","alpha","inputs","geometry_opacity"],"keys":[[0,0.35],[1,0.7]]}]}]}))?.animation;
         assert!(previs_requires_path(&scene,["opaque","alpha"])?);
         assert!(!previs_requires_path(&scene,["opaque"])?);
+        Ok(())
+    }
+
+    #[test]
+    fn previs_emission_reserves_queries_only_for_possible_receivers() -> Result<()> {
+        let mut scene=crate::test_scene(serde_json::json!({"version":2,
+            "materials":{"source":{"inputs":{"base_weight":0,"specular_weight":0,"emission_luminance":1}}},
+            "nodes":[{"type":"camera"},{"type":"mesh","geometry":{"std":"sphere"},"materials":["source"]}]}),Path::new("."))?;
+        scene.render.settings=vork_scene::v2::Settings::for_level(3,Default::default());
+        assert!(!device_needs(&scene)?.ray_queries,"a pure unlit display needs no ray runtime");
+        scene.materials.get_mut("source").unwrap().inputs.insert("base_weight".into(),serde_json::from_value(serde_json::json!(1))?);
+        assert!(device_needs(&scene)?.ray_queries,"native emissive receivers need the ray runtime before installation");
+        scene.materials.get_mut("source").unwrap().inputs.insert("base_weight".into(),serde_json::from_value(serde_json::json!(0))?);
+        let mut default_receiver=scene.nodes[1].clone();
+        if let NodeKind::Mesh {materials,..}=&mut default_receiver.kind {materials.clear();}
+        scene.nodes.push(default_receiver);
+        assert!(device_needs(&scene)?.ray_queries,"the default material also receives emission");
+        scene.materials.get_mut("source").unwrap().inputs.insert("emission_luminance".into(),serde_json::from_value(serde_json::json!(0))?);
+        assert!(!possible_transport_queries(&scene),"non-emissive previs keeps its original geometry usage");
+        assert!(!device_needs(&scene)?.ray_queries,"non-emissive receivers need no additional ray runtime");
         Ok(())
     }
 

@@ -195,6 +195,75 @@ fn adapter() -> Result<PathBuf> {
     Ok(adapter)
 }
 
+/// A companion is private to one compiler worker thread. Slang's global
+/// session is not thread-safe; neither it nor request-local module state is
+/// shared between concurrent workers. Dropping the thread kills the companion.
+struct Worker {
+    child: std::process::Child,
+    input: std::io::BufWriter<std::process::ChildStdin>,
+    output: std::io::BufReader<std::process::ChildStdout>,
+    stderr: std::sync::Arc<Mutex<Vec<u8>>>,
+    diagnostics: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // This also runs from WORKER's TLS destructor. On Windows that holds
+        // the loader lock, which the diagnostics thread needs to exit. Detach
+        // it: killing the companion closes stderr, and the reader owns its
+        // pipe and sink until it finishes. Joining here deadlocks thread exit.
+        #[cfg(not(windows))]
+        if let Some(thread) = self.diagnostics.take() { let _ = thread.join(); }
+    }
+}
+fn integer(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+fn bytes(reader: &mut impl Read) -> Result<Vec<u8>> {
+    let n = integer(reader)?;
+    ensure!(n <= 512 * 1024 * 1024, "oversized Slang filesystem message");
+    let mut bytes = vec![0; n as usize];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+fn put(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+impl Worker {
+    fn start(command: &Command, adapter: &Path) -> Result<Self> {
+        let mut child_command = Command::new(adapter);
+        child_command
+            .current_dir(command.get_current_dir().context("Slang request working directory")?)
+            .arg(compiler_path(&library(Path::new(command.get_program()))?))
+            .arg(compiler_path(Path::new(command.get_program()).canonicalize()?.parent().context("Slang compiler directory")?))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = spawn_compiler(&mut child_command)?;
+        let input = std::io::BufWriter::new(child.stdin.take().unwrap());
+        let output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut pipe = child.stderr.take().unwrap();
+        let stderr = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = stderr.clone();
+        let diagnostics = std::thread::spawn(move || {
+            let mut buffer = [0; 8192];
+            while let Ok(n) = pipe.read(&mut buffer) {
+                if n == 0 { break; }
+                sink.lock().unwrap().extend_from_slice(&buffer[..n]);
+            }
+        });
+        let mut worker = Self { child, input, output, stderr, diagnostics: Some(diagnostics) };
+        ensure!(integer(&mut worker.output)? == 2, "unsupported Slang filesystem protocol");
+        Ok(worker)
+    }
+}
+thread_local! {
+    static WORKER: std::cell::RefCell<Option<(blake3::Hash, Worker)>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(super) fn compile(
     command: &Command,
     observations: Option<&Observations>,
@@ -243,54 +312,40 @@ pub(super) fn compile(
         }
     }
     let adapter = adapter()?;
-    let mut child_command = Command::new(&adapter);
-    child_command
-        .current_dir(&state.root)
-        .arg(compiler_path(&library(Path::new(command.get_program()))?))
-        .arg(compiler_path(
-            Path::new(command.get_program())
-                .canonicalize()?
-                .parent()
-                .context("Slang compiler directory")?,
-        ))
-        .args(command.get_args())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = spawn_compiler(&mut child_command)?;
-    let mut input = std::io::BufWriter::new(child.stdin.take().unwrap());
-    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
-    let mut stderr = child.stderr.take().unwrap();
-    let diagnostics = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes);
-        bytes
+    // Replacing a toolchain/adapter or changing loader search state cannot keep
+    // using the previously loaded compiler. Unidentifiable loaders get one-shot workers.
+    let key = Compiler::new(command.get_program()).toolchain().ok().and_then(|toolchain| {
+        let mut hash = blake3::Hasher::new();
+        hash.update(toolchain.as_bytes());
+        hash.update(adapter.as_os_str().as_encoded_bytes());
+        hash.update(&fs::read(&adapter).ok()?);
+        Some(hash.finalize())
     });
-    fn integer(reader: &mut impl Read) -> Result<u64> {
-        let mut bytes = [0; 8];
-        reader.read_exact(&mut bytes)?;
-        Ok(u64::from_le_bytes(bytes))
-    }
-    fn bytes(reader: &mut impl Read) -> Result<Vec<u8>> {
-        let n = integer(reader)?;
-        ensure!(n <= 512 * 1024 * 1024, "oversized Slang filesystem message");
-        let mut bytes = vec![0; n as usize];
-        reader.read_exact(&mut bytes)?;
-        Ok(bytes)
-    }
+    let retained = WORKER.with(|slot| slot.borrow_mut().take());
+    let mut worker = match retained {
+        Some((previous, mut worker)) if Some(previous) == key => {
+            if worker.child.try_wait()?.is_none() { worker } else { Worker::start(command, &adapter)? }
+        },
+        _ => Worker::start(command, &adapter)?,
+    };
+    let input = &mut worker.input;
+    let output = &mut worker.output;
     let exchange = (|| -> Result<i32> {
-        ensure!(
-            integer(&mut output)? == 1,
-            "unsupported Slang filesystem protocol"
-        );
+        input.write_all(b"C")?;
+        put(input, compiler_path(&state.root).as_bytes())?;
+        input.write_all(&(command.get_args().count() as u64).to_le_bytes())?;
+        for arg in command.get_args() {
+            put(input, arg.to_str().context("Slang argument is not UTF-8")?.as_bytes())?;
+        }
+        input.flush()?;
         loop {
             let mut tag = [0];
             output.read_exact(&mut tag)?;
             match tag[0] {
                 b'R' => {
-                    let op = integer(&mut output)? as i32;
-                    let name = String::from_utf8(bytes(&mut output)?)?;
-                    let extra = String::from_utf8(bytes(&mut output)?)?;
+                    let op = integer(&mut *output)? as i32;
+                    let name = String::from_utf8(bytes(&mut *output)?)?;
+                    let extra = String::from_utf8(bytes(&mut *output)?)?;
                     let result = state.read(op, &name, Some(&extra));
                     input.write_all(
                         &result
@@ -304,9 +359,9 @@ pub(super) fn compile(
                     input.flush()?;
                 }
                 b'E' => {
-                    let channel = integer(&mut output)?;
-                    let name = String::from_utf8(bytes(&mut output)?)?;
-                    let bytes = bytes(&mut output)?;
+                    let channel = integer(&mut *output)?;
+                    let name = String::from_utf8(bytes(&mut *output)?)?;
+                    let bytes = bytes(&mut *output)?;
                     match channel {
                         1 => state.stdout.extend(bytes),
                         2 => state.stderr.extend(bytes),
@@ -321,28 +376,22 @@ pub(super) fn compile(
                         _ => bail!("unknown Slang output channel"),
                     }
                 }
-                b'D' => return Ok(integer(&mut output)? as u32 as i32),
+                b'D' => return Ok(integer(&mut *output)? as u32 as i32),
                 _ => bail!("invalid Slang filesystem protocol"),
             }
         }
     })();
-    drop(input);
     if exchange.is_err() {
-        let _ = child.kill();
+        let _ = worker.child.kill();
+        let _ = worker.child.wait();
+        if let Some(thread) = worker.diagnostics.take() { let _ = thread.join(); }
     }
-    let exit = child.wait()?;
-    state.stderr.extend(diagnostics.join().unwrap_or_default());
-    let status = exchange.with_context(|| {
-        format!(
-            "Slang filesystem adapter {exit}: {}",
-            String::from_utf8_lossy(&state.stderr)
-        )
-    })?;
-    ensure!(
-        exit.success(),
-        "Slang filesystem adapter {exit}: {}",
-        String::from_utf8_lossy(&state.stderr)
-    );
+    state.stderr.extend(std::mem::take(&mut *worker.stderr.lock().unwrap()));
+    let status = exchange.with_context(|| format!(
+        "Slang filesystem adapter: {}", String::from_utf8_lossy(&state.stderr)))?;
+    if status >= 0 {
+        if let Some(key) = key { WORKER.with(|slot| *slot.borrow_mut() = Some((key, worker))); }
+    }
     if status < 0 && state.stderr.is_empty() {
         state
             .stderr
@@ -392,6 +441,71 @@ pub(super) fn compile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_worker_thread_teardown() -> Result<()> {
+        const CHILD: &str = "VORK_TEST_WORKER_THREAD_TEARDOWN";
+        const TEST: &str = "filesystem::tests::retained_worker_thread_teardown";
+        if std::env::var_os(CHILD).is_some() {
+            let thread = std::thread::spawn(|| -> Result<()> {
+                let compiler = Compiler::discover();
+                let output = compiler.prepare_modules(
+                    &[("main", "[numthreads(1,1,1)] void main() {}")],
+                    "main", &[("main", "compute")], &["-target", "spirv"],
+                )?.compile()?;
+                ensure!(!output.is_empty(), "empty compiler output");
+                WORKER.with(|slot| assert!(slot.borrow().is_some()));
+                eprintln!("compiled; exiting thread with retained companion");
+                Ok(())
+            });
+            thread.join().expect("compiler thread panicked")?;
+            return Ok(());
+        }
+        // Keep a Windows loader-lock regression from hanging the test runner.
+        let mut child = Command::new(std::env::current_exe()?)
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut timed_out = false;
+        while child.try_wait()?.is_none() {
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                child.kill()?;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let result = child.wait_with_output()?;
+        ensure!(!timed_out && result.status.success(),
+            "retained worker teardown (timed out: {timed_out}): {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr));
+        Ok(())
+    }
+
+    #[test]
+    fn retained_global_session_keeps_requests_isolated() -> Result<()> {
+        let compiler = Compiler::discover();
+        let build = |value: &str| -> Result<Vec<u8>> {
+            compiler.prepare_modules(&[
+                ("main", "import helper; RWStructuredBuffer<float> result; [numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID){result[id.x]=value();}"),
+                ("helper", &format!("public float value() {{ return {value}; }}")),
+            ], "main", &[("main", "compute")], &["-target", "spirv"])?.compile()
+        };
+        let first = build("0.25")?;
+        let pid = WORKER.with(|slot| slot.borrow().as_ref().unwrap().1.child.id());
+        let second = build("0.75")?;
+        assert_ne!(first, second, "a retained module hid changed source");
+        assert_eq!(first, build("0.25")?);
+        assert_eq!(pid, WORKER.with(|slot| slot.borrow().as_ref().unwrap().1.child.id()));
+        // A killed compiler must be replaced without retaining any request state.
+        WORKER.with(|slot| slot.borrow_mut().as_mut().unwrap().1.child.kill())?;
+        WORKER.with(|slot| slot.borrow_mut().as_mut().unwrap().1.child.wait())?;
+        assert_eq!(first, build("0.25")?);
+        assert_ne!(pid, WORKER.with(|slot| slot.borrow().as_ref().unwrap().1.child.id()));
+        Ok(())
+    }
+
     #[test]
     fn replay_rejects_unrecorded_queries() -> Result<()> {
         let compiler = Compiler::discover();

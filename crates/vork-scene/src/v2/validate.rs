@@ -62,14 +62,15 @@ impl Scene {
                         out.push(value);
                     }
                 }
+                let mut numbers = Vec::with_capacity(b.element_type.width());
                 for value in data {
-                    let mut numbers = Vec::new();
+                    numbers.clear();
                     flat(value, &mut numbers);
                     ensure!(
                         numbers.len() == b.element_type.width(),
                         "buffer {name}: element width mismatch"
                     );
-                    for n in numbers {
+                    for n in &numbers {
                         let valid = match b.element_type {
                             BufferType::U32 | BufferType::Uvec4 => {
                                 n.as_u64().is_some_and(|n| u32::try_from(n).is_ok())
@@ -491,7 +492,7 @@ impl Scene {
                 }
             }
         }
-        fn nodes(scene: &Scene, list: &[Node]) -> Result<()> {
+        fn nodes(scene: &Scene, media: &MediaReaders<'_>, list: &[Node]) -> Result<()> {
             let mut errors = Vec::new();
             for n in list {
                 let result = (|| -> Result<()> {
@@ -510,7 +511,7 @@ impl Scene {
                 if let Some(AimTarget::Point(point)) = &n.target {
                     ensure!(point.iter().all(|x|x.is_finite()), "node {:?}: target point must be finite",n.name);
                 }
-                scene.validate_node_time(n)?;
+                scene.validate_node_time(n, media)?;
                 match &n.kind {
                     NodeKind::Mesh {
                         geometry,
@@ -789,11 +790,11 @@ impl Scene {
                 Ok(())
                 })();
                 if let Err(error) = result {errors.push(error);}
-                if let Err(error) = nodes(scene, &n.children) {errors.push(error);}
+                if let Err(error) = nodes(scene, media, &n.children) {errors.push(error);}
             }
             diagnostics::joined(errors)
         }
-        if let Err(error) = nodes(self, &self.nodes) {errors.push(error);}
+        if let Err(error) = nodes(self, &self.media_readers(), &self.nodes) {errors.push(error);}
         if let Err(error) = self.validate_targets(nodes_by_name) {errors.push(error);}
         // A canvas has no camera.
         if let Err(error) = self.validate_render_selection(&self.main_render(), nodes_by_name,require_camera && !self.is_canvas()) {errors.push(error);}
@@ -804,7 +805,7 @@ impl Scene {
     /// Rule 12 at open: `active` windows are ordered, `time` constants are in range,
     /// and `loop` or a negative speed has an end to traverse (A7.4). The one
     /// source's length is known only at install; several or none are refused here.
-    pub(super) fn validate_node_time(&self, node: &Node) -> Result<()> {
+    pub(super) fn validate_node_time(&self, node: &Node, media: &MediaReaders<'_>) -> Result<()> {
         if matches!(
             &node.kind,
             NodeKind::Mesh {
@@ -837,7 +838,7 @@ impl Scene {
         if let Some(time) = &node.time {
             if let Some(line) = time.refusal() { anyhow::bail!("node {:?}: {line}", node.name); }
             if (time.looping || time.reverse()) && time.duration.is_none() {
-                let sources = self.media_sources(node);
+                let sources = media.media_sources(node);
                 ensure!(sources.len() + self.audio_sources(node).len() == 1, "node {:?}: time: {} write time.duration", node.name,
                     if sources.is_empty() { "loop and speed < 0 need an end;" } else { "several sources have no one length;" });
             }
@@ -858,63 +859,10 @@ impl Scene {
         visit(node, &mut out);
         out
     }
-    /// Movie and frame-sequence images sampled by materials or paints of `node` and its subtree.
-    pub fn media_sources(&self, node: &Node) -> std::collections::BTreeSet<String> {
-        let mut out = std::collections::BTreeSet::new();
-        fn visit(scene: &Scene, node: &Node, out: &mut std::collections::BTreeSet<String>) {
-            out.extend(scene.node_media(node));
-            for child in &node.children { visit(scene, child, out); }
-        }
-        visit(self, node, &mut out);
-        out
-    }
-    /// The movies and frame sequences `node` itself shows through its materials: a mesh's, an
-    /// asset's overrides, a camera's, an environment light's radiance and medium, or a path's paints (rule 7).
-    pub fn node_media(&self, node: &Node) -> Vec<String> {
-        let materials: Vec<&String> = match &node.kind {
-            NodeKind::Mesh { materials, .. } => materials.iter().collect(),
-            NodeKind::Asset { materials, .. } => materials.values().collect(),
-            NodeKind::Camera { material, .. } => material.iter().collect(),
-            NodeKind::Light { material, medium, .. } => material.iter().chain(medium).collect(),
-            _ => Vec::new(),
-        };
-        let mut out = Vec::new();
-        let paints: Vec<&Paint> = match &node.kind {
-            NodeKind::Path { fill, stroke, .. } => vec![fill, stroke],
-            NodeKind::Text { fill, stroke, content, .. } => {
-                let mut paints = vec![fill, stroke];
-                if let Content::Runs(runs) = content {
-                    paints.extend(runs.iter().flat_map(|run| run.fill.iter().chain(&run.stroke)));
-                }
-                paints
-            }
-            _ => Vec::new(),
-        };
-        for paint in paints {
-            if let Paint::Image(binding) = paint {
-                if self.images.get(&binding.image).and_then(|image| image.file.as_deref()).is_some_and(is_media_file) && !out.contains(&binding.image) {
-                    out.push(binding.image.clone());
-                }
-            }
-        }
-        if matches!(node.kind, NodeKind::Path { .. } | NodeKind::Text { .. })
-            && self.images.values().any(|image| image.file.as_deref().is_some_and(is_media_file)) {
-            for name in self.keyed_images(node) {
-                if self.images.get(&name).and_then(|image| image.file.as_deref()).is_some_and(is_media_file) && !out.contains(&name) {
-                    out.push(name);
-                }
-            }
-        }
-        for material in materials.into_iter().filter_map(|name| self.materials.get(name)) {
-            for input in material.inputs.values() {
-                if let Input::Texture(binding) = input {
-                    if self.images.get(&binding.image).and_then(|image| image.file.as_deref()).is_some_and(is_media_file) && !out.contains(&binding.image) {
-                        out.push(binding.image.clone());
-                    }
-                }
-            }
-        }
-        out
+    /// Media discovery for one immutable scene. Share it across a node walk so tracks are resolved once.
+    pub fn media_readers(&self) -> MediaReaders<'_> {
+        MediaReaders { scene: self, has_media: self.images.values().any(|image| image.file.as_deref().is_some_and(is_media_file)),
+            keyed: std::cell::OnceCell::new() }
     }
     /// One image under two clocks: a movie shown under a node clock is not also read on scene
     /// time by a compositor, the scene's or a render image's.
@@ -926,20 +874,20 @@ impl Scene {
                 readers.entry(image).or_insert_with(|| format!("images.{name}.composition.compositor"));
             }
         }
-        fn visit(scene: &Scene, nodes: &[Node], clock: Option<&str>, readers: &BTreeMap<String, String>) -> Result<()> {
+        fn visit(media: &MediaReaders<'_>, nodes: &[Node], clock: Option<&str>, readers: &BTreeMap<String, String>) -> Result<()> {
             for node in nodes {
                 let clock = if node.has_clock() { Some(node.name.as_str()) } else { clock };
                 if let Some(owner) = clock {
-                    if let Some((image, reader)) = scene.node_media(node).into_iter().find_map(|image| readers.get(&image).map(|reader| (image, reader))) {
+                    if let Some((image, reader)) = media.node_media(node).into_iter().find_map(|image| readers.get(&image).map(|reader| (image, reader))) {
                         anyhow::bail!("image {image:?} is shown under node {owner:?}'s clock and read by {reader} on scene time; give the compositor its own image");
                     }
                 }
-                visit(scene, &node.children, clock, readers)?;
+                visit(media, &node.children, clock, readers)?;
             }
             Ok(())
         }
         if readers.is_empty() { return Ok(()); }
-        visit(self, &self.nodes, None, &readers)
+        visit(&self.media_readers(), &self.nodes, None, &readers)
     }
     pub(super) fn validate_render(&self, r: &Render, nodes: &BTreeMap<&str, &Node>) -> Result<()> {
         self.validate_render_selection(r,nodes,true)
@@ -1042,12 +990,6 @@ pub(super) fn validate_camera(name: &str, nodes: &BTreeMap<&str, &Node>) -> Resu
 }
 /// The OpenPBR parameter a std/openpbr input or track names.
 pub fn validate_openpbr_input(name: &str) -> Result<&'static OpenPbrParam> {
-    if name == "base_diffuse_roughness" {
-        bail!("base_diffuse_roughness is not supported; remove base_diffuse_roughness.");
-    }
-    if matches!(name, "transmission_scatter" | "transmission_scatter_anisotropy") {
-        bail!("{name} is not supported; remove {name} and use a volume material.");
-    }
     let p = OpenPbrParam::find(name).with_context(|| match principled_spelling(name) {
         Some(meant) => format!(
             "unknown OpenPBR parameter {name:?}; did you mean {meant:?}? (Principled and glTF names are not inputs)"
@@ -1176,21 +1118,97 @@ fn validate_openpbr_value(p: &OpenPbrParam, value: &Input) -> std::result::Resul
     }
 }
 
+/// An operation-local media index borrowing its scene: scene edits and extracted compositions cannot
+/// reuse stale track bindings. Scenes without video never resolve tracks for media discovery.
+pub struct MediaReaders<'a> {
+    scene: &'a Scene,
+    has_media: bool,
+    keyed: std::cell::OnceCell<BTreeMap<String, std::collections::BTreeSet<String>>>,
+}
+impl MediaReaders<'_> {
+    /// Movie and frame-sequence images sampled by materials or paints of `node` and its subtree.
+    pub fn media_sources(&self, node: &Node) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        fn visit(scene: &MediaReaders<'_>, node: &Node, out: &mut std::collections::BTreeSet<String>) {
+            out.extend(scene.node_media(node));
+            for child in &node.children { visit(scene, child, out); }
+        }
+        visit(self, node, &mut out);
+        out
+    }
+    /// The movies and frame sequences `node` itself shows through its materials: a mesh's, an
+    /// asset's overrides, a camera's, an environment light's radiance and medium, or a path's paints (rule 7).
+    pub fn node_media(&self, node: &Node) -> Vec<String> {
+        if !self.has_media { return Vec::new(); }
+        let materials: Vec<&String> = match &node.kind {
+            NodeKind::Mesh { materials, .. } => materials.iter().collect(),
+            NodeKind::Asset { materials, .. } => materials.values().collect(),
+            NodeKind::Camera { material, .. } => material.iter().collect(),
+            NodeKind::Light { material, medium, .. } => material.iter().chain(medium).collect(),
+            _ => Vec::new(),
+        };
+        let mut out = Vec::new();
+        let paints: Vec<&Paint> = match &node.kind {
+            NodeKind::Path { fill, stroke, .. } => vec![fill, stroke],
+            NodeKind::Text { fill, stroke, content, .. } => {
+                let mut paints = vec![fill, stroke];
+                if let Content::Runs(runs) = content {
+                    paints.extend(runs.iter().flat_map(|run| run.fill.iter().chain(&run.stroke)));
+                }
+                paints
+            }
+            _ => Vec::new(),
+        };
+        for paint in paints {
+            if let Paint::Image(binding) = paint {
+                if self.scene.images.get(&binding.image).and_then(|image| image.file.as_deref()).is_some_and(is_media_file) && !out.contains(&binding.image) {
+                    out.push(binding.image.clone());
+                }
+            }
+        }
+        if matches!(node.kind, NodeKind::Path { .. } | NodeKind::Text { .. })
+            && self.has_media {
+            for name in self.keyed.get_or_init(|| self.scene.keyed_images()).get(&node.name).into_iter().flatten() {
+                if self.scene.images.get(name).and_then(|image| image.file.as_deref()).is_some_and(is_media_file) && !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+        }
+        for material in materials.into_iter().filter_map(|name| self.scene.materials.get(name)) {
+            for input in material.inputs.values() {
+                if let Input::Texture(binding) = input {
+                    if self.scene.images.get(&binding.image).and_then(|image| image.file.as_deref()).is_some_and(is_media_file) && !out.contains(&binding.image) {
+                        out.push(binding.image.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod hemisphere_tests {
     use super::*;
 
     #[test]
-    fn diffuse_roughness_stays_refused_until_its_brdf_is_implemented() {
-        let error=validate_openpbr_input("base_diffuse_roughness").err().expect("unshaded diffuse roughness accepted").to_string();
-        assert_eq!(error,"base_diffuse_roughness is not supported; remove base_diffuse_roughness.");
-    }
-
-    #[test]
-    fn transmission_scattering_names_are_refused_without_spelling_suggestions() {
-        for name in ["transmission_scatter", "transmission_scatter_anisotropy"] {
-            let error=validate_openpbr_input(name).err().expect("unshaded scattering parameter accepted").to_string();
-            assert_eq!(error,format!("{name} is not supported; remove {name} and use a volume material."));
+    fn approximated_openpbr_inputs_keep_shape_range_and_finite_validation() {
+        for name in ["base_diffuse_roughness", "transmission_scatter", "transmission_scatter_anisotropy"] {
+            let p = validate_openpbr_input(name).unwrap();
+            assert!(!p.closure, "approximation must not change the shaded Closure");
+            let input = |x| if p.kind == OpenPbrKind::Color3 {
+                Input::Vector(vec![x; 3])
+            } else { Input::Number(x) };
+            for x in [0., p.min, p.max] {
+                validate_openpbr_value(p, &input(x)).unwrap();
+            }
+            for x in [p.min - 0.1, p.max + 0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let error = validate_openpbr_value(p, &input(x)).unwrap_err().to_string();
+                assert!(error.contains(name), "{error}");
+                assert!(error.contains(if x.is_finite() { "outside" } else { "finite" }), "{error}");
+            }
+            let wrong = if p.kind == OpenPbrKind::Color3 { Input::Number(0.) } else { Input::Vector(vec![0.; 3]) };
+            assert!(validate_openpbr_value(p, &wrong).is_err());
         }
     }
 
@@ -1701,6 +1719,58 @@ mod dense_grid_tests {
             v["geometry"]=serde_json::json!({"g":{"topology":"volume","attributes":{"density":"d"}}});
             assert_eq!(check(v).is_ok(),matches!(kind,"f32"|"vec3"));
         }
+        Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod media_index_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn media_index_is_shared_by_readers_and_rebuilt_after_scene_edits() -> Result<()> {
+        let mut scene: Scene = serde_json::from_value(json!({"version":2,
+            "composition":{"space":"2d"},
+            "images":{"a":{"file":"a.mp4"},"b":{"file":"b.mp4"},"still":{"file":"still.png"}},
+            "nodes":[
+                {"name":"owner","animation":[{"tracks":[
+                    {"path":["children","p","stroke"],"keys":[[0,"red"],[1,{"image":"b"}]]}
+                ]}],"children":[{"name":"p","type":"path","d":"M0 0H1V1Z","fill":{"image":"a"}}]},
+                {"name":"t","type":"text","content":"X","font":"font.ttf"},
+                {"name":"plain","type":"path","d":"M0 0H1V1Z","fill":{"image":"still"}}
+            ],
+            "animation":[{"tracks":[
+                {"path":["nodes","t","glyphs","0","fill"],"keys":[[0,"red"],[1,{"image":"a"}]]}
+            ]}]
+        }))?;
+        {
+            let media = scene.media_readers();
+            assert!(media.keyed.get().is_none());
+            assert_eq!(media.node_media(&scene.nodes[0].children[0]), ["a", "b"]);
+            let index = media.keyed.get().unwrap() as *const _;
+            assert_eq!(media.node_media(&scene.nodes[1]), ["a"]);
+            assert!(media.node_media(&scene.nodes[2]).is_empty());
+            assert_eq!(media.media_sources(&scene.nodes[0]), ["a".into(), "b".into()].into_iter().collect());
+            assert_eq!(index, media.keyed.get().unwrap() as *const _);
+        }
+        scene.animation.clear();
+        let media = scene.media_readers();
+        assert!(media.node_media(&scene.nodes[1]).is_empty());
+        assert_eq!(media.node_media(&scene.nodes[0].children[0]), ["a", "b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn still_images_do_not_resolve_media_tracks() -> Result<()> {
+        let scene: Scene = serde_json::from_value(json!({"version":2,
+            "images":{"still":{"file":"still.png"}},
+            "nodes":[{"type":"path","name":"p","d":"M0 0H1V1Z","fill":{"image":"still"}}]
+        }))?;
+        let media = scene.media_readers();
+        assert!(media.node_media(&scene.nodes[0]).is_empty());
+        assert!(media.keyed.get().is_none());
         Ok(())
     }
 }

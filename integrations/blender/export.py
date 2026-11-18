@@ -30,6 +30,7 @@ from integrations.blender.geometry import export_gltf, filter_material_overrides
 from integrations.blender.display import translate as translate_display
 from integrations.blender.material_export import MaterialWriter
 from integrations.blender.instances import particle_occurrences
+from integrations.blender.particle_curves import export as export_particle_curves
 from integrations.blender.render_geometry import direct_render_objects, render_selection, gltf_render_settings
 report = dict(stages={}, omissions=[], materials={}, warnings=[])
 clip = None
@@ -51,7 +52,7 @@ for ob in sc.objects:
     if ob.hide_render: continue
     for p in getattr(ob, 'particle_systems', []):
         s = p.settings
-        if s.render_type not in ('OBJECT', 'COLLECTION', 'NONE'):
+        if s.render_type not in ('OBJECT', 'COLLECTION', 'NONE') and not (s.type == 'HAIR' and s.render_type == 'PATH'):
             wall('particles/hair not exported', f'{ob.name}/{p.name}: {s.type} render_as={s.render_type} count={s.count} children={s.child_type}x{s.rendered_child_count}')
     if ob.type in ('CURVES', 'VOLUME', 'POINTCLOUD'): wall(f'{ob.type} object not exported', ob.name)
     if ob.type == 'CURVE' and (ob.data.bevel_depth == 0 and ob.data.extrude == 0 and not ob.data.bevel_object): pass
@@ -87,6 +88,8 @@ writer = MaterialWriter(out, best_effort=True, curve_lookups=args.bake_curves)
 # Bake the same render-evaluated mesh/UV layout that glTF exported.
 with gltf_render_settings(sc):
     bindings = writer.write_asset(out/'scene.glb',bake_resolution=args.bake_values)
+    hair_nodes, hair_geometry, hair_buffers, report['particle_curves'] = export_particle_curves(
+        sc, writer, animated=animated, on_substitution=wall)
 report['material_reports'] = writer.reports
 report['asset_reports'] = writer.asset_reports
 for name in sorted(used):
@@ -162,6 +165,7 @@ elif cd.dof.use_dof:
 materials['camera-optics'] = dict(program='std/camera',inputs=optics)
 nodes = [dict(type='asset', name='model', file='scene.glb', materials=bindings, nodes=asset_overrides(out/'scene.glb',
     lambda obj,reason,replacement: wall('object ray visibility', f'{obj}: {reason}; {replacement}'))), cam]
+nodes.extend(hair_nodes)
 if environment is not None: nodes.append(environment)
 lights = collections.Counter()
 visible = direct_render_objects(bpy.context.view_layer.layer_collection)
@@ -197,6 +201,8 @@ with gltf_render_settings(sc):
 report['lights'] = dict(lights)
 scene_doc = dict(version=2, composition=dict(space="3d", **display), render=render, nodes=nodes, images={**images, **writer.images}, programs=writer.programs,
                  materials={**materials, **writer.materials})
+if hair_geometry:
+    scene_doc.update(geometry=hair_geometry, buffers=hair_buffers)
 if animated:
     controls = sample_controls(sc, control_bindings)
     for node in nodes:

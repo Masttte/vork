@@ -1,13 +1,14 @@
-# OpenPBR Surface parameters (exact)
+# OpenPBR Surface parameter declarations
 
 Source: OpenPBR Surface specification **v1.1.1** (2026-04-17), Academy Software Foundation.
 - Table: https://github.com/AcademySoftwareFoundation/OpenPBR/blob/v1.1.1/parametrization.md.html ("Parameter reference")
 - Meanings: https://github.com/AcademySoftwareFoundation/OpenPBR/blob/v1.1.1/index.html (per-section parameter tables)
 - Fetched 2026-10-21 from tag `v1.1.1` (latest release). Copied, not recalled.
 
-This table holds the 38 of the specification's 41 parameters that vork shades, with the specification's
-identifiers, types, ranges and defaults. All are std/openpbr material inputs. The other three (base_diffuse_roughness,
-transmission_scatter, transmission_scatter_anisotropy) are neither inputs nor Closure fields.
+This table holds all 41 specification parameters with their identifiers, types, ranges and defaults.
+All are std/openpbr material inputs. This is a declaration table, not a conformance claim:
+accepted inputs may be approximated; see [implementation](../../docs/design/materials.md).
+The three approximation-only inputs below do not add shaded Closure fields.
 No aliases. The std-only evaluation input below is excluded from Closure. Range: `[]` inclusive, `()` exclusive, per channel for colours and vectors. Norm is the
 typically useful range where it differs from the allowed range (a soft range, not a clamp). Lengths other than
 `thin_film_thickness` are in scene world units (metres in vork). `color3` is linear in the model colour space (OpenPBR
@@ -76,3 +77,9 @@ Spec-text notes (copied as the reference table gives them):
 Std evaluation input (not an OpenPBR Closure field):
 
 | `alpha_cutoff` | float | [-1, 1] | | -1 | | Negative disables threshold; otherwise geometry_opacity >= alpha_cutoff produces 1, else 0 | Input only |
+
+Approximation-only OpenPBR inputs (accepted and validated; zero is neutral):
+
+| `base_diffuse_roughness` | float | [0, 1] | | 0 | | Diffuse roughness; approximated with Lambert diffuse | Approximation only |
+| `transmission_scatter` | color3 | [0, 1]³ | | (0, 0, 0) | | Interior scattering albedo; approximated with Beer-only transmission | Approximation only |
+| `transmission_scatter_anisotropy` | float | [-1, 1] | | 0 | | Henyey-Greenstein anisotropy; approximated without interior scattering | Approximation only |

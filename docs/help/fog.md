@@ -1,7 +1,7 @@
 FOG AND VOLUMES
 Author a Slang program with MediumCoefficients medium(MediumContext, Inputs).
 Bind its material to light.medium on the single environment light for world fog,
-or to a closed triangle mesh for finite homogeneous fog. No surface stage
+or to a closed triangle mesh for finite fog, smoke or fire. No surface stage
 is needed on a carrier. See vork help programs --all for program bindings.
 
 MediumCoefficients fields all default to zero:
@@ -16,15 +16,17 @@ MediumContext supplies position (carrier-local; world for the environment),
 world_position (metres), time (seconds), wavelength (nm; zero in RGB).
 Node scaling changes carrier bounds, not coefficient units.
 
-Stage 1 admits spatially constant coefficients on finite carriers; world fog may
-also use certified exponential-height absorption/scattering. Height extinction
+Finite carriers admit bounded spatial coefficient programs; world fog admits
+constant or certified exponential-height absorption/scattering. Height extinction
 has the form coefficient * exp(-falloff * (world_position.y - base_height)),
 with base_height in metres and falloff in inverse metres; emission stays constant.
 Zero channels must stay zero even where the exponential overflows. Nonfinite
 positive evaluated coefficients refuse the image. Admission proves the supported
-coefficient form and bounded callback work; arbitrary density, resource inputs
-(images, grids, geometry), unprovable loops and combined surface/medium programs
-are refused. Program Inputs initializers define authored input defaults.
+coefficient bounds and bounded callback work; arbitrary world density, image and
+geometry inputs, unprovable loops and combined surface/medium programs
+are refused. FloatGrid and VectorGrid inputs (import std.grid; sample_grid) read a
+dense buffer or a .vdb/.nvdb grid; extinction is bounded by the grid's stored range.
+A geometry with topology: volume is a carrier bounded by its grids. Program Inputs initializers define authored input defaults.
 
 World segments end at mathematical infinity. Positive constant extinction closes
 the world; uniform nonemitting fog cannot receive light from infinity.
@@ -39,8 +41,5 @@ qualified fallback. Builtin OpenPBR surfaces, including glass and subsurface,
 may coexist with fog, implicit geometry and curved propagation.
 Custom surface callbacks, including those paired with displacement, are not yet supported. Deformed carriers and finite-fog
 subtree renders remain unsupported. Normal fog paths use sampled free flights and compensated Russian roulette.
-An emergency step watchdog reports `terminated_medium_paths` and warns if it fires.
-`discarded_medium_radiance` reports the accumulated absolute-luminance sum erased
-before sample averaging; additional energy in the untraced continuation is unknown.
-Ordinary scenes should not reach this watchdog.
+Exhausting the transport work allowance refuses the frame; simplify the medium.
 Exact attachment field: vork help field light.medium.

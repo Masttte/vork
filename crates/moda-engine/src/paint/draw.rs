@@ -20,12 +20,46 @@ use std::collections::{HashMap, HashSet};
 use crate::external_texture::ExternalUploadOutcome;
 use crate::paint::image_source::DecodedImage;
 
+/// Uploaded immutable images shared by engines on one device and in one working colour.
+/// Entries are weak: the drawing caches, not the installation, own residency.
+#[derive(Default)]
+pub struct SharedImages(
+    std::sync::Mutex<HashMap<String, SharedImage>>,
+    std::sync::Mutex<HashMap<String, SharedImage>>,
+);
+struct SharedImage {
+    pixels: std::sync::Weak<Vec<u8>>,
+    texture: std::sync::Weak<wgpu::Texture>,
+    size: [u32; 2],
+}
+
+impl SharedImages {
+    /// Shader images are straight RGBA8 without mips; keep their namespace apart
+    /// from paint images, whose upload includes colour conversion and mipmaps.
+    pub(crate) fn shader_texture(&self, key: &str, pixels: &std::sync::Arc<Vec<u8>>, size: [u32; 2],
+        create: impl FnOnce() -> wgpu::Texture) -> std::sync::Arc<wgpu::Texture> {
+        let mut store = self.1.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(texture) = store.get(key).filter(|entry| entry.size == size
+            && entry.pixels.ptr_eq(&std::sync::Arc::downgrade(pixels))).and_then(|entry| entry.texture.upgrade()) {
+            return texture;
+        }
+        let texture = std::sync::Arc::new(create());
+        crate::scratch::flush();
+        store.retain(|_, entry| entry.texture.strong_count() > 0);
+        store.insert(key.to_string(), SharedImage { pixels: std::sync::Arc::downgrade(pixels),
+            texture: std::sync::Arc::downgrade(&texture), size });
+        texture
+    }
+}
+
 /// Per-frame (or per-engine) cache of uploaded pattern textures and their
 /// texture bind groups.
 pub struct PatternTextureCache {
     /// Trilinear (linear between mip levels): an image drawn smaller than its pixels samples the level whose texels
     /// match the screen's, as a filtered downscale would, in the canvas and the export alike. With one level (a
     /// borrowed capture texture) it is plain bilinear.
+    shared: Option<std::sync::Arc<SharedImages>>,
+    shared_textures: HashMap<String, std::sync::Arc<wgpu::Texture>>,
     repeat_sampler: wgpu::Sampler,
     clamp_sampler: wgpu::Sampler,
     /// The owning engine's working colour: the encoding decoded images are uploaded in (`level0`). `None` is sRGB,
@@ -83,6 +117,8 @@ impl PatternTextureCache {
         };
         let linear = wgpu::MipmapFilterMode::Linear;
         PatternTextureCache {
+            shared: None,
+            shared_textures: HashMap::new(),
             repeat_sampler: mk("pattern repeat sampler", wgpu::AddressMode::Repeat, linear),
             clamp_sampler: mk("pattern clamp sampler", wgpu::AddressMode::ClampToEdge, linear),
             working,
@@ -100,6 +136,11 @@ impl PatternTextureCache {
             pending_retry: HashSet::new(),
             surface_tokens: HashMap::new(),
         }
+    }
+
+    /// Call before the first draw. Mutable surfaces and external/video frames stay local.
+    pub fn share_images(&mut self, shared: std::sync::Arc<SharedImages>) {
+        self.shared = Some(shared);
     }
 
     /// Task #95 R2d: advance the LRU clock (once per render).
@@ -147,7 +188,7 @@ impl PatternTextureCache {
                 crate::surface::detach_texture(token, budget);
             }
             self.surface_mips.remove(key);
-            if self.borrowed_textures.remove(key).is_none() {
+            if self.borrowed_textures.remove(key).is_none() && self.shared_textures.remove(key).is_none() {
                 crate::scratch::destroy(&texture);
             }
         }
@@ -247,7 +288,7 @@ impl PatternTextureCache {
                 crate::surface::detach_texture(token, false);
             }
             self.surface_mips.remove(&key);
-            if self.borrowed_textures.remove(&key).is_none() {
+            if self.borrowed_textures.remove(&key).is_none() && self.shared_textures.remove(&key).is_none() {
                 crate::scratch::destroy(&texture);
             }
         }
@@ -306,6 +347,11 @@ impl PatternTextureCache {
         if image.external.is_some() && self.heap_pixel_allocations.contains_key(key) {
             self.evict(key, false);
         }
+        let share = self.shared.is_some() && image.external.is_none() && !key.starts_with("video:");
+        if share && self.heap_pixel_allocations.get(key).is_some_and(|pixels|
+            !pixels.ptr_eq(&std::sync::Arc::downgrade(&image.rgba_premultiplied))) {
+            self.evict(key, false);
+        }
         if image.external.is_none() {
             if let Some(texture) = self.textures.get(key) {
                 let oversized = image.width.max(image.height) > device.limits().max_texture_dimension_2d;
@@ -339,6 +385,24 @@ impl PatternTextureCache {
                     }
                     self.heap_pixel_allocations.insert(key.to_string(), std::sync::Arc::downgrade(&image.rgba_premultiplied));
                     self.regen_all_mips(device, queue, key);
+                }
+            }
+        }
+        // The publication lock covers creation, upload and mip submission. A second engine
+        // sees only a complete immutable image, never an allocation being rewritten.
+        let shared = (share && !self.textures.contains_key(key)).then(|| self.shared.as_ref().unwrap().clone());
+        let mut shared = shared.as_ref().map(|store| store.0.lock().unwrap_or_else(|poison| poison.into_inner()));
+        if !self.textures.contains_key(key) {
+            if let Some(store) = shared.as_ref() {
+                if let Some(entry) = store.get(key).filter(|entry| entry.size == [image.width, image.height]
+                    && entry.pixels.ptr_eq(&std::sync::Arc::downgrade(&image.rgba_premultiplied))) {
+                    if let Some(texture) = entry.texture.upgrade() {
+                        self.textures.insert(key.to_string(), texture.as_ref().clone());
+                        self.shared_textures.insert(key.to_string(), texture);
+                        self.heap_pixel_allocations.insert(key.to_string(), entry.pixels.clone());
+                        self.usage.insert(key.to_string(), (bytes, self.tick));
+                        self.total_bytes += bytes;
+                    }
                 }
             }
         }
@@ -496,9 +560,23 @@ impl PatternTextureCache {
                 }
                 texture
             };
+            if let Some(store) = shared.as_mut() {
+                // Mip generation can be held by a surrounding scratch render.
+                // Publish only after every prerequisite is on the shared queue.
+                crate::scratch::flush();
+                let owner = std::sync::Arc::new(texture.clone());
+                store.retain(|_, entry| entry.texture.strong_count() > 0);
+                store.insert(key.to_string(), SharedImage {
+                    pixels: std::sync::Arc::downgrade(&image.rgba_premultiplied),
+                    texture: std::sync::Arc::downgrade(&owner),
+                    size: [image.width, image.height],
+                });
+                self.shared_textures.insert(key.to_string(), owner);
+            }
             self.textures.insert(key.to_string(), texture);
         }
 
+        drop(shared);
         let cache_key = (key.to_string(), clamp);
         if !self.bind_groups.contains_key(&cache_key) {
             let texture = &self.textures[key];
@@ -697,6 +775,66 @@ mod tests {
 
     // These tests share the process-global uploader slot, so each holds the
     // common test lock while it initializes the GPU and exercises the cache.
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn immutable_images_share_ownership_without_cross_worker_rewrites() {
+        let gpu = crate::device::GpuContext::new(crate::device::BackendChoice::Auto).expect("GPU test requires a working adapter");
+        eprintln!("shared-image GPU: {}", gpu.adapter_info.name);
+        let scratch = crate::scratch::ScratchPool::default();
+        scratch.enter(&gpu.device, true);
+        let shared = Arc::new(SharedImages::default());
+        let layout = pattern_texture_bgl(&gpu.device);
+        let mut a = PatternTextureCache::new(&gpu.device, None);
+        let mut b = PatternTextureCache::new(&gpu.device, None);
+        a.share_images(shared.clone()); b.share_images(shared);
+        let mut image = DecodedImage { width: 4, height: 4, rgba_premultiplied: Arc::new(vec![255; 64]), straight: false, external: None };
+        a.bind_group(&gpu.device, &gpu.queue, &layout, "image", &image, true);
+        b.bind_group(&gpu.device, &gpu.queue, &layout, "image", &image, true);
+        assert_eq!(a.textures["image"], b.textures["image"]);
+        let old = b.textures["image"].clone();
+        image.rgba_premultiplied = Arc::new(vec![0; 64]);
+        a.bind_group(&gpu.device, &gpu.queue, &layout, "image", &image, true);
+        assert_ne!(a.textures["image"], old, "a new pixel identity gets a new immutable allocation");
+        assert_eq!(b.textures["image"], old, "the other worker retains its own picture");
+        a.clear_gpu_resources();
+        // Sampling through a fresh view validates the original allocation after
+        // another worker has replaced and destroyed its own cache.
+        let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shared immutable mip read"),
+            source: wgpu::ShaderSource::Wgsl("@group(0) @binding(0) var s: sampler; @group(0) @binding(1) var t: texture_2d<f32>; @group(0) @binding(2) var<storage,read_write> result: vec4<f32>; @compute @workgroup_size(1) fn main() { result = textureSampleLevel(t, s, vec2<f32>(0.5), 2.0); }".into()),
+        });
+        let pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("shared immutable mip read"), layout: None, module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        let result = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let view = b.texture_view("image").unwrap();
+        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shared image lifetime"), layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&b.clamp_sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 2, resource: result.as_entire_binding() }],
+        });
+        let mut command = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = command.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline); pass.set_bind_group(0, &group, &[]); pass.dispatch_workgroups(1, 1, 1);
+        }
+        command.copy_buffer_to_buffer(&result, 0, &read, 0, 16);
+        gpu.queue.submit([command.finish()]);
+        let (send, receive) = std::sync::mpsc::channel();
+        read.map_async(wgpu::MapMode::Read, .., move |result| { send.send(result).unwrap(); });
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receive.recv().unwrap().unwrap();
+        let pixels = bytemuck::cast_slice::<u8, f32>(&read.get_mapped_range(..)).to_vec();
+        read.unmap();
+        scratch.leave(&gpu.queue, true);
+        assert_eq!(pixels, [1., 1., 1., 1.], "the other cache's white mip survives replacement and eviction");
+    }
 
     #[test]
     #[ignore = "requires a working GPU adapter"]

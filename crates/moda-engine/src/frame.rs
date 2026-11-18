@@ -404,6 +404,21 @@ pub(crate) fn placed_span(scene: &Scene, recipe: &TranslationPlacement, items: &
     placed_at(&a, opacity, recipe, items)
 }
 
+/// Re-evaluate the ordinary placement recipe under the same capture-opacity context as emission.
+/// The product is recomputed in its original order; no ratio of rounded opacities is applied.
+pub(crate) fn placed_span_in_capture(scene: &Scene, recipe: &TranslationPlacement, items: &[DrawItem],
+    context: &[(u32, u8)]) -> Option<Placed> {
+    let node = scene.effective_node(&recipe.source)?;
+    let faded = |id: &str| scene.row_of(id).is_some_and(|row|
+        context.iter().any(|&(capture, flags)| capture == row && flags & 1 != 0));
+    let ancestor = scene.ancestor_opacity_product_except(&recipe.source, faded);
+    let own_faded = faded(&recipe.source);
+    let own = node.f64("opacity").unwrap_or(1.0);
+    let opacity = if ancestor < 1.0 || own_faded { (if own_faded { 1.0 } else { own }) * ancestor } else { own };
+    let affine = scene.node_canvas_affine(&recipe.source)?;
+    placed_at(&affine, opacity, recipe, items)
+}
+
 /// [`placed_span`] for a recipe whose source node is the scene row `row`: the matrix is read from the scene's
 /// world column (`Scene::row_canvas_affine`), the same numbers the walk by name composes, and no name is looked
 /// up. `None` also when the column does not answer for that row.
@@ -457,6 +472,8 @@ pub(crate) fn translate_span(scene: &Scene, recipe: &mut TranslationPlacement, i
 /// items without rebuilding the display list or re-deriving page geometry.
 #[derive(Debug, Clone, Default)]
 pub struct PlanBuildAux {
+    /// The same recorded planning units the camera retains, for offscreen dependency updates.
+    pub segment: Option<CameraSegment>,
     pub spans: Vec<NodeSpan>,
     pub page_clip: [f32; 4],
     pub transparent: bool,
@@ -491,6 +508,15 @@ pub struct PlanUnit {
     pub z_consumed: u64,
     /// Masks in the segment's table before the unit was planned.
     pub masks_before: usize,
+    /// Actual reads in the segment-local mask table, recorded by the mask builder.
+    /// Used by the offscreen retained index; includes reads inside nested captures.
+    pub mask_reads: Vec<usize>,
+    /// The ordinary body emitter read the page's analytic-body eligibility.
+    pub(crate) reads_body_mode: bool,
+    /// Composition outputs emitted separately from the child content they consume.
+    pub(crate) compositions: Vec<CompositionRecipe>,
+    /// Filter operations recorded by the ordinary subtree executor, including nested outputs.
+    pub(crate) captures: Vec<CaptureRecipe>,
     /// Skipped by the cull window (no items; still consumed its z).
     pub culled: bool,
     /// A range inside it (a subtree capture's) was skipped by the cull window.
@@ -503,17 +529,75 @@ pub struct PlanUnit {
     pub flags: u8,
 }
 
+/// The source bounds consumed by an emitted filtered subtree. The output graph retains this
+/// operation independently of the preparation records inside it.
+#[derive(Debug, Clone)]
+pub(crate) struct CaptureRecipe {
+    pub(crate) row: u32,
+    pub(crate) strip_masks: Vec<u64>,
+    pub(crate) mask_table: Vec<u64>,
+    pub(crate) bounds: crate::backdrop::plan::Rect,
+    pub(crate) isolations: Vec<([usize; 2], Option<crate::backdrop::plan::Rect>)>,
+}
+#[derive(Default)]
+struct SubtreeOutputs {
+    composition: Option<CompositionRecipe>,
+    capture: Option<CaptureRecipe>,
+}
+
+/// A composition output emitted by the shared subtree executor. Child bounds are derived from child
+/// preparation; the source's paint value is read here, not baked into those children.
+#[derive(Debug, Clone)]
+pub(crate) struct CompositionRecipe {
+    pub(crate) row: u32,
+    bounds: Option<crate::backdrop::plan::Rect>,
+    mode: u32,
+    fade: bool,
+}
+impl CompositionRecipe {
+    pub(crate) fn same_inputs(&self, other: &Self) -> bool { self.row == other.row && self.fade == other.fade }
+    pub(crate) fn separates_paint(&self) -> bool { self.fade }
+    pub(crate) fn with_bounds(&self, bounds: Option<crate::backdrop::plan::Rect>) -> Self { Self { bounds, ..self.clone() } }
+    pub(crate) fn bounds_match(&self, bounds: Option<crate::backdrop::plan::Rect>) -> bool {
+        let bits = |r: crate::backdrop::plan::Rect| [r.x.to_bits(), r.y.to_bits(), r.w.to_bits(), r.h.to_bits()];
+        self.bounds.map(bits) == bounds.map(bits)
+    }
+    pub(crate) fn emit(&self, scene: &Scene, ctx: &crate::backdrop::PlanCtx)
+        -> Option<[DrawItem; 2]> {
+        let node = scene.row(self.row)?;
+        if self.fade != moda_scene::scene::is_opacity_group(node) { return None; }
+        let fade = self.fade.then(|| node.f64("opacity").unwrap_or(1.0));
+        let (begin, end) = composition_splits(node, ctx, self.bounds, self.mode, fade)?;
+        Some([DrawItem::BackdropSplit(Box::new(begin)), DrawItem::BackdropSplit(Box::new(end))])
+    }
+}
+fn composition_splits(node: &moda_scene::types::RawNode, ctx: &crate::backdrop::PlanCtx,
+    bounds: Option<crate::backdrop::plan::Rect>, mode: u32, fade: Option<f64>)
+    -> Option<(crate::seams::BackdropSplit, crate::seams::BackdropSplit)> {
+    match fade {
+        Some(opacity) => crate::backdrop::blend::compute_region_fade_splits(node, ctx, bounds, mode, opacity),
+        None => crate::backdrop::blend::compute_region_blend_splits(node, ctx, bounds, mode),
+    }
+}
+
 /// Records [`PlanUnit`]s while [`append_node_draw_items`] plans a display list.
 #[derive(Debug, Default)]
 pub(crate) struct UnitRecorder {
     pub units: Vec<PlanUnit>,
+    pub(crate) prepared: Option<crate::prepared_rows::PreparedRows>,
+    /// A retained source interval owns plain child output too, including after its composition ends.
+    retain_plain: bool,
     /// The open unit, with the warning counts at its start.
-    open: Option<(PlanUnit, usize, usize)>,
+    open: Option<(PlanUnit, usize, usize, usize)>,
     /// `items.len()` when the recording started (unit item offsets are relative).
     base: usize,
 }
 
 impl UnitRecorder {
+    fn read_body_mode(&mut self) {
+        if let Some((unit, ..)) = self.open.as_mut() { unit.reads_body_mode = true; }
+    }
+
     fn start(&mut self, items_len: usize) {
         self.base = items_len;
     }
@@ -524,24 +608,25 @@ impl UnitRecorder {
         items_len: usize,
         z: u64,
         warnings: &PlanWarnings,
-        masks_len: usize,
+        masks: &crate::effects::PlanMasks,
     ) {
-        self.close(dl_index, items_len, z, warnings);
+        self.close(dl_index, items_len, z, warnings, masks);
         self.open = Some((
             PlanUnit {
                 dl_start: dl_index,
                 item_start: items_len - self.base,
                 z,
-                masks_before: masks_len,
+                masks_before: masks.masks.len(),
                 ..PlanUnit::default()
             },
             warnings.skipped.len(),
             warnings.dropped.len(),
+            masks.reads().len(),
         ));
     }
 
     fn mark_culled(&mut self, whole: bool) {
-        if let Some((u, _, _)) = self.open.as_mut() {
+        if let Some((u, _, _, _)) = self.open.as_mut() {
             if whole {
                 u.culled = true;
             } else {
@@ -550,8 +635,11 @@ impl UnitRecorder {
         }
     }
 
-    fn close(&mut self, dl_end: usize, items_len: usize, z: u64, warnings: &PlanWarnings) {
-        if let Some((mut u, s0, d0)) = self.open.take() {
+    fn close(&mut self, dl_end: usize, items_len: usize, z: u64, warnings: &PlanWarnings, masks: &crate::effects::PlanMasks) {
+        if let Some((mut u, s0, d0, m0)) = self.open.take() {
+            u.mask_reads = masks.reads()[m0..].to_vec();
+            u.mask_reads.sort_unstable();
+            u.mask_reads.dedup();
             u.dl_end = dl_end;
             u.item_len = items_len - self.base - u.item_start;
             u.z_consumed = z - u.z;
@@ -598,6 +686,7 @@ pub struct CameraSegment {
     pub z_start: u64,
     pub z_end: u64,
     pub units: Vec<PlanUnit>,
+    pub(crate) prepared: Option<crate::prepared_rows::PreparedRows>,
     /// Warnings raised outside its units: before them (page-level) and by its
     /// mask table after them.
     pub head_warnings: PlanWarnings,
@@ -621,6 +710,7 @@ pub(crate) struct RangeBuild {
     pub end_z: u64,
     /// Units relative to the range (display-list indices from 0).
     pub units: Vec<PlanUnit>,
+    pub(crate) prepared: Option<crate::prepared_rows::PreparedRows>,
 }
 
 /// Scale RFC stage C: re-plan `dl_items` (a unit-aligned range of `seg`'s display
@@ -660,6 +750,43 @@ pub(crate) fn rebuild_segment_range(
         crate::backdrop::PlanCtx::new_camera(scene, p.width_px, p.height_px, seg.page_clip, p.vp)
             .at_shader_time(opts.shader_time_s)
     });
+    rebuild_range_inner(scene, seg, dl_items, opts, backdrop_ctx.as_ref(), layer_blur_ctx.as_ref(),
+        caches, z_start, cull, None, &[], false)
+}
+
+/// Re-plan an offscreen page unit with exactly the projection and composition context of its cold build.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rebuild_page_range(
+    scene: &Scene, plan: &CoveragePlan, seg: &CameraSegment,
+    dl_items: &[moda_scene::types::PaintItem], opts: &RenderOptions,
+    caches: Option<CacheCtx<'_>>, z_start: u64, prepared: Option<crate::prepared_rows::PreparedRows>,
+    inherited: &[(u32, u8)], retain_plain: bool,
+) -> RangeBuild {
+    let (backdrop, layer) = page_range_contexts(scene, plan, seg, opts);
+    rebuild_range_inner(scene, seg, dl_items, opts, backdrop.as_ref(), layer.as_ref(), caches, z_start, None, prepared, inherited, retain_plain)
+}
+
+/// Every retained source re-enters the emitter under the page inputs recorded by its cold build.
+/// The contexts borrow only the scene; writing the output plan does not invalidate them.
+pub(crate) fn page_range_contexts<'a>(
+    scene: &'a Scene, plan: &CoveragePlan, seg: &CameraSegment, opts: &RenderOptions,
+) -> (Option<crate::backdrop::PlanCtx<'a>>, Option<crate::backdrop::PlanCtx<'a>>) {
+    let context = || crate::backdrop::PlanCtx::new(scene, plan.width_px, plan.height_px,
+        plan.camera[0], plan.camera[1], plan.page_size[0], plan.page_size[1], seg.page_clip);
+    let backdrop = seg.backdrop.map(|keep_sdf| context()
+        .over_transparent(seg.node_transparent).keeping_shape_sdf(keep_sdf));
+    let layer = seg.layer_blur.then(|| context().at_shader_time(opts.shader_time_s));
+    (backdrop, layer)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_range_inner(
+    scene: &Scene, seg: &CameraSegment, dl_items: &[moda_scene::types::PaintItem],
+    opts: &RenderOptions, backdrop_ctx: Option<&crate::backdrop::PlanCtx>,
+    layer_blur_ctx: Option<&crate::backdrop::PlanCtx>, caches: Option<CacheCtx<'_>>,
+    z_start: u64, cull: Option<&crate::cull::Aabb>, prepared: Option<crate::prepared_rows::PreparedRows>,
+    inherited: &[(u32, u8)], retain_plain: bool,
+) -> RangeBuild {
     let mut plan_masks = crate::effects::PlanMasks::with_text_masks(seg.text_masks)
         .with_vector_text_masks(true)
         .in_working_color(opts.working.is_some())
@@ -673,7 +800,7 @@ pub(crate) fn rebuild_segment_range(
     };
     let mut items = Vec::new();
     let mut warnings = PlanWarnings::default();
-    let mut recorder = UnitRecorder::default();
+    let mut recorder = UnitRecorder { retain_plain: retain_plain && prepared.is_some(), prepared, ..Default::default() };
     let mut cull_out = CullOut::default();
     let end_z = append_node_draw_items(
         scene,
@@ -681,8 +808,8 @@ pub(crate) fn rebuild_segment_range(
         opts,
         seg.node_transparent,
         seg.page_clip,
-        backdrop_ctx.as_ref(),
-        layer_blur_ctx.as_ref(),
+        backdrop_ctx,
+        layer_blur_ctx,
         &mut plan_masks,
         caches,
         &mut items,
@@ -691,6 +818,7 @@ pub(crate) fn rebuild_segment_range(
         None,
         cull.map(|w| (w, &mut cull_out)),
         Some(&mut recorder),
+        inherited,
     );
     let mut mask_warnings = PlanWarnings::default();
     let masks = plan_masks.into_masks(&mut mask_warnings);
@@ -700,6 +828,7 @@ pub(crate) fn rebuild_segment_range(
         mask_warnings,
         end_z,
         units: recorder.units,
+        prepared: recorder.prepared,
     }
 }
 
@@ -893,6 +1022,7 @@ pub fn build_coverage_plan_indexed_with_dl(
     prebuilt_dl: Option<moda_scene::DisplayList>,
 ) -> Result<(CoveragePlan, PlanWarnings, PlanBuildAux)> {
     let mut aux = PlanBuildAux::default();
+    let mut segment = None;
     let (plan, warnings, _end_z) = build_coverage_plan_inner(
         scene,
         page_index,
@@ -905,8 +1035,9 @@ pub fn build_coverage_plan_indexed_with_dl(
         prebuilt_dl,
         None,
         None,
-        None,
+        Some(&mut segment),
     )?;
+    aux.segment = segment;
     Ok((plan, warnings, aux))
 }
 
@@ -930,6 +1061,7 @@ pub(crate) fn rebuild_node_items(
     transparent: bool,
     page_clip: [f32; 4],
     backdrop_ctx: Option<&crate::backdrop::PlanCtx>,
+    layer_blur_ctx: Option<&crate::backdrop::PlanCtx>,
     plan_masks: &mut crate::effects::PlanMasks,
     caches: Option<CacheCtx<'_>>,
     z_in: u64,
@@ -948,10 +1080,7 @@ pub(crate) fn rebuild_node_items(
         transparent,
         page_clip,
         backdrop_ctx,
-        // Layer-blur pages are excluded from incremental seeding
-        // (`aux.has_layer_blur`), so the patcher never rebuilds a diverted
-        // node — no ctx here.
-        None,
+        layer_blur_ctx,
         plan_masks,
         caches,
         &mut items,
@@ -960,6 +1089,7 @@ pub(crate) fn rebuild_node_items(
         None,
         None,
         None,
+        &[],
     );
     (items, end_z - z_in, warnings)
 }
@@ -1610,6 +1740,7 @@ pub fn build_camera_plan_culled_with(
         sample_count,
         camera: [cam.camera_x, cam.camera_y],
         items,
+        item_order: None,
         masks,
         camera_frame: Some(crate::seams::CameraFrameView {
             camera_x: cam.camera_x,
@@ -2064,7 +2195,9 @@ fn build_coverage_plan_inner(
         Some(dl) => dl,
         None => {
             let dl = std::sync::Arc::new(
-                prebuilt_dl.unwrap_or_else(|| moda_scene::build_display_list(scene, &page_id)),
+                prebuilt_dl.unwrap_or_else(|| if aux.is_some() && camera_backdrop.is_none() {
+                    moda_scene::display_list::build_retained_display_list(scene, &page_id)
+                } else { moda_scene::build_display_list(scene, &page_id) }),
             );
             if let Some((c, _)) = caches.as_mut() {
                 c.dl_put(&page_id, dl.clone());
@@ -2085,7 +2218,10 @@ fn build_coverage_plan_inner(
     // rust-edit-incremental-z4: capture per-node spans when an index is wanted.
     let mut spans_buf: Option<Vec<NodeSpan>> = aux.as_ref().map(|_| Vec::new());
     let culled_before = cull.as_ref().map_or(0, |(_, o)| o.roots.len());
-    let mut recorder = seg_out.as_ref().map(|_| UnitRecorder::default());
+    let mut recorder = seg_out.as_ref().filter(|_| aux.is_some() || camera_backdrop.is_some()
+        || page_splits || page_has_layer_blur || !scene.group_appearance_by_id().is_empty()
+        || dl.items.iter().any(|item| !item.clip_chain.is_empty() || scene.clip_below_base(&item.node_id).is_some()))
+        .map(|_| UnitRecorder { prepared: (aux.is_some() && camera_backdrop.is_none()).then(Default::default), ..Default::default() });
     let head_warnings = seg_out.as_ref().map(|_| warnings.clone());
     let prefix = items.len();
     let end_z = append_node_draw_items(
@@ -2104,6 +2240,7 @@ fn build_coverage_plan_inner(
         spans_buf.as_mut(),
         cull.as_mut().map(|(w, o)| (&**w, &mut **o)),
         recorder.as_mut(),
+        &[],
     );
     depth::ensure_render_z(drawn_z_end(&items))?;
     let mut tail_warnings = PlanWarnings::default();
@@ -2125,6 +2262,7 @@ fn build_coverage_plan_inner(
             z_start,
             z_end: end_z,
             units: recorder.units,
+            prepared: recorder.prepared,
             head_warnings: head_warnings.unwrap_or_default(),
             tail_warnings: tail_warnings.clone(),
         });
@@ -2154,6 +2292,7 @@ fn build_coverage_plan_inner(
             sample_count,
             camera: [page_x, page_y],
             items,
+            item_order: None,
             masks,
             // Page-local export/editor-snapshot path: no camera override, no
             // backdrop clear color (the page-fill quad covers the target).
@@ -2210,6 +2349,18 @@ fn is_excluded(scene: &Scene, id: &str, exclude: &[String]) -> bool {
     false
 }
 
+/// The recorded group-boundary operation has no body output. Its children and any separately recorded
+/// composition carry the drawing; the same operation is consumed by cold and retained execution.
+pub(crate) fn boundary_has_no_body(item: &moda_scene::types::PaintItem) -> bool {
+    item.kind == PaintKind::GroupBoundary
+}
+
+/// Structural source role shared by emission and retained body ownership. Mask-only sources
+/// are consumed through mask reads; they never own an ordinary body, even when its output is empty.
+pub(crate) fn source_has_body(item: &moda_scene::types::PaintItem) -> bool {
+    !boundary_has_no_body(item) && !item.fallback_reasons.contains(&"text-mask-source")
+}
+
 /// The skip-filters of [`append_node_draw_items`]: a primary display-list item that
 /// draws nothing AND consumes no render-z. Every other primary item consumes z
 /// (1, or a blend's expansion count) whether or not it draws — which is what lets
@@ -2249,13 +2400,8 @@ fn item_skipped_without_z(
     if transparent && moda_scene::types::is_page_bg_id(&item.node_id) {
         return true; // skipPageBackgrounds (displayListAdapter.ts:68)
     }
-    // Group boundaries render nothing and consume NO z (renderNode.ts:32).
-    if item.kind == PaintKind::GroupBoundary {
-        return true;
-    }
-    // Active clip-mask source nodes are skipped without consuming z
-    // (WebGPUShapeSystem.shouldSkipRender early-return).
-    if item.fallback_reasons.contains(&"text-mask-source") {
+    // Group boundaries and mask-only sources consume no body render-z.
+    if !source_has_body(item) {
         return true;
     }
     scene.effective_node(&item.node_id).is_none()
@@ -2446,12 +2592,14 @@ fn append_node_draw_items(
     // Scale RFC stage C: when Some, record the display list's rebuildable units
     // (`PlanUnit`) for the retained camera plan.
     mut units: Option<&mut UnitRecorder>,
+    inherited: &[(u32, u8)],
 ) -> u64 {
     // Brush plan P8: outlined strokes refit at the render scale (a camera
     // build's zoom band, set by the camera builder, takes precedence).
     let _outline_scale = tess::outline::enter_plan(opts.scale);
     if let Some(r) = units.as_deref_mut() {
         r.start(items.len());
+        plan_masks.record_reads();
     }
     // RENDER-Z RULE (seams.rs): a separate counter from PaintItem.z_index.
     // Starts at `z_start` so a combined plan can keep z monotonic across
@@ -2541,6 +2689,8 @@ fn append_node_draw_items(
     // Subtree captures (a group's or an unfilled frame's shadows and layer
     // filters) whose display-list range is still being drawn, innermost last.
     let mut subtrees: Vec<SubtreeCapture> = Vec::new();
+    let inherited_has = |id: &str, flag: u8| inherited.iter().any(|&(row, flags)| flags & flag != 0
+        && scene.row(row).is_some_and(|node| node.id() == id));
 
     for (index, item) in dl.items.iter().enumerate() {
         while subtrees.last().is_some_and(|c| c.dl_end <= index) {
@@ -2561,12 +2711,12 @@ fn append_node_draw_items(
                     warnings,
                     &|id: &str| {
                         (done.fade.is_some() && id == done.node.id())
-                            || subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id)
+                            || inherited_has(id, 1) || subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id)
                     },
                 ));
                 z += 1;
             }
-            finish_subtree_capture(
+            let outputs = finish_subtree_capture(
                 scene,
                 layer_blur_ctx,
                 backdrop_ctx,
@@ -2577,7 +2727,12 @@ fn append_node_draw_items(
                 items,
                 z,
                 warnings,
+                units.as_ref().is_some_and(|r| r.prepared.is_some()),
             );
+            if let Some((unit, _, _, _)) = units.as_mut().and_then(|r| r.open.as_mut()) {
+                unit.compositions.extend(outputs.composition);
+                unit.captures.extend(outputs.capture);
+            }
         }
         if index < culled_until || !item.is_primary_node_item {
             continue; // shapeText/connectorText ride their node's z + 0.5
@@ -2585,9 +2740,10 @@ fn append_node_draw_items(
         // A primary item outside every open subtree capture starts a unit.
         if subtrees.is_empty() {
             if let Some(r) = units.as_deref_mut() {
-                r.open_at(index, items.len(), z, warnings, plan_masks.masks.len());
+                r.open_at(index, items.len(), z, warnings, plan_masks);
             }
         }
+        if scene.hidden_from_paint_order(&item.node_id) { continue; }
         if let Some((end, z_cost)) = cull_plan.as_ref().and_then(|p| p.skip_at(index)) {
             z += z_cost;
             culled_until = end;
@@ -2611,7 +2767,7 @@ fn append_node_draw_items(
                 caches.as_mut().map(|(c, h)| (&mut **c, *h)),
                 items,
                 z,
-                &|id: &str| subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id),
+                &|id: &str| inherited_has(id, 1) || subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id),
             ) {
                 let mut capture = capture;
                 capture.mask = capture_composite_mask(scene, plan_masks, capture.node.id());
@@ -2646,7 +2802,7 @@ fn append_node_draw_items(
                 plan_masks,
                 caches.as_mut().map(|(c, h)| (&mut **c, *h)),
                 warnings,
-                &|id: &str| subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id),
+                &|id: &str| inherited_has(id, 1) || subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id),
             ));
             z += 1;
         }
@@ -2659,11 +2815,32 @@ fn append_node_draw_items(
         if item_skipped_without_z(scene, item, opts, isolate.as_ref(), transparent) {
             continue;
         }
-        let _in_capture = tess::outline::enter_capture(!subtrees.is_empty());
+        let _in_capture = tess::outline::enter_capture(!subtrees.is_empty() || !inherited.is_empty());
 
         let Some(base_node) = scene.effective_node(&item.node_id) else {
             continue;
         };
+        let body_mode = backdrop_ctx.is_none_or(|ctx| ctx.keep_shape_sdf);
+        let mut read_body_mode = None;
+        let prepared_context: Option<Vec<(u32, u8)>> = units.as_ref().filter(|r| r.prepared.is_some() && (r.retain_plain || !subtrees.is_empty() || !inherited.is_empty()))
+            .and_then(|_| {
+                let mut context = inherited.to_vec();
+                context.extend(subtrees.iter().map(|c| scene.row_of(c.node.id())
+                    .map(|row| (row, u8::from(c.fade.is_some()) | (u8::from(c.blend.is_some()) << 1))))
+                    .collect::<Option<Vec<_>>>()?);
+                Some(context)
+            });
+        let prepared_row = prepared_context.as_ref().and_then(|_| scene.row_of(&item.node_id));
+        let masks_before = plan_masks.masks.len();
+        if let (Some(context), Some(row), Some(records)) = (prepared_context.as_deref(), prepared_row,
+            units.as_mut().and_then(|r| r.prepared.as_mut())) {
+            if let Some((prepared, consumed, reads_body)) = records.reuse(scene, row, context, z, body_mode, plan_masks) {
+                if reads_body { if let Some(recorder) = units.as_mut() { recorder.read_body_mode(); } }
+                items.extend(prepared);
+                z += consumed;
+                continue;
+            }
+        }
         // Viewport culling: a camera plan built for a new cull window copies the
         // items of nodes an earlier window's build of this scene generation already
         // made (`PlanCaches::node_items`), and keeps the ones it makes. Not for a
@@ -2671,7 +2848,7 @@ fn append_node_draw_items(
         // target or the capture view (a background blur, a blend split, a layer
         // capture, anything inside a subtree capture): those follow the camera.
         let reuse = cull_plan.is_some()
-            && subtrees.is_empty()
+            && inherited.is_empty() && subtrees.is_empty()
             && backdrop_ctx.is_none_or(|ctx| {
                 !crate::backdrop::plan::has_active_background_blur(base_node)
                     && !crate::backdrop::blend::node_splits(
@@ -2718,7 +2895,7 @@ fn append_node_draw_items(
         // only when an ancestor actually dims this node.
         // A group composited as one unit (`SubtreeCapture::fade`) fades its layers in its split, not each layer:
         // its opacity leaves their product, and its own paint (a frame's fill) draws at full opacity inside.
-        let faded = |id: &str| subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id);
+        let faded = |id: &str| inherited_has(id, 1) || subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id);
         let ancestor_opacity = scene.ancestor_opacity_product_except(&item.node_id, faded);
         let own_faded = faded(&item.node_id);
         let dimmed_node;
@@ -2809,7 +2986,11 @@ fn append_node_draw_items(
                 // the SDF fast path and tessellates, mirroring WebGPU's
                 // `disableOpaqueFastPath`.
                 let mut body_is_sdf = false;
-                let disable_shape_sdf = clipped || backdrop_ctx.is_some_and(|c| !c.keep_shape_sdf);
+                let body_mode_read = std::cell::Cell::new(false);
+                let disable_shape_sdf = BodyMode {
+                    disabled: clipped || !body_mode,
+                    read: (!clipped).then_some(&body_mode_read),
+                };
                 // Live geometry effects (E8.1): a Transform effect with copies
                 // resolved to one path per copy (`live_effects::split_copies`);
                 // each copy draws its own fill and stroke, in turn, as
@@ -2975,7 +3156,7 @@ fn append_node_draw_items(
                     )),
                     (None, None) => {
                         let body_node = container_body_override.as_ref().unwrap_or(node);
-                        if !clipped && eff_clip == page_clip && subtrees.is_empty()
+                        if !clipped && eff_clip == page_clip && ((subtrees.is_empty() && inherited.is_empty()) || units.as_ref().is_some_and(|r| r.prepared.is_some()))
                             && !caches.as_ref().is_some_and(|(c, _)| c.outline_progressive()) {
                             placement = local_path_placement(scene, body_node);
                         }
@@ -2994,6 +3175,10 @@ fn append_node_draw_items(
                     )
                     },
                 };
+                if body_mode_read.get() {
+                    read_body_mode = Some(body_mode);
+                    if let Some(recorder) = units.as_mut() { recorder.read_body_mode(); }
+                }
                 // A stack's shadow pads by its widest stroke; its opaque SDF fill
                 // covers the shadow only when no stroke band reaches past it.
                 let shadow_node = stack.as_ref().map(|_| {
@@ -3658,10 +3843,10 @@ fn append_node_draw_items(
         // fallback (`BlendMode::fixed_function`). A blended subtree's root
         // draws plainly (its subtree's split carries the mode), and inside one
         // the backdrop starts cleared, so multiply splits too.
-        let blend_root = subtrees
+        let blend_root = inherited_has(&item.node_id, 2) || subtrees
             .last()
             .is_some_and(|c| c.blend.is_some() && c.node.id() == item.node_id);
-        let in_blend_subtree = subtrees.iter().any(|c| c.blend.is_some());
+        let in_blend_subtree = inherited.iter().any(|&(_, flags)| flags & 2 != 0) || subtrees.iter().any(|c| c.blend.is_some());
         if let Some(ctx) = backdrop_ctx
             .filter(|_| !stacked && !blend_root)
             .map(|c| c.over_transparent(c.transparent_target || in_blend_subtree))
@@ -3687,6 +3872,16 @@ fn append_node_draw_items(
                     items.insert(last + 1, DrawItem::BackdropSplit(Box::new(end)));
                     items.insert(first, DrawItem::BackdropSplit(Box::new(begin)));
                 }
+            }
+        }
+        if prepared_context.is_some()
+            && warnings.skipped.len() == skipped_before && warnings.dropped.len() == dropped_before
+            && crate::text_draw::degraded_zoom_limited_count() == degraded_limited_before
+            && !caches.as_ref().is_some_and(|(c, _)| c.outline_progressive() || c.outline_pending_len() != pending_before) {
+            if let (Some(context), Some(row), Some(records)) = (prepared_context.as_deref(), prepared_row,
+                units.as_mut().and_then(|r| r.prepared.as_mut())) {
+                records.put(scene, row, context, span_z, z - span_z, &items[span_start..], plan_masks, masks_before, read_body_mode,
+                    || placement.clone().and_then(|recipe| certify_placement(scene, recipe, &items[span_start..])));
             }
         }
         // rust-edit-incremental-z4: record this node's item span. Reached only by
@@ -3739,12 +3934,12 @@ fn append_node_draw_items(
                 warnings,
                 &|id: &str| {
                     (done.fade.is_some() && id == done.node.id())
-                        || subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id)
+                        || inherited_has(id, 1) || subtrees.iter().any(|c| c.fade.is_some() && c.node.id() == id)
                 },
             ));
             z += 1;
         }
-        finish_subtree_capture(
+        let outputs = finish_subtree_capture(
             scene,
             layer_blur_ctx,
             backdrop_ctx,
@@ -3755,10 +3950,15 @@ fn append_node_draw_items(
             items,
             z,
             warnings,
+            units.as_ref().is_some_and(|r| r.prepared.is_some()),
         );
+        if let Some((unit, _, _, _)) = units.as_mut().and_then(|r| r.open.as_mut()) {
+            unit.compositions.extend(outputs.composition);
+            unit.captures.extend(outputs.capture);
+        }
     }
     if let Some(r) = units {
-        r.close(dl.items.len(), items.len(), z, warnings);
+        r.close(dl.items.len(), items.len(), z, warnings, plan_masks);
     }
     z
 }
@@ -3778,7 +3978,7 @@ pub(crate) fn drawn_z_end(items: &[DrawItem]) -> u64 {
             DrawItem::LayerBlurComposite { z, group, .. } => (z.max(0.0) as u64 + 1)
                 .max(drawn_z_end(&group.items))
                 .max(drawn_z_end(&group.coverage)),
-            DrawItem::BackdropSplit(_) | DrawItem::PageFill { .. } => 0,
+            DrawItem::Vacant | DrawItem::BackdropSplit(_) | DrawItem::PageFill { .. } => 0,
         })
         .max()
         .unwrap_or(0)
@@ -4028,7 +4228,9 @@ fn finish_subtree_capture(
     items: &mut Vec<DrawItem>,
     z: u64,
     warnings: &mut PlanWarnings,
-) {
+    record: bool,
+) -> SubtreeOutputs {
+    let mut outputs = SubtreeOutputs::default();
     let root_id = capture.node.id().to_string();
     mask_subtree_shadows(scene, lb_ctx, &mut capture, masks, items, warnings);
     for (suffix, group) in std::mem::take(&mut capture.inner) {
@@ -4065,30 +4267,24 @@ fn finish_subtree_capture(
         || capture.fixed_blend.is_some()
         || crate::backdrop::blend::composite_blend_split(&capture.node).is_none();
     if let Some(lb_ctx) = lb_ctx.filter(|_| blend_ok) {
-        divert_subtree_filter(scene, lb_ctx, &capture, hashes, masks, opts, items, warnings);
+        outputs.capture = divert_subtree_filter(scene, lb_ctx, &capture, hashes, masks, opts, items, warnings, record);
     }
     if items.len() <= capture.items_start {
-        return;
+        return outputs;
     }
     let fade = capture.fade.zip(blend_ctx);
-    let splits = match (blend, fade) {
-        // Faded as one unit (and blended with its mode, when it has one): the isolated subtree is scaled by the
-        // opacity, then composited.
-        (b, Some((opacity, ctx))) => {
-            let bounds = crate::layer_blur::shadow::all_items_canvas_bounds(&items[capture.items_start..]);
-            let mode = b.map_or(BlendMode::Normal.exact_split_id(), |(mode, _)| mode);
-            crate::backdrop::blend::compute_region_fade_splits(&capture.node, ctx, bounds, mode, opacity)
-        }
-        (Some((mode, ctx)), None) => {
-            let bounds = crate::layer_blur::shadow::all_items_canvas_bounds(&items[capture.items_start..]);
-            crate::backdrop::blend::compute_region_blend_splits(&capture.node, ctx, bounds, mode)
-        }
-        (None, None) => None,
+    let (ctx, mode, fade) = match (blend, fade) {
+        (b, Some((opacity, ctx))) => (ctx, b.map_or(BlendMode::Normal.exact_split_id(), |(mode, _)| mode), Some(opacity)),
+        (Some((mode, ctx)), None) => (ctx, mode, None),
+        (None, None) => return outputs,
     };
-    if let Some((begin, end)) = splits {
-        items.push(DrawItem::BackdropSplit(Box::new(end)));
-        items.insert(capture.items_start, DrawItem::BackdropSplit(Box::new(begin)));
-    }
+    let bounds = crate::layer_blur::shadow::all_items_canvas_bounds(&items[capture.items_start..]);
+    let Some((begin, end)) = composition_splits(&capture.node, ctx, bounds, mode, fade) else { return outputs };
+    items.push(DrawItem::BackdropSplit(Box::new(end)));
+    items.insert(capture.items_start, DrawItem::BackdropSplit(Box::new(begin)));
+    if !record { return outputs; }
+    outputs.composition = scene.row_of(capture.node.id()).map(|row| CompositionRecipe { row, bounds, mode, fade: fade.is_some() });
+    outputs
 }
 
 /// The masks owned inside a subtree (`inner`: the root's own clip, clip groups and clipping frames below it), with
@@ -4346,14 +4542,15 @@ fn divert_subtree_filter(
     opts: &RenderOptions,
     items: &mut Vec<DrawItem>,
     warnings: &mut PlanWarnings,
-) {
+    record: bool,
+) -> Option<CaptureRecipe> {
     let root_id = capture.node.id().to_string();
     if !capture.filtered || items.len() <= capture.items_start {
-        return;
+        return None;
     }
     let own = &items[capture.items_start..];
     let Some(bounds) = crate::layer_blur::shadow::all_items_canvas_bounds(own) else {
-        return;
+        return None;
     };
     let Some(params) = crate::layer_blur::plan::compute_subtree_layer_blur_params(
         scene,
@@ -4362,7 +4559,7 @@ fn divert_subtree_filter(
         bounds,
         &mut warnings.skipped,
     ) else {
-        return;
+        return None;
     };
     let root_mask = capture.mask.as_ref().map(|m| m.mask_id);
     let owner = |id: u64| masks.get(id as usize).map(|m| m.owner_node_id.as_str());
@@ -4383,7 +4580,7 @@ fn divert_subtree_filter(
     // its pair is re-aimed at the capture below (`retarget_isolation_splits`).
     if capture_cannot_hold(own, false) {
         warnings.skipped.push(capture_refusal(&root_id));
-        return;
+        return None;
     }
     for item in own {
         let Some(id) = crate::camera_slot::item_mask_id(item) else {
@@ -4400,7 +4597,7 @@ fn divert_subtree_filter(
             }
             _ => {
                 warnings.skipped.push(format!("{root_id}: subtree filter cannot capture an unrelated mask; move the mask inside the filtered subtree"));
-                return;
+                return None;
             }
         }
     }
@@ -4414,7 +4611,7 @@ fn divert_subtree_filter(
         && !crate::layer_blur::plan::clipping_containers_clip_the_composite(scene, &root_id, &region)
     {
         warnings.skipped.push(format!("{root_id}: subtree filter crosses an ancestor clip; remove the ancestor clip"));
-        return;
+        return None;
     }
     // Filter shadows alone (`LayerFilters::shadows_alone`): the capture is a copy of the subtree's items, which
     // stay and draw directly over the shadows' composite. A blended root's composite carries its blend, so its
@@ -4429,24 +4626,12 @@ fn divert_subtree_filter(
     } else {
         items.drain(capture.items_start..).collect()
     };
-    unmask_captured(&mut diverted, capture.mask.as_ref());
-    for id in strip {
-        let mask = crate::seams::MaskRef {
-            mask_id: id,
-            origin: [0.0; 2],
-            inv_size: [0.0; 2],
-        };
-        unmask_captured(&mut diverted, Some(&mask));
-    }
-    // The masks inside the subtree form the capture's own mask table.
+    if let Some(root_mask) = root_mask { strip.push(root_mask); }
     let (table, group_masks) = subtree_mask_table(masks, inner, inside);
-    let index_of = |id: u64| table.iter().position(|t| *t == id);
-    for it in &mut diverted {
-        if let Some(i) = crate::camera_slot::item_mask_id(it).and_then(index_of) {
-            crate::camera_slot::set_item_mask_id(it, i as u64);
-        }
-    }
-    crate::backdrop::blend::retarget_isolation_splits(&mut diverted, params.region_canvas, params.width_px, params.height_px);
+    capture_child_masks(&mut diverted, &strip, &table);
+    let mut isolations = Vec::new();
+    crate::backdrop::blend::retarget_isolation_splits_record(&mut diverted, params.region_canvas, params.width_px, params.height_px,
+        |slots, bounds| { if record { isolations.push((slots, bounds)); } });
     let mut group = crate::seams::LayerBlurGroup {
         items: diverted,
         region_canvas: params.region_canvas,
@@ -4480,7 +4665,7 @@ fn divert_subtree_filter(
     // composite takes its clip inside this root. Nothing here depends on the filters above, so a capture's
     // content key needs nothing more. After the content key: re-clipping a text batch makes a new batch, and
     // an unkeyed batch is named by its allocation.
-    widen_captured_clips(scene, &mut group.items, &root_id, INFINITE_CLIP);
+    capture_child_clips(scene, &mut group.items, &root_id);
     let composite = DrawItem::LayerBlurComposite {
         node_id: root_id,
         z: capture.z_start as f64,
@@ -4495,6 +4680,22 @@ fn divert_subtree_filter(
     } else {
         items.push(composite);
     }
+    record.then(|| scene.row_of(capture.node.id()).map(|row| CaptureRecipe { row, bounds, isolations, strip_masks: strip, mask_table: table })).flatten()
+}
+
+/// Replay the mask namespace transformation recorded by the ordinary capture builder.
+pub(crate) fn capture_child_masks(items: &mut [DrawItem], strip: &[u64], table: &[u64]) {
+    for &id in strip {
+        unmask_captured(items, Some(&crate::seams::MaskRef {
+            mask_id: id, origin: [0.0; 2], inv_size: [0.0; 2],
+        }));
+    }
+    for item in items {
+        if let Some(index) = crate::camera_slot::item_mask_id(item)
+            .and_then(|id| table.iter().position(|&original| original == id)) {
+            crate::camera_slot::set_item_mask_id(item, index as u64);
+        }
+    }
 }
 
 /// Clip a subtree capture's items as they clip inside the root (the clipping
@@ -4504,6 +4705,10 @@ fn divert_subtree_filter(
 /// What an item clips by itself stays: a text batch cut to its own box (`clip_to_node_box`; a source clip, so
 /// not a filtered text's composite, whose filter reaches past the box), and a nested capture's composite cut
 /// by the rounded corners of a clipping frame inside the root.
+pub(crate) fn capture_child_clips(scene: &Scene, items: &mut [DrawItem], root_id: &str) {
+    widen_captured_clips(scene, items, root_id, INFINITE_CLIP);
+}
+
 fn widen_captured_clips(scene: &Scene, items: &mut [DrawItem], root_id: &str, page_clip: [f32; 4]) {
     // Sub-items carry `<node id>:<suffix>` ids.
     let owner = |node_id: &str| -> Option<String> {
@@ -5093,6 +5298,7 @@ fn build_canvas_root_items(
                 z_start,
                 z_end,
                 units,
+                prepared: None,
                 head_warnings: PlanWarnings::default(),
                 tail_warnings: tail,
             }
@@ -5132,6 +5338,7 @@ fn build_canvas_root_items(
         None,
         cull,
         recorder.as_mut(),
+        &[],
     );
     depth::ensure_render_z(drawn_z_end(&items))?;
     let mut tail = PlanWarnings::default();
@@ -5229,7 +5436,9 @@ fn try_shape_sdf_body(
     page_clip: [f32; 4],
     mask: Option<&crate::seams::MaskRef>,
     canvas_affine_override: Option<moda_scene::types::Affine>,
+    mode: BodyMode<'_>,
 ) -> Result<Option<Vec<DrawItem>>> {
+    if mode.disabled && mode.read.is_none() { return Ok(None); }
     // Active clip-mask context disqualifies (WebGPU `getActiveMaskContextForNode`).
     if mask.is_some() {
         return Ok(None);
@@ -5251,6 +5460,9 @@ fn try_shape_sdf_body(
     } else {
         return Ok(None);
     };
+
+    if let Some(read) = mode.read { read.set(true); }
+    if mode.disabled { return Ok(None); }
 
     // Canvas-space model matrix: the same chain the tessellated body uses
     // (`createNodeModelMatrix` transform-id redirect for synthetic proxies).
@@ -5756,7 +5968,7 @@ fn build_placed_brush_body(
     z: f64,
     page_clip: [f32; 4],
     mask: Option<crate::seams::MaskRef>,
-    disable_shape_sdf: bool,
+    disable_shape_sdf: BodyMode<'_>,
     shader_time_s: f64,
     canvas_affine_override: Option<moda_scene::types::Affine>,
     mut caches: Option<CacheCtx<'_>>,
@@ -6321,22 +6533,34 @@ pub(crate) fn silhouette_owner_id(item_id: &str) -> &str {
     item_id.strip_suffix(SILHOUETTE_SUFFIX).unwrap_or(item_id)
 }
 
+/// The derived body input, with an optional read recorder owned by the source executor.
+/// Eligibility is decided before this value is read; an ineligible body does not depend on it.
+#[derive(Clone, Copy)]
+struct BodyMode<'a> {
+    disabled: bool,
+    read: Option<&'a std::cell::Cell<bool>>,
+}
+impl From<bool> for BodyMode<'_> {
+    fn from(disabled: bool) -> Self { Self { disabled, read: None } }
+}
+
 /// [`build_body_item_inner`] with the node's dash alignment set for every dash
 /// walk under it ([`tess::with_dash_alignment`]).
 #[allow(clippy::too_many_arguments)]
-fn build_body_item(
+fn build_body_item<'a>(
     scene: &Scene,
     node: &moda_scene::types::RawNode,
     z: f64,
     page_clip: [f32; 4],
     mask: Option<crate::seams::MaskRef>,
-    disable_shape_sdf: bool,
+    disable_shape_sdf: impl Into<BodyMode<'a>>,
     shader_time_s: f64,
     canvas_affine_override: Option<moda_scene::types::Affine>,
     geom_hash: Option<u64>,
     caches: Option<CacheCtx<'_>>,
     warnings: &mut PlanWarnings,
 ) -> Result<Vec<DrawItem>> {
+    let disable_shape_sdf = disable_shape_sdf.into();
     let aligned = moda_scene::paint::node_stroke_style(node).dash_aligned();
     // Curves flatten for the size the node reaches the screen at: the view's zoom band raised by the node's own
     // canvas scale (its scale × its parents', animated values included; the larger axis of a non-uniform one), so a
@@ -6388,7 +6612,7 @@ fn build_body_item_inner(
     // phantom-line artifact. Consequence (expected, not a regression): native
     // exports are crisper than — and so not pixel-identical to — WebGPU exports
     // for these shapes.
-    disable_shape_sdf: bool,
+    disable_shape_sdf: BodyMode<'_>,
     shader_time_s: f64,
     // M4b: synthetic blend intermediates are not in the scene graph — the
     // production renderer translates them by `_pageOrigin` (+ node.x/y;
@@ -6508,18 +6732,10 @@ fn build_body_item_inner(
     // at arbitrary zoom). An active mask (`mask.is_some()`) or the blur-segmented
     // context (`disable_shape_sdf`) decline the fast path; anything else
     // ineligible falls through to the tessellation path below, byte-unchanged.
-    if !disable_shape_sdf {
-        if let Some(items) = try_shape_sdf_body(
-            scene,
-            node,
-            node_type,
-            z,
-            page_clip,
-            mask.as_ref(),
-            canvas_affine_override,
-        )? {
-            return Ok(items);
-        }
+    if let Some(items) = try_shape_sdf_body(
+        scene, node, node_type, z, page_clip, mask.as_ref(), canvas_affine_override, disable_shape_sdf,
+    )? {
+        return Ok(items);
     }
 
     // M3b: paint routing (WebGPUPathRenderer.ts:1076-1133 order; see
@@ -8175,6 +8391,7 @@ pub struct Engine {
     /// R2d: pattern textures persistent across renders; keys carry settle
     /// state + decoded-pixels identity so Loading→Loaded flips
     /// self-invalidate (the browser's bind-group-key trick, MAP §5.7).
+    shared_images: Option<std::sync::Arc<paint::draw::SharedImages>>,
     retained_patterns: std::cell::RefCell<Option<paint::draw::PatternTextureCache>>,
     retained_shader_images: std::cell::RefCell<Option<ShaderImageTextureCache>>,
     /// Retained mask coverage (pipeline, full-rect sharing, textures of unchanged
@@ -8280,6 +8497,9 @@ pub struct Engine {
     capture_stand_ins_mid_zoom: std::cell::Cell<bool>,
     /// Depth of the capture pre-pass recursion (a capture's own mini-plan).
     capture_depth: std::cell::Cell<u32>,
+    /// Installed scene owning this render and all recursive mask captures.
+    mask_capture_owner: std::cell::Cell<Option<u64>>,
+    mask_capture_history: std::cell::RefCell<MaskCaptureHistory>,
     /// The buffers and textures a render makes and drops, reused once the GPU is done with them, and the bind groups
     /// over them (`scratch`): a non-retained render's own, and every capture's.
     scratch: crate::scratch::ScratchPool,
@@ -8512,7 +8732,7 @@ pub enum ChangedItems<'a> {
     /// Items written in place, by index. `placed`: bodies whose values changed and whose draw did not (their
     /// kind, phase, pipeline, geometry, z, blend and mask stand: a placement recipe's promise). `replaced`:
     /// items prepared again, each with the item it took the place of.
-    Written { placed: &'a [u32], replaced: &'a [(u32, DrawItem)] },
+    Written { placed: &'a [u32], replaced: &'a [(u32, DrawItem)], masks_changed: bool },
     /// Another plan took the earlier one's place: this is the earlier one, and any item may differ.
     Whole(&'a CoveragePlan),
 }
@@ -8535,79 +8755,13 @@ impl<'a> PacketPlan<'a> {
     }
 }
 
-/// One storage buffer of a packet as the CPU holds it: the records its collect uploaded, kept so a patch compares
-/// a changed item's record with the one the buffer holds and writes it where it stands. Record `i` is the
-/// buffer's bytes from `i * size_of::<T>()`.
-struct Column<T> {
-    records: Vec<T>,
-    /// Records a patch asked for and has not committed, by index (`Column::put`).
-    pending: Vec<(u32, T)>,
-}
-
-impl<T> Default for Column<T> {
-    fn default() -> Self {
-        Self { records: Vec::new(), pending: Vec::new() }
-    }
-}
-
-impl<T: bytemuck::Pod> Column<T> {
-    fn of(records: Vec<T>) -> Self {
-        Self { records, pending: Vec::new() }
-    }
-
-    /// Ask for `record` at `index`. `Ok(true)`: it differs from the one held and is pending until
-    /// [`Column::commit`]; `Ok(false)`: the buffer already holds it. `Err`: the column has no such record.
-    fn put(&mut self, index: u32, record: &T) -> std::result::Result<bool, &'static str> {
-        let held = self.records.get(index as usize).ok_or("record")?;
-        if bytemuck::bytes_of(held) == bytemuck::bytes_of(record) {
-            return Ok(false);
-        }
-        self.pending.push((index, *record));
-        Ok(true)
-    }
-}
-
-/// A [`Column`] without its record type, for what is done to every column of a packet alike.
-trait PendingRecords {
-    /// The bytes the column's buffer holds.
-    fn bytes(&self) -> u64;
-    fn is_pending(&self) -> bool;
-    /// Forget what was asked for.
-    fn discard(&mut self);
-    /// Take the pending records into the column and hand `upload` the column from its first changed record to
-    /// its last, as (byte offset in the buffer, bytes): one write for a column, however its changed records lie.
-    fn commit(&mut self, upload: &mut dyn FnMut(u64, &[u8]));
-}
-
-impl<T: bytemuck::Pod> PendingRecords for Column<T> {
-    fn bytes(&self) -> u64 {
-        std::mem::size_of_val(self.records.as_slice()) as u64
-    }
-    fn is_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-    fn discard(&mut self) {
-        self.pending.clear();
-    }
-    fn commit(&mut self, upload: &mut dyn FnMut(u64, &[u8])) {
-        let mut span: Option<(usize, usize)> = None;
-        for (index, record) in self.pending.drain(..) {
-            let index = index as usize;
-            self.records[index] = record;
-            span = Some(span.map_or((index, index + 1), |(from, to)| (from.min(index), to.max(index + 1))));
-        }
-        if let Some((from, to)) = span {
-            let size = std::mem::size_of::<T>() as u64;
-            upload(from as u64 * size, bytemuck::cast_slice(&self.records[from..to]));
-        }
-    }
-}
+use moda_text_draw::records::{Column, PendingRecords};
 
 /// What a packet's state is compared with to reach a new one (`Engine::patch_prepared`).
 #[derive(Clone, Copy)]
 enum PatchBase<'a> {
     /// Its owner's account of the items written in place (`ChangedItems::Written`).
-    Written { placed: &'a [u32], replaced: &'a [(u32, DrawItem)] },
+    Written { placed: &'a [u32], replaced: &'a [(u32, DrawItem)], masks_changed: bool },
     /// The plan the packet was of: every item is compared.
     Whole(&'a CoveragePlan),
 }
@@ -8622,7 +8776,7 @@ struct RecordAt {
 }
 
 impl RecordAt {
-    /// An item with no record of its own (text, a capture's composite, a background effect).
+    /// An item with no record of its own (a capture's composite or a background effect).
     const NONE: Self = Self { index: u32::MAX, first_vertex: 0 };
 }
 
@@ -8697,7 +8851,7 @@ const TEXT_CHUNK: usize = 256;
 
 /// A frame's prepared text, in chunks of [`TEXT_CHUNK`] batches (batch `i` is chunk `i / TEXT_CHUNK`'s
 /// `i % TEXT_CHUNK`).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct TextChunks {
     chunks: Vec<std::sync::Arc<crate::text_draw::PreparedText>>,
 }
@@ -8974,6 +9128,47 @@ struct RetainedFrame {
     bufs: std::collections::HashMap<&'static str, PooledBuf>,
 }
 
+/// Approximate consecutive-frame membership for rendered-mask admission. Every
+/// key contributes, regardless of traversal order or scene size. False positives
+/// only retain extra captures: exact content keys still own texture reuse, and
+/// CaptureCache's byte budget bounds retention.
+#[derive(Default)]
+struct MaskCaptureHistory {
+    previous: Box<[u64]>,
+    current: Box<[u64]>,
+}
+impl MaskCaptureHistory {
+    // Two 32 KiB filters, rather than a distinct-key cutoff. At 8,192 unique
+    // keys/frame, three probes have about 0.07% false positives. Saturation
+    // admits more scratch results to the existing 256 MiB LRU; it never drops
+    // later keys or changes the exact keys used to serve cached pictures.
+    const BITS: usize = 256 * 1024;
+
+    fn begin_frame(&mut self) {
+        std::mem::swap(&mut self.previous, &mut self.current);
+        self.current.fill(0);
+    }
+
+    fn observe(&mut self, key: u64) -> bool {
+        if self.current.is_empty() {
+            self.previous = vec![0; Self::BITS / 64].into_boxed_slice();
+            self.current = vec![0; Self::BITS / 64].into_boxed_slice();
+        }
+        // Cache keys are already content hashes. Double hashing supplies three
+        // probes; the odd step also covers the whole power-of-two bit domain.
+        let step = key.rotate_left(32) | 1;
+        let mut present = true;
+        for probe in 0..3 {
+            let bit = key.wrapping_add(step.wrapping_mul(probe)) as usize & (Self::BITS - 1);
+            let word = bit / 64;
+            let mask = 1u64 << (bit % 64);
+            present &= self.previous[word] & mask != 0;
+            self.current[word] |= mask;
+        }
+        present
+    }
+}
+
 struct ScratchAttachments {
     key: (u32, u32, u32),
     msaa: Option<wgpu::Texture>,
@@ -9229,6 +9424,7 @@ impl Engine {
             reuse_frame_targets: true,
             keep_patterns: false,
             retained_frame: Default::default(),
+            shared_images: None,
             retained_patterns: Default::default(),
             retained_shader_images: Default::default(),
             retained_masks: Default::default(),
@@ -9261,6 +9457,8 @@ impl Engine {
             captures_pending: std::cell::Cell::new(false),
             capture_stand_ins_mid_zoom: std::cell::Cell::new(false),
             capture_depth: std::cell::Cell::new(0),
+            mask_capture_owner: std::cell::Cell::new(None),
+            mask_capture_history: Default::default(),
             scratch: Default::default(),
             capture_scissor: Default::default(),
             capture_window: Default::default(),
@@ -9500,6 +9698,13 @@ impl Engine {
         self.gpu.max_sample_count_for(self.frame_format)
     }
 
+    /// Share immutable image textures between engines using the same device.
+    pub fn share_images(&mut self, images: std::sync::Arc<paint::draw::SharedImages>) {
+        if let Some(cache) = self.retained_patterns.get_mut() { cache.share_images(images.clone()); }
+        if let Some(cache) = self.retained_shader_images.get_mut() { cache.shared = Some(images.clone()); }
+        self.shared_images = Some(images);
+    }
+
     /// Task #95 R2: enable retained GPU frame residency (wasm editor lane +
     /// the resident_smoke test). Default OFF — CLI/export is untouched.
     pub fn set_retained(&mut self, on: bool) {
@@ -9617,59 +9822,6 @@ impl Engine {
         self.retained_masks.borrow().as_ref().map_or(0, |c| c.atlas_passes)
     }
 
-    /// Retained GPU memory by owner, in bytes (benches; see `crate::gpu_profile`). Frame targets count
-    /// colour + MSAA + depth at 4 B per sample.
-    pub fn gpu_memory_json(&self) -> moda_scene::value::Value {
-        let frame = self.retained_frame.borrow();
-        let pool: u64 = frame.bufs.values().map(|b| b.capacity).sum();
-        let targets: u64 = frame
-            .targets
-            .iter()
-            .map(|t| {
-                let (w, h, s) = t.key;
-                let px = u64::from(w) * u64::from(h);
-                px * 4
-                    + if t.msaa.is_some() {
-                        px * 4 * u64::from(s)
-                    } else {
-                        0
-                    }
-                    + px * 4 * u64::from(s.max(1))
-            })
-            .sum();
-        let (pattern_count, pattern_bytes) = self
-            .retained_patterns
-            .borrow()
-            .as_ref()
-            .map_or((0, 0), |c| c.resident());
-        let shader_image_bytes = self
-            .retained_shader_images
-            .borrow()
-            .as_ref()
-            .map_or(0, |c| c.total_bytes);
-        let emoji = self.text.emoji_texture_bytes();
-        let arena = self.text.vec_arena_stats();
-        let (mask_cache_bytes, mask_cache_entries) = self
-            .retained_masks
-            .borrow()
-            .as_ref()
-            .map_or((0, 0), |c| c.resident());
-        moda_scene::value::json!({
-            "geometryPoolBytes": pool,
-            "geometryPoolBuffers": frame.bufs.len(),
-            "frameTargetBytes": targets,
-            "patternTextures": pattern_count,
-            "patternTextureBytes": pattern_bytes,
-            "shaderImageBytes": shader_image_bytes,
-            "emojiBytes": emoji,
-            "textArenaBytes": arena.bytes,
-            "maskCacheBytes": mask_cache_bytes,
-            "maskCacheEntries": mask_cache_entries,
-            "captureCacheBytes": self.capture_cache.borrow().resident().1,
-            "captureCacheEntries": self.capture_cache.borrow().resident().0,
-        })
-    }
-
     /// Snapshot of the prepared-frame counters; the wasm host flat-merges these
     /// into `residency_stats()` as `pf_*` keys.
     pub fn prepared_frame_stats(&self) -> PreparedFrameStats {
@@ -9740,6 +9892,7 @@ impl Engine {
         // Cached layer-capture results are GPU textures too, and so is what captures took from the frame's
         // generation (targets, filter passes, buffers, the bind groups over them).
         self.capture_cache.borrow_mut().clear();
+        *self.mask_capture_history.borrow_mut() = MaskCaptureHistory::default();
         self.scratch.clear();
         // T9: the node-local text arena cache holds Arc<wgpu::Buffer> GPU
         // residency (up to VEC_ARENA_BUDGET_BYTES) that the rest of this teardown
@@ -10477,68 +10630,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Compile the hot body/shape pipelines at BOTH
-    /// editor sample counts (MSAA 1 and 4) up front, so toggling a backdrop-blur
-    /// node — which flips the editor MSAA policy between 4 (normal) and 1 (a
-    /// resolved single-sample target backdrop requires) — does not stall on a
-    /// lazy `create_render_pipeline`. The census + rationale are in
-    /// `docs/productionization.md` (the ~12-hot-pipeline list); this prewarms the
-    /// non-text body pipelines that are reachable without a live scene
-    /// (`page-fill`/`path-solid` are 100% of renders; shadow/gradient/pattern are
-    /// the next tier). Best-effort: a prewarm miss just defers that one compile to
-    /// first organic use, so errors are swallowed (never fatal to startup). Text /
-    /// mask / procedural pipelines stay lazy (they need the text subsystem or a
-    /// concrete module id, and the persisted shader cache covers them).
-    pub fn prewarm_pipelines(&self) {
-        for &requested in &[1u32, 4u32] {
-            let sc = requested.min(self.max_frame_sample_count()).max(1);
-            let _ = self.pipeline(
-                "page-fill",
-                0,
-                sc,
-                BlendMode::Normal,
-                &self.layouts.page_layout,
-            );
-            let _ = self.pipeline(
-                "path-solid",
-                0,
-                sc,
-                BlendMode::Normal,
-                &self.layouts.path_layout,
-            );
-            let _ = self.pipeline(
-                "path-solid",
-                1,
-                sc,
-                BlendMode::Normal,
-                &self.layouts.path_layout,
-            );
-            let _ = self.pipeline(
-                "path-shadow",
-                1,
-                sc,
-                BlendMode::Normal,
-                &self.layouts.path_layout,
-            );
-            for desc in [0usize, 1] {
-                let _ = self.pipeline(
-                    "path-gradient",
-                    desc,
-                    sc,
-                    BlendMode::Normal,
-                    &self.layouts.path_layout,
-                );
-                let _ = self.pipeline(
-                    "path-pattern",
-                    desc,
-                    sc,
-                    BlendMode::Normal,
-                    &self.layouts.pattern_layout,
-                );
-            }
-        }
-    }
-
     /// Build (and cache) a render pipeline for `module_id`, using pipeline
     /// descriptor index `desc_index` from the manifest, with the given sample
     /// count and optional blend-mode override (manifest `blend_modes` data).
@@ -10840,31 +10931,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Submit a coverage plan and start readback. Oversized readbacks retain the
-    /// synchronous banded fallback; ordinary frames do not wait for GPU completion.
-    pub fn render_plan_start(&self, plan: &CoveragePlan, pool: &crate::readback::ReadbackPool) -> Result<crate::readback::PendingRgba> {
-        let _encode = crate::prof::span("gpu.encode_submit");
-        let target = self.render_plan_to_texture(plan)?;
-        let retries = if self.first_readback_done.get() {
-            crate::readback::READBACK_POLL_TIMEOUT_RETRIES
-        } else {
-            crate::readback::READBACK_POLL_TIMEOUT_RETRIES_FIRST
-        };
-        crate::readback::read_texture_rgba_start(&self.gpu.device, &self.gpu.queue, &target, pool, plan.transparent, retries)
-    }
-
-    /// Finish a submitted readback, including format canonicalization and straight alpha.
-    pub fn render_plan_finish(&self, pending: crate::readback::PendingRgba) -> Result<Vec<u8>> {
-        let rgba = pending.finish(&self.gpu.device)?;
-        self.first_readback_done.set(true);
-        Ok(rgba)
-    }
-
     /// Execute a coverage plan and read back tightly-packed RGBA bytes (the
     /// export path: native CLI / batch / PDF lanes). ALWAYS canonical RGBA
     /// regardless of the engine's frame format — a BGRA-frame engine's readback
     /// canonicalizes the texels before the un-premultiply below.
-    pub fn render_plan(&self, plan: &CoveragePlan) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    pub(crate) fn render_plan(&self, plan: &CoveragePlan) -> Result<Vec<u8>> {
         let encode = crate::prof::span("gpu.encode_submit");
         let target = self.render_plan_to_texture(plan)?;
         drop(encode);
@@ -10899,45 +10971,6 @@ impl Engine {
             crate::readback::unpremultiply_in_place(&mut rgba);
         }
         Ok(rgba)
-    }
-
-    /// [`Engine::render_plan`] with the GPU RGBA→NV12 conversion at the
-    /// readback seam: same render, same submit; the finished texture is
-    /// converted by `converter`'s compute pass and 1.5 bytes/px are read back
-    /// instead of 4 (BT.709, limited range — see `nv12.rs` for the math and
-    /// its measured relationship to the ffmpeg lane it replaces). Opaque
-    /// plans only: NV12 carries no alpha, and the conversion white-composites
-    /// exactly like the mp4 filter chain would.
-    pub fn render_plan_nv12(
-        &self,
-        plan: &CoveragePlan,
-        converter: &crate::nv12::Nv12Converter,
-    ) -> Result<Vec<u8>> {
-        if plan.transparent {
-            anyhow::bail!("nv12 render: transparent plans have no NV12 representation");
-        }
-        let target = self.render_plan_to_texture(plan)?;
-        let poll_retries = if self.first_readback_done.get() {
-            crate::readback::READBACK_POLL_TIMEOUT_RETRIES
-        } else {
-            crate::readback::READBACK_POLL_TIMEOUT_RETRIES_FIRST
-        };
-        // No CPU-side poll between the render submit and the compute pass:
-        // wgpu orders the compute pass's texture read after the render pass's
-        // write on the queue itself, so the only synchronous wait this frame
-        // needs is `convert`'s map poll — which carries the same retry budget
-        // and therefore the same slow-first-frame tolerance the RGBA lane's
-        // pre-readback poll provides.
-        let nv12 = converter.convert(
-            &self.gpu.device,
-            &self.gpu.queue,
-            &target,
-            plan.width_px,
-            plan.height_px,
-            poll_retries,
-        )?;
-        self.first_readback_done.set(true);
-        Ok(nv12)
     }
 
     /// Execute a coverage plan into the frame-format offscreen target texture
@@ -11109,11 +11142,14 @@ impl Engine {
         // canvas units, where this render's own captures must be exact.
         let scissor = self.capture_scissor.take();
         let window = self.capture_window.take();
+        if self.capture_depth.get() == 0 {
+            self.mask_capture_owner.set(packet_plan.map(|packet| packet.key.owner));
+            self.mask_capture_history.borrow_mut().begin_frame();
+        }
         let mut rendered_mask_views = crate::effects::SurfaceViews::new();
         for mask in &plan.masks {
             let Some(image) = &mask.image else { continue };
             let Some(rendered) = &image.rendered else { continue };
-            let capture_scene = Scene::from_document((*rendered.document).clone())?;
             let scale = cam_override.map_or_else(
                 || plan.camera_frame.as_ref().map_or(plan.scale, |camera| camera.zoom * plan.width_px as f64 / camera.viewport_w),
                 |camera| camera.view.zoom * camera.width_px as f64 / camera.view.viewport_w,
@@ -11122,6 +11158,31 @@ impl Engine {
             let limit = self.gpu.device.limits().max_texture_dimension_2d as f64;
             let texel_limit = (crate::effects::mask::MAX_MASK_TEXELS as f64 / (mask.size[0] * mask.size[1])).sqrt();
             let scale = scale.min(limit / mask.size[0]).min(limit / mask.size[1]).min(texel_limit);
+            // Namespace host-owned text revisions by the caller's installed scene.
+            // Unowned plans keep their ordinary capture path. The shared capture budget bounds
+            // these exact results alongside layer-filter results.
+            let cache_key = rendered.cache_key.filter(|_| self.retained)
+                .zip(self.mask_capture_owner.get()).map(|(source, owner)| {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = rustc_hash::FxHasher::default();
+                    h.write(b"rendered-mask-result");
+                    source.hash(&mut h);
+                    owner.hash(&mut h);
+                    for value in mask.origin.into_iter().chain(mask.size).chain([scale]) {
+                        value.to_bits().hash(&mut h);
+                    }
+                    moda_assets::engine_seam::store_generation().hash(&mut h);
+                    crate::text_draw::text_host_generation().hash(&mut h);
+                    crate::surface::epoch_total().hash(&mut h);
+                    h.finish()
+                });
+            let stable = cache_key.is_some_and(|key| self.mask_capture_history.borrow_mut().observe(key));
+            if let Some(view) = cache_key.and_then(|key| self.capture_cache.borrow_mut().get(key)) {
+                let _ = rendered.shader_clock.set(false); // Only clock-free captures enter this store.
+                rendered_mask_views.insert(image.surface.clone().expect("rendered mask surface"), view);
+                continue;
+            }
+            let capture_scene = Scene::from_document((*rendered.document).clone())?;
             let camera = CameraParams {
                 camera_x: mask.origin[0], camera_y: mask.origin[1], zoom: 1.0,
                 viewport_w: mask.size[0], viewport_h: mask.size[1], dpr: scale,
@@ -11150,7 +11211,18 @@ impl Engine {
             self.scratch.release(scope, result.as_ref().ok());
             self.capture_depth.set(self.capture_depth.get() - 1);
             let texture = result?;
-            rendered_mask_views.insert(image.surface.clone().expect("rendered mask surface"), texture.create_view(&Default::default()));
+            let view = texture.create_view(&Default::default());
+            // A procedural paint or effect can read the clock even when its source is unchanged.
+            // Such captures are never published under the clock-free content key.
+            let uses_shader_time = crate::residency::plan_uses_shader_time(&capture_plan);
+            let _ = rendered.shader_clock.set(uses_shader_time);
+            if stable && !uses_shader_time {
+                if let Some(key) = cache_key {
+                    self.scratch.keep(&texture);
+                    self.capture_cache.borrow_mut().put(key, view.clone(), texture.width(), texture.height());
+                }
+            }
+            rendered_mask_views.insert(image.surface.clone().expect("rendered mask surface"), view);
         }
         let device = &self.gpu.device;
         let queue = &self.gpu.queue;
@@ -12010,32 +12082,6 @@ impl Engine {
             Option<u64>,
         )> = Vec::new();
         let mut layer_blur_bucket_draws: Vec<(usize, u64, usize)> = Vec::new();
-        // Size the body vertex streams up front: at 100k nodes they are hundreds of MB,
-        // and grown by doubling they held up to three times their final size at once
-        // (the old and new blocks of each realloc) — the biggest transient of a large
-        // document's first frame, in wasm linear memory that never shrinks.
-        {
-            let (mut opaque, mut trans) = ((0usize, 0usize), (0usize, 0usize));
-            for item in &plan.items {
-                if let DrawItem::Body {
-                    phase, geometry, ..
-                } = item
-                {
-                    let n = match phase {
-                        Phase::Opaque => &mut opaque,
-                        Phase::Transparent => &mut trans,
-                    };
-                    n.0 += geometry.positions.len();
-                    n.1 += geometry.vertex_types.len();
-                }
-            }
-            opaque_vertices.reserve_exact(opaque.0);
-            opaque_types.reserve_exact(opaque.1);
-            opaque_uvs.reserve_exact(2 * opaque.1);
-            trans_vertices.reserve_exact(trans.0);
-            trans_types.reserve_exact(trans.1);
-            trans_uvs.reserve_exact(2 * trans.1);
-        }
         // Vertex residency (live camera presents only): per phase, `Some(appending)` — `true` to append what the
         // streams don't hold, `false` to pack afresh (and record where everything went).
         // The engine's residency is the outermost render's: a capture's render packs its own streams and leaves it be.
@@ -12060,6 +12106,7 @@ impl Engine {
                 if let Some(r) = residency[k].as_mut() { r.assign_slots(&plan.items, k, &mut item_slots); }
             }
         }
+        let mut vertex_reserve = [(0usize, 0usize); 2];
         let appending: [Option<bool>; 2] = std::array::from_fn(|k| {
             if !resident_lane {
                 residency[k] = None;
@@ -12089,7 +12136,11 @@ impl Engine {
                         if !seen.insert((address, owner)) { continue; }
                         match r.offset_of(geometry, owner) {
                             Some(_) => live += u64::from(geometry.vertex_count),
-                            None => add += u64::from(geometry.vertex_count),
+                            None => {
+                                add += u64::from(geometry.vertex_count);
+                                vertex_reserve[k].0 += geometry.positions.len();
+                                vertex_reserve[k].1 += geometry.vertex_types.len();
+                            }
                         }
                     }
                 }
@@ -12113,6 +12164,30 @@ impl Engine {
             }
         });
 
+        // Reserve only vertices the resident streams do not already hold. The residency proof
+        // counted missing geometry in the same identity/owner namespace the packer uses below.
+        // A fresh phase keeps the full upper bound: growing its large streams by doubling would
+        // hold old and new allocations at once, especially costly in wasm's linear memory.
+        for k in 0..2 {
+            if appending[k] != Some(true) { vertex_reserve[k] = (0, 0); }
+        }
+        if appending.iter().any(|a| *a != Some(true)) {
+            for item in &plan.items {
+                if let DrawItem::Body { phase, geometry, .. } = item {
+                    let k = usize::from(*phase == Phase::Transparent);
+                    if appending[k] == Some(true) { continue; }
+                    vertex_reserve[k].0 += geometry.positions.len();
+                    vertex_reserve[k].1 += geometry.vertex_types.len();
+                }
+            }
+        }
+        opaque_vertices.reserve_exact(vertex_reserve[0].0);
+        opaque_types.reserve_exact(vertex_reserve[0].1);
+        opaque_uvs.reserve_exact(2 * vertex_reserve[0].1);
+        trans_vertices.reserve_exact(vertex_reserve[1].0);
+        trans_types.reserve_exact(vertex_reserve[1].1);
+        trans_uvs.reserve_exact(2 * vertex_reserve[1].1);
+
         // A phase packed afresh starts its slots again; either way, remember which geometries are shared.
         if resident_lane {
             for k in 0..2 {
@@ -12129,8 +12204,9 @@ impl Engine {
                 *at = RecordAt { index, first_vertex };
             }
         };
-        for (item_at, item) in plan.items.iter().enumerate() {
+        for (item_at, item) in plan.indexed_items() {
             match item {
+                DrawItem::Vacant => unreachable!("vacant output in painter order"),
                 DrawItem::PageFill { instance } => {
                     note(item_at, page_instances.len() as u32, 0);
                     page_instances.push(*instance);
@@ -12279,6 +12355,7 @@ impl Engine {
                     // M3a: text draws in the transparent phase at the batch's
                     // exact z, after paths within the bucket.
                     let idx = text_batches.len();
+                    note(item_at, idx as u32, 0);
                     // A greeked motion frame draws the batch's word-bar copy (same z, model and clip).
                     let batch = greek_arcs.get(idx).and_then(Option::as_ref).unwrap_or(batch);
                     text_batches.push(batch);
@@ -12846,6 +12923,7 @@ impl Engine {
                 }
                 None => local_patterns.get_or_insert_with(|| paint::draw::PatternTextureCache::new(device, self.working)),
             };
+            if let Some(images) = &self.shared_images { cache.share_images(images.clone()); }
             cache.begin_frame();
             for item in &plan.items {
                 if let DrawItem::Body {
@@ -12911,6 +12989,7 @@ impl Engine {
             } else {
                 local_shader_images.get_or_insert_with(|| ShaderImageTextureCache::new(device))
             };
+            if let Some(images) = &self.shared_images { cache.shared = Some(images.clone()); }
             cache.begin_frame();
             for item in &plan.items {
                 if let DrawItem::Body {
@@ -14134,7 +14213,7 @@ impl Engine {
         // What the packet's state is compared with: the owner's account from that state, or the pinned plan.
         let base = match (new.change, &pinned) {
             (Some(change), _) if key == (PlanKey { owner: new.key.owner, revision: change.from }) => Some(match change.items {
-                ChangedItems::Written { placed, replaced } => PatchBase::Written { placed, replaced },
+                ChangedItems::Written { placed, replaced, masks_changed } => PatchBase::Written { placed, replaced, masks_changed },
                 ChangedItems::Whole(old) => PatchBase::Whole(old),
             }),
             (None, Some(old)) if new.pinned.is_some() => Some(PatchBase::Whole(&**old)),
@@ -14179,13 +14258,13 @@ impl Engine {
             return Err("split vertex stream");
         }
         // The mask table is rebuilt by every encode (`MaskAtlas`); only the recorded pass holds the old one. Items
-        // written in place keep the plan's mask table (a placement touches no mask, and the planner prepares a
-        // node again only into the masks the plan has).
+        // written in place name changed mask inputs explicitly; their consumers have been prepared again.
         let masks_changed = match base {
             PatchBase::Whole(old) => !std::ptr::eq(old.masks.as_ptr(), new_plan.masks.as_ptr()) && old.masks != new_plan.masks,
-            PatchBase::Written { .. } => false,
+            PatchBase::Written { masks_changed, .. } => masks_changed,
         };
         let mut text_changed = false;
+        let mut text_writes = std::collections::BTreeMap::new();
         let sdf_opaque_lane = sample_count > 1 && clear_is_opaque;
         // The packet's vertex residency (a slot-owned body's new geometry takes its old one's place in it), and
         // the moves to record once the patch is known to apply.
@@ -14333,6 +14412,7 @@ impl Engine {
                 (DrawItem::Text(a), DrawItem::Text(b)) => {
                     if !std::sync::Arc::ptr_eq(a, b) {
                         text_changed = true;
+                        text_writes.insert(rec.index as usize, b.clone());
                     }
                 }
                 (
@@ -14389,7 +14469,7 @@ impl Engine {
             Ok(())
         };
         match base {
-            PatchBase::Written { placed, replaced } => {
+            PatchBase::Written { placed, replaced, .. } => {
                 for &at in placed {
                     visit(at as usize, None)?;
                 }
@@ -14419,62 +14499,42 @@ impl Engine {
                 }
             }
         }
-        // Changed text: the new plan's batches, each chunk kept when its batches are the packet's (the rebuild's
-        // `TextCarry` rule), else prepared again against the retained frame uniform the packet's text binds.
-        let text = if text_changed {
+        // Address only changed text records. Reprepare an affected chunk only when its content changed.
+        let mut rebuilt_text = Vec::new();
+        let mut paint_chunks = std::collections::BTreeSet::new();
+        if text_changed {
             let pf = self.prepared_frame.borrow();
             let p = pf.as_ref().ok_or("no packet")?;
-            if p.text_greek_sig != 0 {
-                return Err("greeked text");
-            }
+            if p.text_greek_sig != 0 { return Err("greeked text"); }
             if p.text_host_generation != crate::text_draw::text_host_generation() || p.sample_count != sample_count {
                 return Err("text host");
             }
-            let uniform = self
-                .retained_frame
-                .borrow()
-                .frame_uniform
-                .as_ref()
-                .map(|(b, _)| b.clone())
-                .ok_or("text uniform")?;
-            let arcs: Vec<std::sync::Arc<crate::seams::TextQuadBatch>> = new_plan
-                .items
-                .iter()
-                .filter_map(|i| match i {
-                    DrawItem::Text(b) => Some(b.clone()),
-                    _ => None,
-                })
-                .collect();
-            let mut chunks = Vec::with_capacity(arcs.len().div_ceil(TEXT_CHUNK));
-            let mut prepared_chunks = 0u64;
-            for (i, chunk) in arcs.chunks(TEXT_CHUNK).enumerate() {
-                let start = i * TEXT_CHUNK;
-                let kept = p
-                    .text_batches
-                    .get(start..start + chunk.len())
-                    .filter(|old| old.iter().zip(chunk).all(|(a, b)| std::sync::Arc::ptr_eq(a, b)))
-                    .and_then(|_| p.text.chunks.get(i).cloned());
-                match kept {
-                    Some(c) => chunks.push(c),
-                    None => {
-                        let batches: Vec<&crate::seams::TextQuadBatch> = chunk.iter().map(|b| &**b).collect();
-                        let prepared = self
-                            .text
-                            .prepare(&self.text_gpu(), &uniform, &batches, sample_count)
-                            .map_err(|_| "text prepare")?;
-                        self.add_pf_text_bytes(prepared.uploaded_bytes());
-                        chunks.push(std::sync::Arc::new(prepared));
-                        prepared_chunks += 1;
-                    }
-                }
+            let mut rebuild = std::collections::BTreeSet::new();
+            for (&at, batch) in &text_writes {
+                let chunk = at / TEXT_CHUNK;
+                let old = p.text_batches.get(at).ok_or("text address")?;
+                let prepared = p.text.chunks.get(chunk).ok_or("text chunk")?;
+                if prepared.can_repaint(at % TEXT_CHUNK, old, batch) {
+                    paint_chunks.insert(chunk);
+                } else { rebuild.insert(chunk); }
+            }
+            for chunk in rebuild {
+                paint_chunks.remove(&chunk);
+                let start = chunk * TEXT_CHUNK;
+                let end = (start + TEXT_CHUNK).min(p.text_batches.len());
+                let batches: Vec<_> = (start..end).map(|at|
+                    &**text_writes.get(&at).unwrap_or(&p.text_batches[at])).collect();
+                let uniform = self.retained_frame.borrow().frame_uniform.as_ref()
+                    .map(|(b,_)| b.clone()).ok_or("text uniform")?;
+                let prepared = self.text.prepare(&self.text_gpu(), &uniform, &batches, sample_count)
+                    .map_err(|_| "text prepare")?;
+                self.add_pf_text_bytes(prepared.uploaded_bytes());
+                rebuilt_text.push((chunk, std::sync::Arc::new(prepared)));
             }
             let mut st = self.prepared_stats.get();
-            st.patched_text_chunks = st.patched_text_chunks.wrapping_add(prepared_chunks);
+            st.patched_text_chunks = st.patched_text_chunks.wrapping_add(rebuilt_text.len() as u64);
             self.prepared_stats.set(st);
-            Some((std::sync::Arc::new(TextChunks { chunks }), arcs))
-        } else {
-            None
-        };
+        }
         drop(residency_guard);
         {
             let mut res = self.vertex_residency.borrow_mut();
@@ -14511,12 +14571,29 @@ impl Engine {
             if let Some(replaced) = std::mem::replace(&mut p.pinned, new.pinned.cloned()) {
                 self.defer_drop(Box::new(replaced));
             }
-            if let Some((chunks, batches)) = text {
-                let old_text = std::mem::replace(&mut p.text, chunks);
-                let old_batches = std::mem::replace(&mut p.text_batches, batches);
-                self.defer_drop(Box::new((old_text, old_batches)));
+            for (&at, batch) in &text_writes {
+                if paint_chunks.contains(&(at / TEXT_CHUNK)) {
+                    p.text.chunks[at / TEXT_CHUNK].stage_paint(at % TEXT_CHUNK, batch);
+                }
             }
-            if text_changed || masks_changed {
+            for chunk in paint_chunks {
+                written += p.text.chunks[chunk].commit_paint(|buffer, offset, data| {
+                    crate::gpu_profile::count_buffer_write(data.len());
+                    self.gpu.queue.write_buffer(buffer, offset, data);
+                });
+            }
+            let text_rebuilt = !rebuilt_text.is_empty();
+            if text_rebuilt {
+                let chunks = std::sync::Arc::make_mut(&mut p.text);
+                for (at, prepared) in rebuilt_text {
+                    let old = std::mem::replace(&mut chunks.chunks[at], prepared);
+                    self.defer_drop(Box::new(old));
+                }
+            }
+            for (at, batch) in text_writes {
+                p.text_batches[at] = batch;
+            }
+            if text_rebuilt || masks_changed {
                 if let Some(bundle) = p.bundle.take() {
                     self.defer_drop(Box::new(bundle));
                 }
@@ -14861,6 +14938,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mask_capture_admission_keeps_stable_masks_and_leaves_animation_in_scratch() {
+        let mut history = MaskCaptureHistory::default();
+        for frame in 0..20 {
+            history.begin_frame();
+            assert_eq!(history.observe(1), frame > 0);
+            assert!(!history.observe(100 + frame), "a changing mask must not be retained");
+            assert!(!history.observe(100 + frame), "two uses in one frame are not temporal reuse");
+        }
+        history.begin_frame();
+        history.begin_frame();
+        assert!(!history.observe(1), "an absent frame resets admission");
+    }
+
+    #[test]
+    fn mask_capture_admission_covers_keys_beyond_the_old_cutoff_in_any_order() {
+        use std::hash::{Hash, Hasher};
+        let keys: Vec<_> = (0..20_000u64).map(|key| {
+            let mut hash = rustc_hash::FxHasher::default();
+            key.hash(&mut hash);
+            hash.finish()
+        }).collect();
+        let mut history = MaskCaptureHistory::default();
+        history.begin_frame();
+        for &key in &keys { assert!(!history.observe(key)); }
+        history.begin_frame();
+        for &key in keys.iter().rev() {
+            assert!(history.observe(key), "every repeated key qualifies, including late keys");
+        }
+        assert_eq!(history.current.len() + history.previous.len(), 8192);
+        history.begin_frame();
+        history.begin_frame();
+        for &key in &keys { assert!(!history.observe(key), "an empty frame clears membership"); }
+        // Full filters can only relax admission; cache lookup still uses the
+        // original full content key. Neither membership nor storage grows.
+        history.previous.fill(u64::MAX);
+        assert!(history.observe(u64::MAX));
+        assert_eq!(history.current.len() + history.previous.len(), 8192);
+    }
+
+    #[test]
     fn translation_recipes_keep_geometry_and_match_cold_nested_models() {
         use moda_scene::value::json;
         for (solid, paint) in [(true, json!({"type":"solid","color":"#e43d26"})),
@@ -14960,32 +15077,6 @@ mod tests {
         assert_eq!(residency.offset_of(&geometry, Some(2)), None);
     }
 
-    #[test]
-    fn a_column_uploads_once_from_its_first_changed_record_to_its_last() {
-        let mut column = Column::of((0..8u32).map(|i| [i, 0]).collect::<Vec<[u32; 2]>>());
-        // A record the buffer already holds asks for nothing.
-        assert_eq!(column.put(3, &[3, 0]), Ok(false));
-        assert!(!column.is_pending());
-        // Asked out of order, with unchanged records between them.
-        assert_eq!(column.put(5, &[5, 9]), Ok(true));
-        assert_eq!(column.put(2, &[2, 9]), Ok(true));
-        assert_eq!(column.put(1, &[1, 9]), Ok(true));
-        assert_eq!(column.put(8, &[8, 9]), Err("record"));
-        // Nothing is taken before the commit.
-        assert_eq!(column.records[2], [2, 0]);
-        let mut uploads: Vec<(u64, Vec<u8>)> = Vec::new();
-        column.commit(&mut |offset, data| uploads.push((offset, data.to_vec())));
-        let bytes = |records: &[[u32; 2]]| bytemuck::cast_slice::<[u32; 2], u8>(records).to_vec();
-        assert_eq!(uploads, vec![(8, bytes(&[[1, 9], [2, 9], [3, 0], [4, 0], [5, 9]]))]);
-        assert!(!column.is_pending());
-        assert_eq!(column.records, vec![[0, 0], [1, 9], [2, 9], [3, 0], [4, 0], [5, 9], [6, 0], [7, 0]]);
-        assert_eq!(column.bytes(), 64);
-        // A discarded record is never taken, and a column with nothing pending uploads nothing.
-        assert_eq!(column.put(0, &[7, 7]), Ok(true));
-        column.discard();
-        column.commit(&mut |_, _| panic!("nothing is pending"));
-        assert_eq!(column.records[0], [0, 0]);
-    }
 
     #[test]
     #[ignore = "requires a working GPU adapter"]
@@ -16073,8 +16164,9 @@ mod tests {
         let gpu = crate::device::GpuContext::new(crate::device::BackendChoice::Auto).expect("GPU test requires a working adapter");
         let engine = Engine::new(gpu).expect("engine init");
         let (target, msaa, depth) = engine.frame_targets(64, 48, 4);
-        let _ = engine.frame_targets(16, 16, 1);
-        let _ = engine.frame_targets(32, 32, 1);
+        for width in 16..16 + SCRATCH_ATTACHMENT_SLOTS as u32 - 1 {
+            let _ = engine.frame_targets(width, width, 1);
+        }
         let (next_target, next_msaa, next_depth) = engine.frame_targets(64, 48, 4);
         assert_ne!(target, next_target);
         assert_eq!(msaa, next_msaa);
@@ -16287,6 +16379,50 @@ mod tests {
         assert!(blit.is_none(), "non-backdrop ⇒ direct present (Ok(None))");
         crate::readback::read_texture_rgba(&engine.gpu.device, &engine.gpu.queue, &tex, w, h)
             .expect("readback")
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn integer_translation_reuse_matches_fresh_blurs_and_masks() {
+        let mut engine = Engine::new(gpu("integer translation")).unwrap();
+        engine.set_retained(true);
+        let mut resident = crate::residency::ResidentScene::default();
+        let mut caches = crate::residency::PlanCaches::default();
+        for (step, x) in [64., 80., 120., 120.25, 121.25, -8., 64.].into_iter().enumerate() {
+            let doc = moda_scene::value::json!({
+                "nodes": [
+                    {"id":"blur","type":"path","x":x,"y":80,"width":40,"height":40,"closed":true,
+                     "points":[{"type":"move","x":0,"y":0},{"type":"line","x":40,"y":0},
+                         {"type":"line","x":32,"y":40},{"type":"close"}],
+                     "fills":[{"id":"f","paint":{"type":"solid","color":"#f04080"}}],
+                     "effects":[{"id":"b","type":"layer-blur","radius":4}]},
+                    {"id":"g","type":"group","x":x,"y":150,"children":["m","inner"],"clipMaskNodeId":"m"},
+                    {"id":"m","type":"ellipse","width":50,"height":40,
+                     "fills":[{"id":"f","paint":{"type":"solid","color":"#ffffff"}}]},
+                    {"id":"inner","type":"group","x":5,"y":3,"children":["m2","c"],"clipMaskNodeId":"m2"},
+                    {"id":"m2","type":"ellipse","width":42,"height":34,
+                     "fills":[{"id":"f","paint":{"type":"solid","color":"#ffffff"}}]},
+                    {"id":"c","type":"rectangle","width":70,"height":60,
+                     "fills":[{"id":"f","paint":{"type":"solid","color":"#40b0f0"}}]}
+                ],
+                "pages":[{"id":"p","width":320,"height":240,"nodeIds":["blur","g"]}],
+                "config":{"renderPageClipping":true}
+            });
+            resident.update(&doc.to_string()).unwrap();
+            caches.begin_frame();
+            let cam = test_camera([0.,0.],1.,[320.,240.],1.,[0.;3]);
+            let (plan, _) = crate::residency::build_camera_plan_retained(
+                &resident, &mut caches, &[0], &cam, &RenderOptions::default()).unwrap().unwrap();
+            let hits = engine.capture_cache_stats().0;
+            let mask_hits = engine.mask_cache_stats().map_or(0, |s| s.0);
+            let actual = engine.render_plan(&plan).unwrap();
+            if step == 1 || step == 2 {
+                assert!(engine.capture_cache_stats().0 > hits, "integer move reuses blur");
+                assert!(engine.mask_cache_stats().unwrap().0 > mask_hits, "integer move reuses mask coverage");
+            }
+            let fresh = Engine::new(gpu("fresh integer translation")).unwrap();
+            assert_eq!(actual, fresh.render_plan(&plan).unwrap(), "fresh pixels at {x}");
+        }
     }
 
     fn gpu(test_name: &str) -> crate::device::GpuContext {
@@ -17164,6 +17300,50 @@ mod tests {
     }
 
 
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn rendered_mask_clock_proof_matches_executed_capture() {
+        let mut engine = Engine::new(gpu("rendered mask clock proof")).unwrap();
+        engine.set_retained(true);
+        for animated in [false, true] {
+            let paint = if animated {
+                moda_scene::value::json!({"type":"shader","shaderId":"clouds"})
+            } else {
+                moda_scene::value::json!({"type":"solid","color":"#808080"})
+            };
+            let doc = moda_scene::value::json!({
+                "nodes":[
+                    {"id":"g","type":"group","children":["m","body"],"clipMaskNodeId":"m"},
+                    {"id":"m","type":"group","maskType":"luminance","children":["ink"]},
+                    {"id":"ink","type":"rectangle","width":320,"height":240,
+                     "fills":[{"id":"f","paint":paint}]},
+                    {"id":"body","type":"rectangle","width":320,"height":240,
+                     "fills":[{"id":"f","paint":{"type":"solid","color":"#ffffff"}}]}
+                ],
+                "pages":[{"id":"p","width":320,"height":240,"nodeIds":["g"]}],
+                "config":{"renderPageClipping":true}
+            });
+            let scene = Scene::load(moda_scene::extract_canvas_data(&doc)).unwrap();
+            let cam = test_camera([0., 0.], 1., [320., 240.], 1., [0., 0., 0.]);
+            let plan = std::sync::Arc::new(build_camera_plan(&scene, &[0], &cam,
+                &editor_camera_opts()).unwrap().unwrap().0);
+            assert!(crate::residency::plan_uses_shader_time(&plan), "unexecuted mask is conservative");
+            let first = render_prepared_test_frame(&engine, &plan, &cam.present_override(0.),
+                Some(&plan), "mask clock first", 320, 240);
+            let proofs: Vec<_> = plan.masks.iter().filter_map(|mask|
+                mask.image.as_ref()?.rendered.as_ref()?.shader_clock.get().copied()).collect();
+            assert!(!proofs.is_empty());
+            assert!(proofs.iter().all(|clock| *clock == animated));
+            assert_eq!(crate::residency::plan_uses_shader_time(&plan), animated);
+            let later = render_prepared_test_frame(&engine, &plan, &cam.present_override(6.),
+                Some(&plan), "mask clock retained", 320, 240);
+            let fresh = render_prepared_test_frame(&engine, &plan, &cam.present_override(6.),
+                None, "mask clock ordinary", 320, 240);
+            assert_eq!(later, fresh, "retained capture matches ordinary execution");
+            assert_eq!(first == later, !animated, "animated mask must visibly advance");
+        }
+    }
 
     #[test]
     #[ignore = "requires a working GPU adapter"]
@@ -18751,6 +18931,8 @@ fn module_is_image_backed(module_id: &str) -> bool {
 /// `premultipliedAlpha` unset), clamp-to-edge linear sampler, one bind group
 /// per resource key on manifest BGL 42 (texture@0, sampler@1).
 struct ShaderImageTextureCache {
+    shared: Option<std::sync::Arc<paint::draw::SharedImages>>,
+    shared_textures: std::collections::HashMap<String, std::sync::Arc<wgpu::Texture>>,
     sampler: wgpu::Sampler,
     bind_groups: std::collections::HashMap<String, wgpu::BindGroup>,
     textures: std::collections::HashMap<String, wgpu::Texture>,
@@ -18763,6 +18945,8 @@ struct ShaderImageTextureCache {
 impl ShaderImageTextureCache {
     fn new(device: &wgpu::Device) -> Self {
         ShaderImageTextureCache {
+            shared: None,
+            shared_textures: Default::default(),
             // `ShaderImageResourceManager`'s sampler: clamp-to-edge, linear.
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("Shader effect image sampler"),
@@ -18808,15 +18992,15 @@ impl ShaderImageTextureCache {
             }
             self.bind_groups.remove(&key);
             if let Some(texture) = self.textures.remove(&key) {
-                crate::scratch::destroy(&texture);
+                if self.shared_textures.remove(&key).is_none() { crate::scratch::destroy(&texture); }
             }
         }
     }
 
     fn clear_gpu_resources(&mut self) {
         self.bind_groups.clear();
-        for (_, texture) in self.textures.drain() {
-            crate::scratch::destroy(&texture);
+        for (key, texture) in self.textures.drain() {
+            if self.shared_textures.remove(&key).is_none() { crate::scratch::destroy(&texture); }
         }
         self.usage.clear();
         self.total_bytes = 0;
@@ -18839,40 +19023,48 @@ impl ShaderImageTextureCache {
         let bytes = tex.width.max(1) as usize * tex.height.max(1) as usize * 4;
         self.usage.insert(cache_key.to_string(), (bytes, self.tick));
         self.total_bytes += bytes;
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(&format!("shader image {}", tex.key)),
-            size: wgpu::Extent3d {
-                width: tex.width.max(1),
-                height: tex.height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        crate::gpu_profile::count_texture_write(tex.rgba_straight.len());
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &tex.rgba_straight,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * tex.width.max(1)),
-                rows_per_image: None,
-            },
-            wgpu::Extent3d {
-                width: tex.width.max(1),
-                height: tex.height.max(1),
-                depth_or_array_layers: 1,
-            },
-        );
+        let create = || {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("shader image {}", tex.key)),
+                size: wgpu::Extent3d {
+                    width: tex.width.max(1),
+                    height: tex.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            crate::gpu_profile::count_texture_write(tex.rgba_straight.len());
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &tex.rgba_straight,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * tex.width.max(1)),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: tex.width.max(1),
+                    height: tex.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+            texture
+        };
+        let texture = if let Some(shared) = &self.shared {
+            let texture = shared.shader_texture(cache_key, &tex.rgba_straight, [tex.width.max(1), tex.height.max(1)], create);
+            self.shared_textures.insert(cache_key.to_string(), texture.clone());
+            texture.as_ref().clone()
+        } else { create() };
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Shader effect image bind group"),
@@ -18896,6 +19088,64 @@ impl ShaderImageTextureCache {
 impl Drop for ShaderImageTextureCache {
     fn drop(&mut self) {
         self.clear_gpu_resources();
+    }
+}
+
+#[cfg(test)]
+mod shared_shader_image_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn shader_images_survive_another_cache_replacing_and_evicting_pixels() {
+        let gpu = crate::device::GpuContext::new(crate::device::BackendChoice::Auto).expect("GPU test requires a working adapter");
+        eprintln!("shared shader-image GPU: {}", gpu.adapter_info.name);
+        let shared = std::sync::Arc::new(paint::draw::SharedImages::default());
+        let layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None, entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let mut a = ShaderImageTextureCache::new(&gpu.device);
+        let mut b = ShaderImageTextureCache::new(&gpu.device);
+        a.shared = Some(shared.clone()); b.shared = Some(shared);
+        let mut image = crate::seams::ShaderImageTexture { key: "image".into(), width: 4, height: 4, rgba_straight: std::sync::Arc::new(vec![255; 64]) };
+        a.bind_group(&gpu.device, &gpu.queue, &layout, "image", &image);
+        b.bind_group(&gpu.device, &gpu.queue, &layout, "image", &image);
+        assert_eq!(a.textures["image"], b.textures["image"]);
+        let original = b.textures["image"].clone();
+        a.clear_gpu_resources();
+        image.rgba_straight = std::sync::Arc::new(vec![0; 64]);
+        a.bind_group(&gpu.device, &gpu.queue, &layout, "image", &image);
+        assert_ne!(a.textures["image"], original);
+        a.clear_gpu_resources(); b.clear_gpu_resources();
+        let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None,
+            source: wgpu::ShaderSource::Wgsl("@group(0) @binding(0) var s: sampler; @group(0) @binding(1) var t: texture_2d<f32>; @group(0) @binding(2) var<storage,read_write> result: vec4<f32>; @compute @workgroup_size(1) fn main() { result = textureSampleLevel(t, s, vec2<f32>(0.5), 0.0); }".into()) });
+        let pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let result = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let view = original.create_view(&Default::default());
+        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None,
+            layout: &pipeline.get_bind_group_layout(0), entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&b.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 2, resource: result.as_entire_binding() },
+            ] });
+        let mut command = gpu.device.create_command_encoder(&Default::default());
+        { let mut pass = command.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline); pass.set_bind_group(0, &group, &[]); pass.dispatch_workgroups(1, 1, 1); }
+        command.copy_buffer_to_buffer(&result, 0, &read, 0, 16);
+        gpu.queue.submit([command.finish()]);
+        let (send, receive) = std::sync::mpsc::channel();
+        read.map_async(wgpu::MapMode::Read, .., move |result| { send.send(result).unwrap(); });
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap(); receive.recv().unwrap().unwrap();
+        let pixels = bytemuck::cast_slice::<u8, f32>(&read.get_mapped_range(..)).to_vec(); read.unmap();
+        assert_eq!(pixels, [1., 1., 1., 1.]);
     }
 }
 

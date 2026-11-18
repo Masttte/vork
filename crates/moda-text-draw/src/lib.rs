@@ -6,6 +6,7 @@
 
 pub mod depth;
 pub mod device;
+pub mod records;
 pub mod seams;
 pub mod text_draw;
 pub mod vec_arena_cache;

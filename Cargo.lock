@@ -120,6 +120,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "ar_archive_writer"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "523e5e187fff36fcb8d1d19ccf0ca4ca43ec3d158316057f66dc6f72716bc5ec"
+dependencies = [
+ "object",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1797,8 +1806,6 @@ dependencies = [
  "moxcms",
  "png",
  "resvg",
- "serde_json",
- "wgpu",
 ]
 
 [[package]]
@@ -1812,7 +1819,6 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytemuck",
- "flate2",
  "half",
  "i_overlay",
  "image",
@@ -1829,7 +1835,6 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
- "simd-adler32",
  "unicode-segmentation",
  "wgpu",
 ]
@@ -1871,7 +1876,6 @@ dependencies = [
  "icu_segmenter",
  "moda-plain-text",
  "moda-scene",
- "png",
  "resvg",
  "rustc-hash 2.1.3",
  "rustybuzz",
@@ -2331,6 +2335,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2673,6 +2686,16 @@ dependencies = [
  "rand_xorshift",
  "regex-syntax",
  "unarray",
+]
+
+[[package]]
+name = "psm"
+version = "0.1.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
+dependencies = [
+ "ar_archive_writer",
+ "cc",
 ]
 
 [[package]]
@@ -3399,6 +3422,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "stacker"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "707f49d46706bacf8a2b00d51dace3f9de527c13eec3778f570c411f89e69967"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "psm",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3907,7 +3943,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vork-audio"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "hound",
@@ -3916,7 +3952,7 @@ dependencies = [
 
 [[package]]
 name = "vork-cli"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3924,6 +3960,7 @@ dependencies = [
  "libc",
  "semver",
  "serde",
+ "stacker",
  "ureq",
  "vork-json",
  "vork-render",
@@ -3935,7 +3972,7 @@ dependencies = [
 
 [[package]]
 name = "vork-encode"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "ash",
@@ -3950,7 +3987,7 @@ dependencies = [
 
 [[package]]
 name = "vork-json"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3958,7 +3995,7 @@ dependencies = [
 
 [[package]]
 name = "vork-mesh"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "glam",
@@ -3969,7 +4006,7 @@ dependencies = [
 
 [[package]]
 name = "vork-render"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "ash",
@@ -3989,7 +4026,6 @@ dependencies = [
  "memmap2",
  "moda-assets",
  "moda-engine",
- "moda-plain-text",
  "moda-scene",
  "moda-text",
  "moda-text-draw",
@@ -3999,6 +4035,7 @@ dependencies = [
  "pollster",
  "proptest",
  "serde",
+ "smallvec",
  "svgtypes",
  "texture2ddecoder",
  "urlencoding",
@@ -4019,7 +4056,7 @@ dependencies = [
 
 [[package]]
 name = "vork-scene"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "cssparser",
@@ -4034,7 +4071,7 @@ dependencies = [
 
 [[package]]
 name = "vork-slang"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4049,7 +4086,7 @@ dependencies = [
 
 [[package]]
 name = "vork-splat"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "flate2",
@@ -4058,7 +4095,7 @@ dependencies = [
 
 [[package]]
 name = "vork-std"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4081,7 +4118,7 @@ dependencies = [
 
 [[package]]
 name = "vork-time"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "num-bigint",

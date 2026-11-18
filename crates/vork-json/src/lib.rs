@@ -1,8 +1,8 @@
 //! Vork's JSON boundary: recursively sorted object keys and explicit float parsing
 //! precision, independent of features unified by embedded engines.
 //!
-//! All serde_json types and parsing APIs are shared with upstream. Only the six
-//! text/byte output helpers below differ: object keys are sorted, arrays retain
+//! All serde_json types and parsing APIs are shared with upstream. The
+//! text/byte output helpers below sort object keys; arrays retain
 //! their order. Use these helpers for files, protocol replies and cache identities.
 use serde::Serialize;
 pub use serde_json::*;
@@ -28,6 +28,33 @@ pub fn to_vec<T: ?Sized + Serialize>(value: &T) -> Result<Vec<u8>> {
 pub fn to_vec_pretty<T: ?Sized + Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec_pretty(&sorted(value)?)
 }
+/// Serialize an existing JSON value with sorted keys without serializing and
+/// parsing an intermediate copy. Its numbers already own their JSON tokens.
+pub fn value_to_vec_pretty(value: &Value) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&SortedValue(value))
+}
+
+struct SortedValue<'a>(&'a Value);
+impl Serialize for SortedValue<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            Value::Object(object) => {
+                let mut entries: Vec<_> = object.iter().collect();
+                entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries { map.serialize_entry(key, &SortedValue(value))?; }
+                map.end()
+            }
+            Value::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values { sequence.serialize_element(&SortedValue(value))?; }
+                sequence.end()
+            }
+            value => value.serialize(serializer),
+        }
+    }
+}
 pub fn to_string<T: ?Sized + Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(&sorted(value)?)
 }
@@ -44,6 +71,19 @@ pub fn to_writer_pretty<W: Write, T: ?Sized + Serialize>(writer: W, value: &T) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_value_output_preserves_sorted_bytes_and_numeric_tokens() {
+        let source = r#"{"z":[{"é":true,"a":null,"\n":"\\\""},-0.0,1.2300,123456789012345678901234567890,1e-1000],"a":{"z":0,"a":1}}"#;
+        let mut value: Value = from_str(source).unwrap();
+        for _ in 0..160 {
+            assert_eq!(value_to_vec_pretty(&value).unwrap(), to_vec_pretty(&value).unwrap());
+            let mut object = Map::new();
+            object.insert("z".into(), value);
+            object.insert("a".into(), Value::from(0));
+            value = Value::Object(object);
+        }
+    }
 
     #[test]
     fn output_depth_is_independent_of_input_limit() {

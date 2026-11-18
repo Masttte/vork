@@ -452,8 +452,7 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
                             .arg(&stem)
                             .arg("-reflection-json")
                             .arg(stem.with_extension(format!("{ext}.json")));
-                        let args:Vec<_>=command.get_args().collect();
-                        let precise=args.windows(2).any(|pair|pair[0]=="-fp-mode" && pair[1]=="precise");
+                        let args:Vec<_>=command.get_args().map(|arg|arg.to_owned()).collect();
                         if let Err(e) = run(command, &stem.with_extension(format!("{ext}.log"))) {
                             failed.store(true, Ordering::Relaxed);
                             return Err(format!("slangc {name} ({target}): {e}"));
@@ -468,15 +467,10 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
                             vork_slang::spirv::allow_driver_inlining(&mut code).map_err(|e| e.to_string())?;
                             fs::write(&stem, code).map_err(|e| e.to_string())?;
                         }
-                        // Slang's MSL source needs the same native FP contract
-                        // as runtime shaders (vork_slang's precise emission).
-                        if target=="metal" && name.starts_with("camera_") && name.ends_with("_evaluate") {
-                            let source=camera_native::inline_metal_functions(&fs::read(&stem).map_err(|e|e.to_string())?);
-                            fs::write(&stem,source).map_err(|e|e.to_string())?;
-                        }
-                        if precise && target=="metal" {
-                            let mut source=b"#pragma METAL fp math_mode(safe)\n#pragma METAL fp contract(off)\n".to_vec();
-                            source.extend(fs::read(&stem).map_err(|e|e.to_string())?);
+                        // Shipped MSL is finished exactly as runtime shaders are
+                        // (initialised locals, the precise contract's directives).
+                        if target=="metal" {
+                            let source=vork_slang::metal_source::finalize(&args,fs::read(&stem).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
                             fs::write(&stem,source).map_err(|e|e.to_string())?;
                         }
                     }

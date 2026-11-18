@@ -122,6 +122,8 @@ impl RenderedShot {
 /// a save still running here is abandoned, and the store keeps its previous entries.
 #[doc(hidden)]
 pub fn exit_process(code: i32) -> ! {
+    // This boundary skips Rust drops; deliver queued diagnostics before exiting.
+    vork_slang::progress::finish_events();
     // _exit skips the pipeline cache's destructor. Its Metal binary archive
     // backs onto temporary files (read lazily while the process runs);
     // remove them here, after every output is delivered. Live owners and
@@ -393,9 +395,6 @@ impl Shot {
         let audio_only = out.iter().all(|p| !directory_marked(p) && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")));
         let parse_start = Instant::now();
         let profile = match profile { Some(profile) => profile, None => vork_scene::Profile::load(vork_scene::DEFAULT_PROFILE)? };
-        if profile.level == 3 {
-            eprintln!("Hint: std/previs omits indirect light; interiors lit by bounced light can look black. Use --profile std/path for full bounce lighting (or std/draft for a quick approximation).");
-        }
         let profile_record = serde_json::json!({"name": profile.name, "version": profile.version, "level": profile.level});
         let overrides = vork_scene::CallOverrides::resolve(settings)
             .map_err(|error| error.context(FailureKind::Usage))?;
@@ -752,17 +751,19 @@ impl Shot {
                     }
                 };
                 if diagnostics {
-                    eprintln!(
+                    vork_slang::progress::line(format!(
                         "device: {:?}; pipeline cache supported: {}",
                         renderer.adapter_info,
                         renderer.pipeline_cache_supported()
-                    );
+                    ));
                 }
                 // Keep optional variants behind install AND frame-slot pipelines.
                 let foreground = renderer.compiler.foreground_preparation();
                 let (installed, encoders, encoder_prepare_ms, encoder_attach_ms, output_run) =
                     std::thread::scope(|scope| -> Result<_> {
-                        let install = scope.spawn(|| {
+                        // The install worker owns the scene: it walks its nodes and drops it, so it has the stack
+                        // a scene nested to its limit needs.
+                        let install = vork_scene::scene_thread().spawn_scoped(scope, || {
                             let _warning_scope = warnings.enter();
                             let mut scene = scene;
                             let mut previous_install = previous_install;
@@ -775,7 +776,7 @@ impl Shot {
                             renderer.install_with_options(scene, scene_path.parent().unwrap_or(Path::new(".")), plan.options)
                             .with_context(|| format!("install scene {}", scene_path.display()))
                             .map(|installed| (installed, plan.delivery, false))
-                        });
+                        }).expect("start the scene install worker");
                         let (prepared, preparation_ms) = match prepare {
                             Some(worker) => worker.join().map_err(|panic| panicked("encoder preparation worker", panic))??,
                             None => (Vec::new(), 0.),
@@ -829,10 +830,10 @@ impl Shot {
             "adaptive": adaptive, "denoise": denoise,
             "resolution": [w, h], "frames": frames,
         });
-        eprintln!("render: {}; {}{} samples ({}); denoise {}; {}x{}; {} frames",
+        vork_slang::progress::line(format!("render: {}; {}{} samples ({}); denoise {}; {}x{}; {} frames",
             profile.name, if adaptive { "up to " } else { "" }, effective.samples,
             if adaptive { "adaptive" } else { "fixed" },
-            if denoise { "on" } else { "off" }, w, h, frames);
+            if denoise { "on" } else { "off" }, w, h, frames));
         let encoder_readback = video.then(|| encoders.iter().any(|e| e.uses_pixel_readback()));
         let mut slots = (0..in_flight)
             .map(|_| {
@@ -1297,6 +1298,8 @@ impl Shot {
         report["sidecars"] = serde_json::to_value(sidecars)?;
         report["exposure"] = exposures.into();
         if let Some(run) = &output_run { run.complete(&pending_metadata)?; }
+        #[cfg(feature = "frame-profile")]
+        crate::frame_profile::report(&report);
         Ok(RenderedShot {
             report,
             _encoders: encoders,
